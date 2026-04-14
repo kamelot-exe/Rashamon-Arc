@@ -1,0 +1,11 @@
+[package]
+name = "rashamon-ipc"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+memmap2.workspace = true
+bincode.workspace = true
+serde.workspace = true
+libc = "0.2"
+tempfile = "3"

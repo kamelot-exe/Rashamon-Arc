@@ -1,0 +1,10 @@
+[package]
+name = "rashamon-renderer"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+rashamon-ipc.workspace = true
+rashamon-sandbox.workspace = true
+memmap2.workspace = true
+libc = "0.2"

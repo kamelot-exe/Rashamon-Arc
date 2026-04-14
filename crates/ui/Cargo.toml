@@ -1,0 +1,15 @@
+[package]
+name = "rashamon-ui"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+rashamon-ipc.workspace = true
+rashamon-renderer.workspace = true
+rashamon-net.workspace = true
+memmap2.workspace = true
+libc = "0.2"
+
+[[bin]]
+name = "rashamon-arc"
+path = "src/main.rs"

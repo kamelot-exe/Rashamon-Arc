@@ -1,0 +1,29 @@
+[workspace]
+members = [
+    "crates/ipc",
+    "crates/sandbox",
+    "crates/renderer",
+    "crates/net",
+    "crates/ui",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+
+[workspace.dependencies]
+rashamon-ipc = { path = "crates/ipc" }
+rashamon-sandbox = { path = "crates/sandbox" }
+rashamon-renderer = { path = "crates/renderer" }
+rashamon-net = { path = "crates/net" }
+memmap2 = "0.9"
+bincode = "1.3"
+serde = { version = "1.0", features = ["derive"] }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = true

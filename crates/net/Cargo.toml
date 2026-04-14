@@ -1,0 +1,10 @@
+[package]
+name = "rashamon-net"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+rashamon-ipc.workspace = true
+rashamon-sandbox.workspace = true
+serde.workspace = true
+regex = "1"

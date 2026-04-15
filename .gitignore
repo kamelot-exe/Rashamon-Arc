@@ -1,3 +1,4 @@
 /target
 *.ppm
 *.rs.bk
+.aider*

@@ -9,6 +9,7 @@ rashamon-renderer.workspace = true
 rashamon-net.workspace = true
 memmap2.workspace = true
 libc = "0.2"
+drm-fourcc = "2"
 
 [[bin]]
 name = "rashamon-arc"

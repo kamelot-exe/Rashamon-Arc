@@ -65,7 +65,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         _ => {}
                     }
                 }
-                input::Event::MouseMove { x, y } => state.set_mouse_pos(x, y),
+                input::Event::MouseMove { x, y } => state.set_mouse_pos(x.max(0) as u32, y.max(0) as u32),
                 input::Event::MouseDown { x, y, button } => {
                     // Обработка клика по Top Bar (например, кнопка назад)
                     if button == 1 && y < 44 {

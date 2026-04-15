@@ -30,6 +30,7 @@ pub enum Key {
 /// Input handler.
 pub struct InputHandler {
     buffer: String,
+    ctrl_pressed: bool,
 }
 
 impl InputHandler {
@@ -37,6 +38,7 @@ impl InputHandler {
         eprintln!("[input] stdin input mode (evdev in production)");
         Ok(Self {
             buffer: String::new(),
+            ctrl_pressed: false,
         })
     }
 
@@ -46,6 +48,10 @@ impl InputHandler {
         // Stub: return None every frame.
         // In production, reads from /dev/input/eventX via evdev.
         Ok(None)
+    }
+
+    pub fn is_ctrl_pressed(&self) -> bool {
+        self.ctrl_pressed
     }
 }
 

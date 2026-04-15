@@ -16,8 +16,7 @@ use std::os::unix::io::{AsRawFd, RawFd};
 use rashamon_renderer::Framebuffer;
 
 use libc::{
-    c_int, c_uint, c_void, off_t,
-    ioctl, mmap, munmap, MAP_SHARED,
+    c_uint, c_void, off_t, ioctl, mmap, munmap, MAP_SHARED, PROT_READ, PROT_WRITE,
 };
 
 const PROT_RW: i32 = libc::PROT_READ | libc::PROT_WRITE;
@@ -25,7 +24,7 @@ const PROT_RW: i32 = libc::PROT_READ | libc::PROT_WRITE;
 // ── DRM ioctl numbers ─────────────────────────────────────────────────────
 
 const DRM_IOCTL_BASE: u32 = 0x64;
-fn drm_ioc(nr: u32, sz: u32) -> u32 {
+const fn drm_ioc(nr: u32, sz: u32) -> u32 {
     0xC000_0000 | (sz << 16) | (DRM_IOCTL_BASE << 8) | nr
 }
 
@@ -90,6 +89,7 @@ struct drm_mode_get_encoder {
     possible_clones: u32,
 }
 
+#[derive(Clone, Copy)]
 #[repr(C)]
 struct drm_mode_modeinfo {
     clock: u32,
@@ -174,7 +174,7 @@ struct drm_mode_destroy_dumb {
 // ── IOCTL helper ───────────────────────────────────────────────────────────
 
 unsafe fn drm_ioctl(fd: RawFd, request: u32, arg: *mut c_void) -> io::Result<()> {
-    let ret = ioctl(fd, request as c_uint, arg);
+    let ret = ioctl(fd, request as u64, arg);
     if ret < 0 {
         Err(io::Error::last_os_error())
     } else {
@@ -358,7 +358,7 @@ impl Display {
             // Clean up dumb buffer on failure.
             let mut destroy = drm_mode_destroy_dumb { handle: gem_handle };
             let _ = drm_ioctl(raw_fd, DRM_IOCTL_MODE_DESTROY_DUMB, &mut destroy as *mut _ as _);
-            return Err(io::Error::new(io::Error::last_os_error(), "mmap dumb buffer failed"));
+            return Err(io::Error::last_os_error());
         }
 
         // 5. Create DRM framebuffer.

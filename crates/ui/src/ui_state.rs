@@ -1,56 +1,32 @@
-//! Browser UI state management.
-
-/// The current browser state.
-#[derive(Debug)]
 pub struct BrowserState {
-    pub url: String,
+    pub url_buffer: String,
     pub title: Option<String>,
     pub tab_count: usize,
-    mouse_x: i32,
-    mouse_y: i32,
+    pub mouse_x: u32,
+    pub mouse_y: u32,
+    pub show_palette: bool,   // Добавлено
+    pub is_private: bool,     // Добавлено
 }
 
 impl BrowserState {
     pub fn new() -> Self {
         Self {
-            url: String::new(),
-            title: Some("Rashamon Arc".to_string()),
+            url_buffer: String::new(),
+            title: None,
             tab_count: 1,
             mouse_x: 0,
             mouse_y: 0,
+            show_palette: false,
+            is_private: false,
         }
     }
 
-    pub fn set_url(&mut self, url: String) {
-        self.url = url;
+    pub fn url(&self) -> Option<String> {
+        if self.url_buffer.is_empty() { None } else { Some(self.url_buffer.clone()) }
     }
 
-    pub fn url(&self) -> Option<&str> {
-        if self.url.is_empty() {
-            None
-        } else {
-            Some(&self.url)
-        }
-    }
-
-    pub fn url_push_char(&mut self, c: char) {
-        self.url.push(c);
-    }
-
-    pub fn url_pop_char(&mut self) {
-        self.url.pop();
-    }
-
-    pub fn set_mouse_pos(&mut self, x: i32, y: i32) {
-        self.mouse_x = x;
-        self.mouse_y = y;
-    }
-
-    pub fn mouse_x(&self) -> i32 {
-        self.mouse_x
-    }
-
-    pub fn mouse_y(&self) -> i32 {
-        self.mouse_y
-    }
+    pub fn set_url(&mut self, url: String) { self.url_buffer = url; }
+    pub fn url_push_char(&mut self, c: char) { self.url_buffer.push(c); }
+    pub fn url_pop_char(&mut self) { self.url_buffer.pop(); }
+    pub fn set_mouse_pos(&mut self, x: u32, y: u32) { self.mouse_x = x; self.mouse_y = y; }
 }

@@ -12,5 +12,5 @@ libc = "0.2"
 drm-fourcc = "2"
 
 [[bin]]
-name = "rashamon-arc"
+name = "rashamon-ui"
 path = "src/main.rs"

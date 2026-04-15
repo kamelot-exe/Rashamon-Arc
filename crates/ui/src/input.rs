@@ -46,8 +46,6 @@ impl InputHandler {
     /// Poll for input events. Non-blocking.
     /// Returns None if no event is available.
     pub fn poll_event(&mut self) -> Result<Option<Event>, io::Error> {
-        // Start text input before polling events
-        self.event_pump.start_text_input();
         match self.event_pump.poll_event() {
             Some(event) => {
                 let keyboard_state = self.event_pump.keyboard_state();

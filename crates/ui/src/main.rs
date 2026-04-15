@@ -5,7 +5,7 @@ mod theme;
 mod ui_state;
 
 use rashamon_net::HttpClient;
-use rashamon_renderer::{framebuffer::Pixel, Framebuffer, RenderEngine};
+use rashamon_renderer::{Framebuffer, RenderEngine};
 use ui_state::BrowserState;
 
 const FB_WIDTH: u32 = 1920;
@@ -96,8 +96,8 @@ fn handle_keypress(
         input::Key::Char('r') if input.is_ctrl_pressed() => engine.reload()?,
         input::Key::Enter => {
             if state.address_bar_focused {
+                let url = state.address_bar_content.clone();
                 if let Some(tab) = state.active_tab_mut() {
-                    let url = state.address_bar_content.clone();
                     let final_url = if !url.starts_with("http://") && !url.starts_with("https://") {
                         format!("https://{}", url)
                     } else {
@@ -188,7 +188,7 @@ fn render_ui(fb: &mut Framebuffer, state: &BrowserState) {
         }
         
         // Placeholder for tab title
-        fb.fill_rect(tab_x + 10, 10, (tab.title.len() * 7).min(180) as u32, 12, fg);
+        fb.fill_rect(tab_x + 10, 10, ((tab.title.len() * 7) as u32).min(180), 12, fg);
         tab_x += TAB_WIDTH + TAB_SEP;
     }
 
@@ -208,5 +208,5 @@ fn render_ui(fb: &mut Framebuffer, state: &BrowserState) {
     }
     
     let text_to_render = &state.address_bar_content;
-    fb.fill_rect(bar_x + 10, bar_y + 8, (text_to_render.len() * 7).min(bar_w - 20) as u32, 14, theme.address_bar_fg);
+    fb.fill_rect(bar_x + 10, bar_y + 8, ((text_to_render.len() * 7) as u32).min(bar_w - 20), 14, theme.address_bar_fg);
 }

@@ -10,6 +10,7 @@ rashamon-net.workspace = true
 memmap2.workspace = true
 libc = "0.2"
 drm-fourcc = "2"
+sdl2 = "0.35"
 
 [[bin]]
 name = "rashamon-ui"

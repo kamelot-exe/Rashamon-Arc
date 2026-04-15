@@ -3,8 +3,8 @@ mod display;
 mod input;
 mod ui_state;
 
-use rashamon_renderer::{Framebuffer, RenderEngine};
 use rashamon_net::HttpClient;
+use rashamon_renderer::{Framebuffer, RenderEngine};
 use ui_state::BrowserState;
 
 const FB_WIDTH: u32 = 1920;
@@ -14,12 +14,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     eprintln!("=== Rashamon Arc v0.1.0 ===");
     eprintln!("Design: Minimal Premium | Engine: Servo | Security: Adblock Active");
 
+    let sdl_context = sdl2::init()?;
+    let video_subsystem = sdl_context.video()?;
+    let event_pump = sdl_context.event_pump()?;
+
     let mut fb = Framebuffer::new(FB_WIDTH, FB_HEIGHT);
     let mut engine = RenderEngine::new()?;
     let _http = HttpClient::new();
     let mut state = BrowserState::new();
-    let mut display = display::Display::new(FB_WIDTH, FB_HEIGHT)?;
-    let mut input_handler = input::InputHandler::new()?;
+    let mut display = display::Display::new(&video_subsystem, FB_WIDTH, FB_HEIGHT)?;
+    let mut input_handler = input::InputHandler::new(event_pump)?;
 
     let args: Vec<String> = std::env::args().collect();
     if args.len() > 1 {

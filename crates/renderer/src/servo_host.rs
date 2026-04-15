@@ -70,41 +70,28 @@ impl ServoHost {
     /// Render a stub pattern so we can see something on screen.
     fn render_stub(&self, fb: &mut Framebuffer) {
         use crate::framebuffer::Pixel;
-        // White background
-        fb.clear(Pixel::WHITE);
+        // This is a stub for the actual web content rendering.
+        // It should only draw into the content area, below the browser chrome.
+        // The UI process is responsible for clearing the framebuffer and drawing the chrome.
 
-        // Draw a simple "browser" frame to show the pipeline works
-        let w = fb.width;
-        let h = fb.height;
-
-        // Top bar (dark gray)
-        fb.fill_rect(0, 0, w, 40, Pixel { r: 48, g: 48, b: 48 });
-
-        // URL bar area (lighter gray)
-        fb.fill_rect(10, 8, w - 20, 24, Pixel { r: 72, g: 72, b: 72 });
-
-        // If we have a URL, render it as a simple text indicator
-        if let Some(ref url) = self.url() {
-            // Render "Rashamon Arc" + URL as colored blocks (font rendering comes later)
-            // For now, a simple visual indicator: green bar proportional to URL length
-            let bar_w = (url.len() as u32 * 5).min(w - 30);
-            fb.fill_rect(15, 12, bar_w, 16, Pixel { r: 80, g: 180, b: 80 });
-        }
-
-        // Content area: render a checkerboard pattern to show active rendering
-        let tile = 20;
-        for y in (50..h).step_by(tile as usize) {
-            for x in (0..w).step_by(tile as usize) {
-                let cx = x / tile;
-                let cy = (y - 50) / tile;
-                if (cx + cy) % 2 == 0 {
-                    fb.fill_rect(x, y, tile, tile, Pixel { r: 240, g: 240, b: 240 });
+        // A simple visual indicator for the "web page".
+        // A real renderer would draw the parsed and laid-out web page here.
+        if let Some(url) = self.url() {
+            if !url.is_empty() {
+                // White background for the page
+                fb.clear(Pixel::WHITE);
+                // Draw some "text" as a placeholder for the content
+                let mut x = 50;
+                let y = 100; // Start below the UI chrome
+                for _ in url.chars() {
+                    fb.fill_rect(x, y, 10, 20, Pixel { r: 0, g: 0, b: 0 });
+                    x += 12;
+                    if x > fb.width - 50 { break; }
                 }
             }
         }
-
-        // Bottom status bar
-        fb.fill_rect(0, h - 24, w, 24, Pixel { r: 48, g: 48, b: 48 });
+        // If the URL is empty, we don't draw anything, letting the UI process
+        // draw the "New Tab" page over a cleared background.
     }
 
     fn get_title_from_url(&self, url: &str) -> String {

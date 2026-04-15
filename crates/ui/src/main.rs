@@ -1,5 +1,6 @@
 //! Rashamon UI — the main browser UI process.
 mod display;
+mod draw;
 mod input;
 mod theme;
 mod ui_state;
@@ -40,6 +41,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut running = true;
     while running {
+        state.frame_count += 1;
         if let Some(event) = input_handler.poll_event()? {
             match event {
                 input::Event::Quit => running = false,
@@ -91,7 +93,9 @@ fn handle_keypress(
                 *running = false;
             }
         }
-        input::Key::Char('t') if input.is_ctrl_pressed() => state.cycle_theme(),
+        input::Key::Char('p') if input.is_ctrl_pressed() => state.cycle_theme(),
+        input::Key::Char('t') if input.is_ctrl_pressed() => state.new_tab("".to_string()),
+        input::Key::Char('n') if input.is_ctrl_pressed() => state.new_tab("".to_string()),
         input::Key::Char('w') if input.is_ctrl_pressed() => state.close_tab(state.active_tab_index),
         input::Key::Char('r') if input.is_ctrl_pressed() => engine.reload()?,
         input::Key::Enter => {
@@ -126,36 +130,50 @@ fn handle_keypress(
 }
 
 fn handle_mouse_down(state: &mut BrowserState, engine: &mut RenderEngine, x: u32, y: u32) {
-    const TOP_BAR_HEIGHT: u32 = 70;
-    const TAB_BAR_HEIGHT: u32 = 32;
+    const TOP_BAR_HEIGHT: u32 = 48;
     const TAB_WIDTH: u32 = 220;
-    const TAB_SEP: u32 = 2;
+    const TAB_SEP: u32 = 1;
+    const TAB_START_X: u32 = 10;
 
     if y < TOP_BAR_HEIGHT {
-        if y < TAB_BAR_HEIGHT {
-            // Tab clicks
-            let mut tab_x = 20;
-            for i in 0..state.tabs.len() {
-                if (tab_x..tab_x + TAB_WIDTH).contains(&x) {
-                    state.set_active_tab(i);
-                    return;
+        // Tab clicks
+        let mut tab_x = TAB_START_X;
+        for i in 0..state.tabs.len() {
+            // Check for close button click first
+            let close_x = tab_x + TAB_WIDTH - 22;
+            if (close_x..close_x + 18).contains(&x) {
+                state.close_tab(i);
+                if let Some(tab) = state.active_tab() {
+                    engine.navigate(&tab.url).ok();
                 }
-                tab_x += TAB_WIDTH + TAB_SEP;
+                return;
             }
-        } else {
-            // Control and Address Bar clicks
-            if (20..60).contains(&x) { engine.go_back().ok(); return; }
-            if (70..110).contains(&x) { engine.go_forward().ok(); return; }
-            if (120..160).contains(&x) { engine.reload().ok(); return; }
+            // Then check for tab body click
+            if (tab_x..tab_x + TAB_WIDTH).contains(&x) {
+                if i != state.active_tab_index {
+                    state.set_active_tab(i);
+                    if let Some(tab) = state.active_tab() {
+                        engine.navigate(&tab.url).ok();
+                    }
+                }
+                return;
+            }
+            tab_x += TAB_WIDTH + TAB_SEP;
+        }
 
-            let bar_x = 200;
-            let bar_w = FB_WIDTH - 300;
-            if (bar_x..bar_x + bar_w).contains(&x) {
-                state.address_bar_focused = true;
-            } else {
-                state.address_bar_focused = false;
-                state.sync_address_bar();
-            }
+        // New tab button
+        if (tab_x..tab_x + 40).contains(&x) {
+            state.new_tab("".to_string());
+            return;
+        }
+
+        // Address bar click
+        let bar_x = (FB_WIDTH - 700) / 2;
+        if (bar_x..bar_x + 700).contains(&x) {
+            state.address_bar_focused = true;
+        } else {
+            state.address_bar_focused = false;
+            state.sync_address_bar();
         }
     } else {
         state.address_bar_focused = false;
@@ -165,48 +183,98 @@ fn handle_mouse_down(state: &mut BrowserState, engine: &mut RenderEngine, x: u32
 
 fn render_ui(fb: &mut Framebuffer, state: &BrowserState) {
     let theme = state.theme;
-    const TOP_BAR_HEIGHT: u32 = 70;
-    const TAB_BAR_HEIGHT: u32 = 32;
-    const TAB_WIDTH: u32 = 220;
-    const TAB_SEP: u32 = 2;
+    const TOP_BAR_HEIGHT: u32 = 48;
 
-    fb.fill_rect(0, 0, fb.width, TOP_BAR_HEIGHT, theme.bg);
-    fb.fill_rect(0, TAB_BAR_HEIGHT, fb.width, 1, theme.border);
+    // Draw content area background to separate it from the engine's render
+    if let Some(tab) = state.active_tab() {
+        if tab.url.is_empty() {
+            fb.fill_rect(0, TOP_BAR_HEIGHT, fb.width, fb.height - TOP_BAR_HEIGHT, theme.bg);
+            draw_new_tab_page(fb, state);
+        }
+    }
+
+    // Draw top bar background and border
+    fb.fill_rect(0, 0, fb.width, TOP_BAR_HEIGHT, theme.tab_active_bg);
     fb.fill_rect(0, TOP_BAR_HEIGHT - 1, fb.width, 1, theme.border);
 
-    let mut tab_x = 20;
+    draw_address_bar(fb, state);
+    draw_tabs(fb, state);
+}
+
+fn draw_tabs(fb: &mut Framebuffer, state: &BrowserState) {
+    let theme = state.theme;
+    const TOP_BAR_HEIGHT: u32 = 48;
+    const TAB_WIDTH: u32 = 220;
+    const TAB_SEP: u32 = 1;
+    const TAB_START_X: u32 = 10;
+
+    let mut tab_x = TAB_START_X;
     for (i, tab) in state.tabs.iter().enumerate() {
         let is_active = i == state.active_tab_index;
-        let is_hovered = state.mouse_y < TAB_BAR_HEIGHT && (tab_x..tab_x + TAB_WIDTH).contains(&state.mouse_x);
+        let is_hovered = state.mouse_y < TOP_BAR_HEIGHT && (tab_x..tab_x + TAB_WIDTH).contains(&state.mouse_x);
 
-        let bg = if is_active { theme.bg } else if is_hovered { theme.tab_hover_bg } else { theme.tab_bg };
+        let bg = if is_active { theme.tab_active_bg } else if is_hovered { theme.tab_hover_bg } else { theme.tab_bg };
         let fg = if is_active { theme.tab_active_fg } else { theme.tab_fg };
 
-        fb.fill_rect(tab_x, 0, TAB_WIDTH, TAB_BAR_HEIGHT, bg);
-        if is_active {
-            fb.fill_rect(tab_x, TAB_BAR_HEIGHT, TAB_WIDTH, 1, theme.bg); // Hide separator for active tab
-        }
+        draw::draw_rounded_rect(fb, tab_x, 0, TAB_WIDTH, TOP_BAR_HEIGHT - 1, 4, bg);
         
-        // Placeholder for tab title
-        fb.fill_rect(tab_x + 10, 10, ((tab.title.len() * 7) as u32).min(180), 12, fg);
+        let title = if tab.title.is_empty() { "New Tab" } else { &tab.title };
+        draw::draw_text(fb, tab_x + 15, 18, title, fg, TAB_WIDTH - 40);
+
+        let close_x = tab_x + TAB_WIDTH - 20;
+        let close_y = TOP_BAR_HEIGHT / 2;
+        draw::draw_icon_close(fb, close_x, close_y, 8, fg);
+
+        if tab.is_loading {
+            let progress = (state.frame_count % (TAB_WIDTH as u64)) as u32;
+            fb.fill_rect(tab_x, TOP_BAR_HEIGHT - 3, progress, 2, theme.accent);
+        }
+
         tab_x += TAB_WIDTH + TAB_SEP;
     }
 
-    let btn_y = 38;
-    fb.fill_rect(25, btn_y, 30, 20, theme.fg); // Back
-    fb.fill_rect(75, btn_y, 30, 20, theme.fg); // Forward
-    fb.fill_rect(125, btn_y, 30, 20, theme.fg); // Reload
+    // New Tab Button
+    draw::draw_icon_add(fb, tab_x + 20, TOP_BAR_HEIGHT / 2, 16, theme.tab_fg);
+}
 
-    let bar_x = 200;
-    let bar_w = fb.width - 300;
-    let bar_y = 34;
-    let bar_h = 30;
-    fb.fill_rect(bar_x, bar_y, bar_w, bar_h, theme.address_bar_bg);
+fn draw_address_bar(fb: &mut Framebuffer, state: &BrowserState) {
+    let theme = state.theme;
+    let bar_w = 700;
+    let bar_h = 32;
+    let bar_x = (fb.width - bar_w) / 2;
+    let bar_y = (48 - bar_h) / 2;
+
+    draw::draw_rounded_rect(fb, bar_x, bar_y, bar_w, bar_h, 4, theme.address_bar_bg);
     if state.address_bar_focused {
         fb.fill_rect(bar_x - 1, bar_y - 1, bar_w + 2, bar_h + 2, theme.accent);
-        fb.fill_rect(bar_x, bar_y, bar_w, bar_h, theme.address_bar_bg);
+        draw::draw_rounded_rect(fb, bar_x, bar_y, bar_w, bar_h, theme.address_bar_bg);
     }
-    
-    let text_to_render = &state.address_bar_content;
-    fb.fill_rect(bar_x + 10, bar_y + 8, ((text_to_render.len() * 7) as u32).min(bar_w - 20), 14, theme.address_bar_fg);
+
+    let text_x = bar_x + 12;
+    let text_y = bar_y + 10;
+
+    if state.address_bar_content.is_empty() && !state.address_bar_focused {
+        draw::draw_text(fb, text_x, text_y, "Search or enter URL", theme.tab_fg, bar_w - 24);
+    } else {
+        draw::draw_text(fb, text_x, text_y, &state.address_bar_content, theme.address_bar_fg, bar_w - 24);
+        if state.address_bar_focused && (state.frame_count / 30) % 2 == 0 {
+            let cursor_x = text_x + (state.address_bar_content.len() * 7) as u32;
+            fb.fill_rect(cursor_x + 2, text_y - 2, 2, 14, theme.accent);
+        }
+    }
+}
+
+fn draw_new_tab_page(fb: &mut Framebuffer, state: &BrowserState) {
+    let theme = state.theme;
+    let center_x = fb.width / 2;
+    let center_y = fb.height / 2;
+
+    let input_w = 600;
+    let input_h = 40;
+    draw::draw_rounded_rect(fb, center_x - input_w / 2, center_y - 100, input_w, input_h, 4, theme.address_bar_bg);
+    draw::draw_text(fb, center_x - input_w / 2 + 15, center_y - 100 + 14, "Search or enter URL", theme.tab_fg, input_w - 30);
+
+    let link_y = center_y;
+    draw::draw_text(fb, center_x - 150, link_y, "GitHub", theme.accent, 100);
+    draw::draw_text(fb, center_x + 50, link_y, "Rust Lang", theme.accent, 100);
 }

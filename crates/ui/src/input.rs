@@ -67,6 +67,7 @@ impl InputHandler {
                             Keycode::T => Some(Key::Char('t')),
                             Keycode::W => Some(Key::Char('w')),
                             Keycode::R => Some(Key::Char('r')),
+                            Keycode::N => Some(Key::Char('n')),
                             _ => None,
                         };
                         if let Some(k) = key {

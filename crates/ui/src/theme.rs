@@ -43,19 +43,19 @@ pub struct Theme {
 }
 
 pub const KAMELOT_DARK: Theme = Theme {
-    bg: Pixel { r: 11, g: 11, b: 11 },         // #0B0B0B
-    fg: Pixel { r: 220, g: 220, b: 220 },   // #DCDCDC
-    border: Pixel { r: 43, g: 43, b: 43 },     // #2B2B2B
-    tab_bg: Pixel { r: 28, g: 28, b: 28 },     // #1C1C1C
-    tab_fg: Pixel { r: 150, g: 150, b: 150 }, // #969696
-    tab_active_bg: Pixel { r: 11, g: 11, b: 11 }, // Same as main bg
-    tab_active_fg: Pixel { r: 220, g: 220, b: 220 },
-    tab_hover_bg: Pixel { r: 40, g: 40, b: 40 },
-    address_bar_bg: Pixel { r: 22, g: 22, b: 22 },
-    address_bar_fg: Pixel { r: 200, g: 200, b: 200 },
-    accent: Pixel { r: 205, g: 92, b: 0 },      // #CD5C00 (Burnt Orange)
+    bg: Pixel { r: 11, g: 11, b: 11 },          // #0B0B0B (Content BG)
+    fg: Pixel { r: 241, g: 241, b: 241 },    // #F1F1F1 (Primary Text)
+    border: Pixel { r: 43, g: 43, b: 43 },      // #2B2B2B
+    tab_bg: Pixel { r: 30, g: 30, b: 30 },      // #1E1E1E
+    tab_fg: Pixel { r: 160, g: 160, b: 160 },  // Dimmed text
+    tab_active_bg: Pixel { r: 17, g: 17, b: 17 }, // #111111 (Surface)
+    tab_active_fg: Pixel { r: 241, g: 241, b: 241 },
+    tab_hover_bg: Pixel { r: 45, g: 45, b: 45 },
+    address_bar_bg: Pixel { r: 30, g: 30, b: 30 }, // #1E1E1E
+    address_bar_fg: Pixel { r: 241, g: 241, b: 241 },
+    accent: Pixel { r: 200, g: 107, b: 60 },    // #C86B3C
     accent_fg: Pixel { r: 255, g: 255, b: 255 },
-    security_ok: Pixel { r: 34, g: 139, b: 34 }, // ForestGreen
+    security_ok: Pixel { r: 34, g: 139, b: 34 },  // ForestGreen
     security_err: Pixel { r: 220, g: 20, b: 60 }, // Crimson
 };
 

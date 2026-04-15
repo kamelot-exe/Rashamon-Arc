@@ -65,7 +65,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     tab.title = title;
                 }
             }
+            // Update URL from engine if we navigated via back/forward
+            if let Some(url) = engine.url() {
+                if tab.url != url {
+                    tab.url = url;
+                    state.sync_address_bar();
+                }
+            }
         }
+        state.check_if_bookmarked();
 
         engine.render(&mut fb)?;
         render_ui(&mut fb, &state);
@@ -101,13 +109,19 @@ fn handle_keypress(
             if state.address_bar_focused {
                 let url = state.address_bar_content.clone();
                 if let Some(tab) = state.active_tab_mut() {
-                    let final_url = if !url.starts_with("http://") && !url.starts_with("https://") {
-                        format!("https://{}", url)
+                    let final_url = if url.contains('.') && !url.contains(' ') {
+                        if !url.starts_with("http://") && !url.starts_with("https://") {
+                            format!("https://{}", url)
+                        } else {
+                            url
+                        }
                     } else {
-                        url
+                        // Not a URL, treat as search query for DuckDuckGo
+                        format!("https://duckduckgo.com/?q={}", url.replace(' ', "+"))
                     };
-                    tab.url = final_url;
-                    engine.navigate(&tab.url)?;
+
+                    tab.url = final_url.clone();
+                    engine.navigate(&final_url)?;
                     tab.is_loading = true;
                 }
                 state.address_bar_focused = false;
@@ -164,14 +178,35 @@ fn handle_mouse_down(state: &mut BrowserState, engine: &mut RenderEngine, x: u32
         if (tab_x..tab_x + 40).contains(&x) { state.new_tab("".to_string()); return; }
 
         // Address bar click
-        let bar_x = (FB_WIDTH - 700) / 2;
-        if (bar_x..bar_x + 700).contains(&x) {
+        let bar_w = 700;
+        let bar_x = (FB_WIDTH - bar_w) / 2;
+        let bookmark_icon_x = bar_x + bar_w - 25;
+        if (bookmark_icon_x..bookmark_icon_x + 20).contains(&x) {
+            state.toggle_bookmark_for_active_tab();
+            return;
+        }
+        if (bar_x..bar_x + bar_w).contains(&x) {
             state.address_bar_focused = true;
         } else {
             state.address_bar_focused = false;
             state.sync_address_bar();
         }
     } else {
+        // New tab page quick links
+        if let Some(tab) = state.active_tab() {
+            if tab.url.is_empty() {
+                let mut link_x = (FB_WIDTH / 2) - (state.bookmarks.len() as u32 * 160 / 2);
+                let link_y = (FB_HEIGHT / 2) - 20;
+                for bookmark in &state.bookmarks {
+                    if (link_x..link_x + 140).contains(&x) && (link_y..link_y + 80).contains(&y) {
+                        state.active_tab_mut().unwrap().url = bookmark.url.clone();
+                        engine.navigate(&bookmark.url).ok();
+                        return;
+                    }
+                    link_x += 150;
+                }
+            }
+        }
         state.address_bar_focused = false;
         state.sync_address_bar();
     }
@@ -275,12 +310,16 @@ fn draw_address_bar(fb: &mut Framebuffer, state: &BrowserState) {
         } else {
             draw::draw_icon_lock(fb, icon_x, icon_y, theme.icon_fg);
         }
+
+        let bookmark_icon_x = bar_x + bar_w - 20;
+        let star_color = if tab.is_bookmarked { theme.accent } else { theme.icon_fg };
+        draw::draw_icon_star(fb, bookmark_icon_x, icon_y, 12, star_color, tab.is_bookmarked);
     }
 
     if state.address_bar_content.is_empty() && !state.address_bar_focused {
-        draw::draw_text(fb, text_x, text_y, "Search or enter URL", theme.placeholder, bar_w - 50);
+        draw::draw_text(fb, text_x, text_y, "Search or enter URL", theme.placeholder, bar_w - 80);
     } else {
-        draw::draw_text(fb, text_x, text_y, &state.address_bar_content, theme.address_bar_fg, bar_w - 50);
+        draw::draw_text(fb, text_x, text_y, &state.address_bar_content, theme.address_bar_fg, bar_w - 80);
         if state.address_bar_focused && (state.frame_count / 30) % 2 == 0 {
             let cursor_x = text_x + (state.address_bar_content.len() * 7) as u32;
             fb.fill_rect(cursor_x + 1, text_y - 2, 2, 14, theme.accent);
@@ -303,11 +342,13 @@ fn draw_new_tab_page(fb: &mut Framebuffer, state: &BrowserState) {
     draw::draw_rounded_rect(fb, center_x - input_w / 2, input_y, input_w, input_h, 6, theme.surface);
     draw::draw_text(fb, center_x - input_w / 2 + 20, input_y + 16, "Search or enter URL", theme.placeholder, input_w - 40);
 
-    let mut link_x = center_x - (state.quick_links.len() as u32 * 160 / 2);
-    let link_y = center_y - 20;
-    for link in &state.quick_links {
-        draw::draw_rounded_rect(fb, link_x, link_y, 140, 80, 6, theme.surface);
-        draw::draw_text(fb, link_x + 15, link_y + 35, &link.title, theme.fg, 110);
-        link_x += 150;
+    if !state.bookmarks.is_empty() {
+        let mut link_x = center_x - (state.bookmarks.len() as u32 * 160 / 2);
+        let link_y = center_y - 20;
+        for link in &state.bookmarks {
+            draw::draw_rounded_rect(fb, link_x, link_y, 140, 80, 6, theme.surface);
+            draw::draw_text(fb, link_x + 15, link_y + 35, &link.title, theme.fg, 110);
+            link_x += 150;
+        }
     }
 }

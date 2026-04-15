@@ -10,6 +10,7 @@ pub struct TabState {
     pub title: String,
     pub is_loading: bool,
     pub is_pinned: bool,
+    pub is_bookmarked: bool,
     pub security: SecurityLevel,
 }
 
@@ -26,6 +27,7 @@ impl TabState {
             title,
             is_loading: false,
             is_pinned: false,
+            is_bookmarked: false,
             security: SecurityLevel::Unknown,
         }
     }
@@ -54,7 +56,7 @@ pub struct BrowserState {
     pub palette: ColorPalette,
     pub address_bar_focused: bool,
     pub address_bar_content: String,
-    pub quick_links: Vec<QuickLink>,
+    pub bookmarks: Vec<QuickLink>,
 }
 
 impl BrowserState {
@@ -73,7 +75,7 @@ impl BrowserState {
             theme: get_theme(default_palette),
             address_bar_focused: false,
             address_bar_content: "".to_string(),
-            quick_links: vec![
+            bookmarks: vec![
                 QuickLink { title: "GitHub".to_string(), url: "https://github.com".to_string() },
                 QuickLink { title: "Rust Lang".to_string(), url: "https://www.rust-lang.org".to_string() },
                 QuickLink { title: "Servo".to_string(), url: "https://servo.org".to_string() },
@@ -134,5 +136,32 @@ impl BrowserState {
     pub fn set_mouse_pos(&mut self, x: u32, y: u32) {
         self.mouse_x = x;
         self.mouse_y = y;
+    }
+
+    pub fn toggle_bookmark_for_active_tab(&mut self) {
+        if let Some(tab) = self.active_tab_mut() {
+            if tab.url.is_empty() { return; }
+
+            if tab.is_bookmarked {
+                self.bookmarks.retain(|b| b.url != tab.url);
+                tab.is_bookmarked = false;
+            } else {
+                self.bookmarks.push(QuickLink {
+                    title: tab.title.clone(),
+                    url: tab.url.clone(),
+                });
+                tab.is_bookmarked = true;
+            }
+        }
+    }
+
+    pub fn check_if_bookmarked(&mut self) {
+        if let Some(tab) = self.active_tab_mut() {
+            if tab.url.is_empty() {
+                tab.is_bookmarked = false;
+                return;
+            }
+            tab.is_bookmarked = self.bookmarks.iter().any(|b| b.url == tab.url);
+        }
     }
 }

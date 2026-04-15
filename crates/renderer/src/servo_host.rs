@@ -11,10 +11,11 @@ use crate::framebuffer::Framebuffer;
 
 /// Host process for the Servo engine.
 pub struct ServoHost {
-    current_url: Option<String>,
     title: Option<String>,
     /// Whether Servo is fully initialized.
     initialized: bool,
+    history: Vec<String>,
+    history_index: usize,
 }
 
 impl ServoHost {
@@ -23,17 +24,30 @@ impl ServoHost {
         // servo::init().map_err(|e| e.into())?;
         eprintln!("[servo] ServoHost initialized (stub — full Servo integration pending)");
         Ok(Self {
-            current_url: None,
             title: None,
             initialized: false,
+            history: Vec::new(),
+            history_index: 0,
         })
     }
 
     pub fn navigate(&mut self, url: &str) -> Result<(), Box<dyn std::error::Error>> {
         eprintln!("[servo] navigate -> {url}");
         // In production: servo::load_url(url)?;
-        self.current_url = Some(url.to_string());
-        self.title = Some(url.to_string());
+
+        // If we are not at the end of the history list, any new navigation
+        // should clear the "forward" history.
+        if !self.history.is_empty() && self.history_index < self.history.len() - 1 {
+            self.history.truncate(self.history_index + 1);
+        }
+
+        // Don't add empty URLs to history (new tabs)
+        if !url.is_empty() {
+            self.history.push(url.to_string());
+            self.history_index = self.history.len().saturating_sub(1);
+        }
+
+        self.title = Some(self.get_title_from_url(url));
         self.initialized = true;
         Ok(())
     }
@@ -70,7 +84,7 @@ impl ServoHost {
         fb.fill_rect(10, 8, w - 20, 24, Pixel { r: 72, g: 72, b: 72 });
 
         // If we have a URL, render it as a simple text indicator
-        if let Some(ref url) = self.current_url {
+        if let Some(ref url) = self.url() {
             // Render "Rashamon Arc" + URL as colored blocks (font rendering comes later)
             // For now, a simple visual indicator: green bar proportional to URL length
             let bar_w = (url.len() as u32 * 5).min(w - 30);
@@ -93,20 +107,43 @@ impl ServoHost {
         fb.fill_rect(0, h - 24, w, 24, Pixel { r: 48, g: 48, b: 48 });
     }
 
+    fn get_title_from_url(&self, url: &str) -> String {
+        if url.is_empty() {
+            return "New Tab".to_string();
+        }
+        url.to_string()
+            .replace("https://", "")
+            .replace("http://", "")
+            .replace("www.", "")
+    }
+
     pub fn go_back(&mut self) -> Result<(), Box<dyn std::error::Error>> {
         eprintln!("[servo] go_back");
+        if self.history_index > 0 {
+            self.history_index -= 1;
+            if let Some(url) = self.history.get(self.history_index) {
+                self.title = Some(self.get_title_from_url(url));
+            }
+        }
         Ok(())
     }
 
     pub fn go_forward(&mut self) -> Result<(), Box<dyn std::error::Error>> {
         eprintln!("[servo] go_forward");
+        if self.history_index < self.history.len() - 1 {
+            self.history_index += 1;
+            if let Some(url) = self.history.get(self.history_index) {
+                self.title = Some(self.get_title_from_url(url));
+            }
+        }
         Ok(())
     }
 
     pub fn reload(&mut self) -> Result<(), Box<dyn std::error::Error>> {
         eprintln!("[servo] reload");
-        if let Some(ref url) = self.current_url.clone() {
-            self.navigate(url)?;
+        if let Some(url) = self.url() {
+             eprintln!("[servo] re-navigating to -> {url}");
+             self.title = Some(self.get_title_from_url(&url));
         }
         Ok(())
     }
@@ -116,6 +153,6 @@ impl ServoHost {
     }
 
     pub fn url(&self) -> Option<String> {
-        self.current_url.clone()
+        self.history.get(self.history_index).cloned()
     }
 }

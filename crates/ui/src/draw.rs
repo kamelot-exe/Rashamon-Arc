@@ -92,3 +92,20 @@ pub fn draw_icon_spinner(fb: &mut Framebuffer, cx: u32, cy: u32, size: u32, fram
     let py = cy as i32 + (angle.sin() * size as f32) as i32;
     fb.fill_rect(px as u32 - 1, py as u32 - 1, 3, 3, color);
 }
+
+pub fn draw_icon_star(fb: &mut Framebuffer, cx: u32, cy: u32, size: u32, color: Pixel, filled: bool) {
+    let s = size / 2;
+    if filled {
+        fb.fill_rect(cx - s, cy - s, size, size, color);
+    } else {
+        // Draw a hollow star shape (asterisk-like)
+        fb.fill_rect(cx - s, cy, size, 2, color);
+        fb.fill_rect(cx, cy - s, 2, size, color);
+        for i in 0..s {
+            fb.set_pixel(cx - i, cy - i, color);
+            fb.set_pixel(cx + i, cy - i, color);
+            fb.set_pixel(cx - i, cy + i, color);
+            fb.set_pixel(cx + i, cy + i, color);
+        }
+    }
+}

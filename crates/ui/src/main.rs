@@ -247,7 +247,7 @@ fn draw_address_bar(fb: &mut Framebuffer, state: &BrowserState) {
     draw::draw_rounded_rect(fb, bar_x, bar_y, bar_w, bar_h, 4, theme.address_bar_bg);
     if state.address_bar_focused {
         fb.fill_rect(bar_x - 1, bar_y - 1, bar_w + 2, bar_h + 2, theme.accent);
-        draw::draw_rounded_rect(fb, bar_x, bar_y, bar_w, bar_h, theme.address_bar_bg);
+        draw::draw_rounded_rect(fb, bar_x, bar_y, bar_w, bar_h, 4, theme.address_bar_bg);
     }
 
     let text_x = bar_x + 12;

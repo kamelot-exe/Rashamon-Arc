@@ -54,19 +54,19 @@ impl InputHandler {
 
                 match event {
                     SdlEvent::Quit { .. } => Ok(Some(Event::Quit)),
-                    SdlEvent::KeyDown { keycode: Some(keycode), .. } => {
-                        let key = match keycode {
-                            Keycode::Escape => Some(Key::Escape),
-                            Keycode::Return => Some(Key::Enter),
-                            Keycode::Backspace => Some(Key::Backspace),
-                            Keycode::Left => Some(Key::Left),
-                            Keycode::Right => Some(Key::Right),
-                            Keycode::Up => Some(Key::Up),
-                            Keycode::Down => Some(Key::Down),
-                            Keycode::P => Some(Key::Char('p')),
-                            Keycode::T => Some(Key::Char('t')),
-                            Keycode::W => Some(Key::Char('w')),
-                            Keycode::R => Some(Key::Char('r')),
+                    SdlEvent::KeyDown { scancode: Some(scancode), .. } => {
+                        let key = match scancode {
+                            Scancode::Escape => Some(Key::Escape),
+                            Scancode::Return => Some(Key::Enter),
+                            Scancode::Backspace => Some(Key::Backspace),
+                            Scancode::Left => Some(Key::Left),
+                            Scancode::Right => Some(Key::Right),
+                            Scancode::Up => Some(Key::Up),
+                            Scancode::Down => Some(Key::Down),
+                            Scancode::P => Some(Key::Char('p')),
+                            Scancode::T => Some(Key::Char('t')),
+                            Scancode::W => Some(Key::Char('w')),
+                            Scancode::R => Some(Key::Char('r')),
                             _ => None,
                         };
                         if let Some(k) = key {

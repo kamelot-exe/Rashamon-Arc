@@ -72,17 +72,19 @@ impl ServoHost {
         use crate::framebuffer::Pixel;
         // This is a stub for the actual web content rendering.
         // It should only draw into the content area, below the browser chrome.
-        // The UI process is responsible for clearing the framebuffer and drawing the chrome.
+        // The UI process is responsible for clearing the framebuffer.
 
-        // A simple visual indicator for the "web page".
-        // A real renderer would draw the parsed and laid-out web page here.
         if let Some(url) = self.url() {
             if !url.is_empty() {
-                // White background for the page
-                fb.clear(Pixel::WHITE);
+                // The UI process has already cleared the content area to the theme's
+                // background color. For this stub, we'll draw a white "page"
+                // on top of that, below the chrome.
+                const TOP_BAR_HEIGHT: u32 = 48;
+                fb.fill_rect(0, TOP_BAR_HEIGHT, fb.width, fb.height - TOP_BAR_HEIGHT, Pixel::WHITE);
+
                 // Draw some "text" as a placeholder for the content
                 let mut x = 50;
-                let y = 100; // Start below the UI chrome
+                let y = TOP_BAR_HEIGHT + 50;
                 for _ in url.chars() {
                     fb.fill_rect(x, y, 10, 20, Pixel { r: 0, g: 0, b: 0 });
                     x += 12;
@@ -90,8 +92,8 @@ impl ServoHost {
                 }
             }
         }
-        // If the URL is empty, we don't draw anything, letting the UI process
-        // draw the "New Tab" page over a cleared background.
+        // If the URL is empty, we do nothing, letting the UI process
+        // draw the "New Tab" page.
     }
 
     fn get_title_from_url(&self, url: &str) -> String {

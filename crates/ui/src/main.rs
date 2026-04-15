@@ -75,6 +75,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         state.check_if_bookmarked();
 
+        // The UI process is the source of truth for the frame.
+        // Start by clearing the buffer to the theme's background color.
+        fb.clear(state.theme.bg);
+
         engine.render(&mut fb)?;
         render_ui(&mut fb, &state);
         display.present(&fb)?;
@@ -224,15 +228,15 @@ fn render_ui(fb: &mut Framebuffer, state: &BrowserState) {
     let theme = state.theme;
     const TOP_BAR_HEIGHT: u32 = 48;
 
-    // Draw content area background to separate it from the engine's render
+    // If the current tab is a new tab, draw the new tab page.
+    // The background has already been cleared in the main loop.
     if let Some(tab) = state.active_tab() {
         if tab.url.is_empty() {
-            fb.fill_rect(0, TOP_BAR_HEIGHT, fb.width, fb.height - TOP_BAR_HEIGHT, theme.bg);
             draw_new_tab_page(fb, state);
         }
     }
 
-    // Draw top bar background and border
+    // Draw top bar background and border, which appears over the web content.
     fb.fill_rect(0, 0, fb.width, TOP_BAR_HEIGHT, theme.surface);
     fb.fill_rect(0, TOP_BAR_HEIGHT - 1, fb.width, 1, theme.border);
 

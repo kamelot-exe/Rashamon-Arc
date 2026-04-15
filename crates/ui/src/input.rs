@@ -3,7 +3,7 @@
 //! Wraps SDL2 events for the main application loop.
 
 use sdl2::event::Event as SdlEvent;
-use sdl2::keyboard::{Keycode, Mod};
+use sdl2::keyboard::{Keycode, Mod, Scancode};
 use sdl2::EventPump;
 use std::io;
 
@@ -48,8 +48,9 @@ impl InputHandler {
     pub fn poll_event(&mut self) -> Result<Option<Event>, io::Error> {
         match self.event_pump.poll_event() {
             Some(event) => {
-                self.ctrl_pressed = self.event_pump.mod_state().contains(Mod::LCTRLMOD)
-                    || self.event_pump.mod_state().contains(Mod::RCTRLMOD);
+                let keyboard_state = self.event_pump.keyboard_state();
+                self.ctrl_pressed = keyboard_state.is_scancode_pressed(Scancode::LCtrl)
+                    || keyboard_state.is_scancode_pressed(Scancode::RCtrl);
 
                 match event {
                     SdlEvent::Quit { .. } => Ok(Some(Event::Quit)),

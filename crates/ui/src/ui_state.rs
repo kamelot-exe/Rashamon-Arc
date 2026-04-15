@@ -1,30 +1,125 @@
+use crate::theme::{get_theme, ColorPalette, Theme};
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+static NEXT_TAB_ID: AtomicUsize = AtomicUsize::new(0);
+
+#[derive(Debug, Clone)]
+pub struct TabState {
+    pub id: usize,
+    pub url: String,
+    pub title: String,
+    pub is_loading: bool,
+    pub is_pinned: bool,
+    pub security: SecurityLevel,
+}
+
+impl TabState {
+    pub fn new(url: String) -> Self {
+        let title = if url.is_empty() {
+            "New Tab".to_string()
+        } else {
+            url.clone()
+        };
+        Self {
+            id: NEXT_TAB_ID.fetch_add(1, Ordering::Relaxed),
+            url,
+            title,
+            is_loading: false,
+            is_pinned: false,
+            security: SecurityLevel::Unknown,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum SecurityLevel {
+    Unknown,
+    Secure,
+    Insecure,
+}
+
 pub struct BrowserState {
-    pub url_buffer: String,
-    pub title: Option<String>,
-    pub tab_count: usize,
+    pub tabs: Vec<TabState>,
+    pub active_tab_index: usize,
     pub mouse_x: u32,
     pub mouse_y: u32,
     pub show_palette: bool,
+    pub theme: Theme,
+    pub palette: ColorPalette,
+    pub address_bar_focused: bool,
+    pub address_bar_content: String,
 }
 
 impl BrowserState {
     pub fn new() -> Self {
+        let default_palette = ColorPalette::KamelotDark;
+        let tabs = vec![TabState::new("".to_string())];
+        let active_tab_index = 0;
+
         Self {
-            url_buffer: String::new(),
-            title: None,
-            tab_count: 1,
+            tabs,
+            active_tab_index,
             mouse_x: 0,
             mouse_y: 0,
             show_palette: false,
+            palette: default_palette,
+            theme: get_theme(default_palette),
+            address_bar_focused: false,
+            address_bar_content: "".to_string(),
         }
     }
 
-    pub fn url(&self) -> Option<String> {
-        if self.url_buffer.is_empty() { None } else { Some(self.url_buffer.clone()) }
+    pub fn active_tab(&self) -> Option<&TabState> {
+        self.tabs.get(self.active_tab_index)
     }
 
-    pub fn set_url(&mut self, url: String) { self.url_buffer = url; }
-    pub fn url_push_char(&mut self, c: char) { self.url_buffer.push(c); }
-    pub fn url_pop_char(&mut self) { self.url_buffer.pop(); }
-    pub fn set_mouse_pos(&mut self, x: u32, y: u32) { self.mouse_x = x; self.mouse_y = y; }
+    pub fn active_tab_mut(&mut self) -> Option<&mut TabState> {
+        self.tabs.get_mut(self.active_tab_index)
+    }
+
+    pub fn new_tab(&mut self, url: String) {
+        let new_tab = TabState::new(url);
+        self.tabs.push(new_tab);
+        self.active_tab_index = self.tabs.len() - 1;
+        self.sync_address_bar();
+    }
+
+    pub fn close_tab(&mut self, index: usize) {
+        if self.tabs.len() > 1 && index < self.tabs.len() {
+            self.tabs.remove(index);
+            if self.active_tab_index >= index && self.active_tab_index > 0 {
+                self.active_tab_index -= 1;
+            } else if self.active_tab_index >= self.tabs.len() {
+                self.active_tab_index = self.tabs.len() - 1;
+            }
+            self.sync_address_bar();
+        }
+    }
+    
+    pub fn set_active_tab(&mut self, index: usize) {
+        if index < self.tabs.len() {
+            self.active_tab_index = index;
+            self.sync_address_bar();
+        }
+    }
+
+    pub fn sync_address_bar(&mut self) {
+        if let Some(tab) = self.active_tab() {
+            self.address_bar_content = tab.url.clone();
+        }
+    }
+
+    pub fn set_theme(&mut self, palette: ColorPalette) {
+        self.palette = palette;
+        self.theme = get_theme(palette);
+    }
+
+    pub fn cycle_theme(&mut self) {
+        self.set_theme(self.palette.cycle());
+    }
+
+    pub fn set_mouse_pos(&mut self, x: u32, y: u32) {
+        self.mouse_x = x;
+        self.mouse_y = y;
+    }
 }

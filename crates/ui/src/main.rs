@@ -1,10 +1,11 @@
 //! Rashamon UI — the main browser UI process.
 mod display;
 mod input;
+mod theme;
 mod ui_state;
 
 use rashamon_net::HttpClient;
-use rashamon_renderer::{Framebuffer, RenderEngine};
+use rashamon_renderer::{framebuffer::Pixel, Framebuffer, RenderEngine};
 use ui_state::BrowserState;
 
 const FB_WIDTH: u32 = 1920;
@@ -16,6 +17,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let sdl_context = sdl2::init()?;
     let video_subsystem = sdl_context.video()?;
+    let _ = sdl_context.mouse().show_cursor(true);
     let event_pump = sdl_context.event_pump()?;
 
     let mut fb = Framebuffer::new(FB_WIDTH, FB_HEIGHT);
@@ -28,9 +30,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = std::env::args().collect();
     if args.len() > 1 {
         let url = &args[1];
-        state.set_url(url.clone());
-        engine.navigate(url)?;
+        state.tabs[0].url = url.clone();
+        if let Some(tab) = state.active_tab_mut() {
+            engine.navigate(&tab.url)?;
+            tab.is_loading = true;
+        }
     }
+    state.sync_address_bar();
 
     let mut running = true;
     while running {
@@ -38,92 +44,169 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             match event {
                 input::Event::Quit => running = false,
                 input::Event::KeyPress(key) => {
-                    match key {
-                        input::Key::Escape => {
-                            if state.show_palette {
-                                state.show_palette = false;
-                            } else {
-                                running = false;
-                            }
-                        }
-                        // Вызов Command Palette: Ctrl + P
-                        input::Key::Char('p') if input_handler.is_ctrl_pressed() => {
-                            state.show_palette = !state.show_palette;
-                        }
-                        input::Key::Enter => {
-                            if let Some(url) = state.url() {
-                                // Core: Secure by default (Basic Adblock/Tracker filter)
-                                let is_blocked = url.contains("ads.") || url.contains("tracker");
-                                
-                                if is_blocked {
-                                    eprintln!("[security] Blocked navigation to: {}", url);
-                                } else {
-                                    eprintln!("[ui] Navigate -> {}", url);
-                                    engine.navigate(&url)?;
-                                    state.show_palette = false;
-                                }
-                            }
-                        }
-                        input::Key::Backspace => state.url_pop_char(),
-                        input::Key::Char(c) => state.url_push_char(c),
-                        _ => {}
-                    }
+                    handle_keypress(&mut state, &mut engine, &mut running, key, &input_handler)?
                 }
-                input::Event::MouseMove { x, y } => state.set_mouse_pos(x.max(0) as u32, y.max(0) as u32),
+                input::Event::MouseMove { x, y } => {
+                    state.set_mouse_pos(x.max(0) as u32, y.max(0) as u32)
+                }
                 input::Event::MouseDown { x, y, button } => {
-                    // Обработка клика по Top Bar (например, кнопка назад)
-                    if button == 1 && y < 44 {
-                        if x < 60 { engine.go_back()?; }
+                    if button == 1 {
+                        handle_mouse_down(&mut state, &mut engine, x as u32, y as u32);
                     }
                 }
             }
         }
 
-        // Рендерим контент Servo
+        if let Some(tab) = state.active_tab_mut() {
+            if let Some(title) = engine.title() {
+                if tab.title != title {
+                    tab.title = title;
+                }
+            }
+        }
+
         engine.render(&mut fb)?;
-
-        // Накладываем Premium UI Overlay
-        render_ui_overlay(&mut fb, &state);
-
+        render_ui(&mut fb, &state);
         display.present(&fb)?;
-        std::thread::sleep(std::time::Duration::from_millis(16)); // ~60fps
+
+        std::thread::sleep(std::time::Duration::from_millis(16));
     }
 
     Ok(())
 }
 
-fn render_ui_overlay(fb: &mut Framebuffer, state: &BrowserState) {
-    use rashamon_renderer::framebuffer::Pixel;
+fn handle_keypress(
+    state: &mut BrowserState,
+    engine: &mut RenderEngine,
+    running: &mut bool,
+    key: input::Key,
+    input: &input::InputHandler,
+) -> Result<(), Box<dyn std::error::Error>> {
+    match key {
+        input::Key::Escape => {
+            if state.address_bar_focused {
+                state.address_bar_focused = false;
+                state.sync_address_bar();
+            } else {
+                *running = false;
+            }
+        }
+        input::Key::Char('t') if input.is_ctrl_pressed() => state.cycle_theme(),
+        input::Key::Char('w') if input.is_ctrl_pressed() => state.close_tab(state.active_tab_index),
+        input::Key::Char('r') if input.is_ctrl_pressed() => engine.reload()?,
+        input::Key::Enter => {
+            if state.address_bar_focused {
+                if let Some(tab) = state.active_tab_mut() {
+                    let url = state.address_bar_content.clone();
+                    let final_url = if !url.starts_with("http://") && !url.starts_with("https://") {
+                        format!("https://{}", url)
+                    } else {
+                        url
+                    };
+                    tab.url = final_url;
+                    engine.navigate(&tab.url)?;
+                    tab.is_loading = true;
+                }
+                state.address_bar_focused = false;
+            }
+        }
+        input::Key::Backspace => {
+            if state.address_bar_focused {
+                state.address_bar_content.pop();
+            }
+        }
+        input::Key::Char(c) => {
+            if state.address_bar_focused {
+                state.address_bar_content.push(c);
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
 
-    // Палитра Rashamon Arc
-    let bg_dark = Pixel { r: 15, g: 15, b: 15 };     // Основной фон (#0F0F0F)
-    let accent = Pixel { r: 40, g: 40, b: 40 };      // Поля ввода (#282828)
-    let text_main = Pixel { r: 220, g: 220, b: 220 }; // Текст (#DCDCDC)
-    let highlight = Pixel { r: 100, g: 140, b: 255 }; // Акцент
+fn handle_mouse_down(state: &mut BrowserState, engine: &mut RenderEngine, x: u32, y: u32) {
+    const TOP_BAR_HEIGHT: u32 = 70;
+    const TAB_BAR_HEIGHT: u32 = 32;
+    const TAB_WIDTH: u32 = 220;
+    const TAB_SEP: u32 = 2;
 
-    // 1. Single Top Bar (44px - как в премиальных нативных приложениях)
-    fb.fill_rect(0, 0, fb.width, 44, bg_dark);
+    if y < TOP_BAR_HEIGHT {
+        if y < TAB_BAR_HEIGHT {
+            // Tab clicks
+            let mut tab_x = 20;
+            for i in 0..state.tabs.len() {
+                if (tab_x..tab_x + TAB_WIDTH).contains(&x) {
+                    state.set_active_tab(i);
+                    return;
+                }
+                tab_x += TAB_WIDTH + TAB_SEP;
+            }
+        } else {
+            // Control and Address Bar clicks
+            if (20..60).contains(&x) { engine.go_back().ok(); return; }
+            if (70..110).contains(&x) { engine.go_forward().ok(); return; }
+            if (120..160).contains(&x) { engine.reload().ok(); return; }
 
-    // Address Bar (Компактный, центрированный)
-    let url_w = (fb.width as f32 * 0.5) as u32;
-    let url_x = (fb.width - url_w) / 2;
-    fb.fill_rect(url_x, 8, url_w, 28, accent);
+            let bar_x = 200;
+            let bar_w = FB_WIDTH - 300;
+            if (bar_x..bar_x + bar_w).contains(&x) {
+                state.address_bar_focused = true;
+            } else {
+                state.address_bar_focused = false;
+                state.sync_address_bar();
+            }
+        }
+    } else {
+        state.address_bar_focused = false;
+        state.sync_address_bar();
+    }
+}
 
-    if let Some(url) = state.url() {
-        let text_bar_w = (url.len() as u32 * 7).min(url_w - 20);
-        fb.fill_rect(url_x + 10, 14, text_bar_w, 16, text_main);
+fn render_ui(fb: &mut Framebuffer, state: &BrowserState) {
+    let theme = state.theme;
+    const TOP_BAR_HEIGHT: u32 = 70;
+    const TAB_BAR_HEIGHT: u32 = 32;
+    const TAB_WIDTH: u32 = 220;
+    const TAB_SEP: u32 = 2;
+
+    fb.fill_rect(0, 0, fb.width, TOP_BAR_HEIGHT, theme.bg);
+    fb.fill_rect(0, TAB_BAR_HEIGHT, fb.width, 1, theme.border);
+    fb.fill_rect(0, TOP_BAR_HEIGHT - 1, fb.width, 1, theme.border);
+
+    let mut tab_x = 20;
+    for (i, tab) in state.tabs.iter().enumerate() {
+        let is_active = i == state.active_tab_index;
+        let is_hovered = state.mouse_y < TAB_BAR_HEIGHT && (tab_x..tab_x + TAB_WIDTH).contains(&state.mouse_x);
+
+        let bg = if is_active { theme.bg } else if is_hovered { theme.tab_hover_bg } else { theme.tab_bg };
+        let fg = if is_active { theme.tab_active_fg } else { theme.tab_fg };
+
+        fb.fill_rect(tab_x, 0, TAB_WIDTH, TAB_BAR_HEIGHT, bg);
+        if is_active {
+            fb.fill_rect(tab_x, TAB_BAR_HEIGHT, TAB_WIDTH, 1, theme.bg); // Hide separator for active tab
+        }
+        
+        // Placeholder for tab title
+        fb.fill_rect(tab_x + 10, 10, (tab.title.len() * 7).min(180) as u32, 12, fg);
+        tab_x += TAB_WIDTH + TAB_SEP;
     }
 
+    let btn_y = 38;
+    fb.fill_rect(25, btn_y, 30, 20, theme.fg); // Back
+    fb.fill_rect(75, btn_y, 30, 20, theme.fg); // Forward
+    fb.fill_rect(125, btn_y, 30, 20, theme.fg); // Reload
 
-    // 2. Command Palette (Оверлей)
-    if state.show_palette {
-        let p_w = 600u32;
-        let p_h = 40u32;
-        let p_x = (fb.width - p_w) / 2;
-        let p_y = 120u32;
-
-        // Рисуем только строку ввода (Minimalism)
-        fb.fill_rect(p_x - 2, p_y - 2, p_w + 4, p_h + 4, highlight); // Border
-        fb.fill_rect(p_x, p_y, p_w, p_h, bg_dark);
+    let bar_x = 200;
+    let bar_w = fb.width - 300;
+    let bar_y = 34;
+    let bar_h = 30;
+    fb.fill_rect(bar_x, bar_y, bar_w, bar_h, theme.address_bar_bg);
+    if state.address_bar_focused {
+        fb.fill_rect(bar_x - 1, bar_y - 1, bar_w + 2, bar_h + 2, theme.accent);
+        fb.fill_rect(bar_x, bar_y, bar_w, bar_h, theme.address_bar_bg);
     }
+    
+    let text_to_render = &state.address_bar_content;
+    fb.fill_rect(bar_x + 10, bar_y + 8, (text_to_render.len() * 7).min(bar_w - 20) as u32, 14, theme.address_bar_fg);
 }

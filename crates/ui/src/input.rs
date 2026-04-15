@@ -3,7 +3,7 @@
 //! Wraps SDL2 events for the main application loop.
 
 use sdl2::event::Event as SdlEvent;
-use sdl2::keyboard::{Keycode, Mod, Scancode};
+use sdl2::keyboard::{Keycode, Scancode};
 use sdl2::EventPump;
 use std::io;
 
@@ -46,6 +46,8 @@ impl InputHandler {
     /// Poll for input events. Non-blocking.
     /// Returns None if no event is available.
     pub fn poll_event(&mut self) -> Result<Option<Event>, io::Error> {
+        // Start text input before polling events
+        self.event_pump.start_text_input();
         match self.event_pump.poll_event() {
             Some(event) => {
                 let keyboard_state = self.event_pump.keyboard_state();
@@ -56,54 +58,35 @@ impl InputHandler {
                     SdlEvent::Quit { .. } => Ok(Some(Event::Quit)),
                     SdlEvent::KeyDown { keycode: Some(keycode), .. } => {
                         let key = match keycode {
-                            Keycode::Escape => Key::Escape,
-                            Keycode::Return => Key::Enter,
-                            Keycode::Backspace => Key::Backspace,
-                            Keycode::Left => Key::Left,
-                            Keycode::Right => Key::Right,
-                            Keycode::Up => Key::Up,
-                            Keycode::Down => Key::Down,
-                            // Simple char conversion for now
-                            Keycode::A => Key::Char('a'),
-                            Keycode::B => Key::Char('b'),
-                            Keycode::C => Key::Char('c'),
-                            Keycode::D => Key::Char('d'),
-                            Keycode::E => Key::Char('e'),
-                            Keycode::F => Key::Char('f'),
-                            Keycode::G => Key::Char('g'),
-                            Keycode::H => Key::Char('h'),
-                            Keycode::I => Key::Char('i'),
-                            Keycode::J => Key::Char('j'),
-                            Keycode::K => Key::Char('k'),
-                            Keycode::L => Key::Char('l'),
-                            Keycode::M => Key::Char('m'),
-                            Keycode::N => Key::Char('n'),
-                            Keycode::O => Key::Char('o'),
-                            Keycode::P => Key::Char('p'),
-                            Keycode::Q => Key::Char('q'),
-                            Keycode::R => Key::Char('r'),
-                            Keycode::S => Key::Char('s'),
-                            Keycode::T => Key::Char('t'),
-                            Keycode::U => Key::Char('u'),
-                            Keycode::V => Key::Char('v'),
-                            Keycode::W => Key::Char('w'),
-                            Keycode::X => Key::Char('x'),
-                            Keycode::Y => Key::Char('y'),
-                            Keycode::Z => Key::Char('z'),
-                            Keycode::Num0 => Key::Char('0'),
-                            Keycode::Num1 => Key::Char('1'),
-                            Keycode::Num2 => Key::Char('2'),
-                            Keycode::Num3 => Key::Char('3'),
-                            Keycode::Num4 => Key::Char('4'),
-                            Keycode::Num5 => Key::Char('5'),
-                            Keycode::Num6 => Key::Char('6'),
-                            Keycode::Num7 => Key::Char('7'),
-                            Keycode::Num8 => Key::Char('8'),
-                            Keycode::Num9 => Key::Char('9'),
-                            Keycode::Space => Key::Char(' '),
-                            _ => return Ok(None), // Ignore other keys for now
+                            Keycode::Escape => Some(Key::Escape),
+                            Keycode::Return => Some(Key::Enter),
+                            Keycode::Backspace => Some(Key::Backspace),
+                            Keycode::Left => Some(Key::Left),
+                            Keycode::Right => Some(Key::Right),
+                            Keycode::Up => Some(Key::Up),
+                            Keycode::Down => Some(Key::Down),
+                            Keycode::P => Some(Key::Char('p')),
+                            Keycode::T => Some(Key::Char('t')),
+                            Keycode::W => Some(Key::Char('w')),
+                            Keycode::R => Some(Key::Char('r')),
+                            _ => None,
                         };
-                        Ok(Some(Event::KeyPress(key)))
+                        if let Some(k) = key {
+                            Ok(Some(Event::KeyPress(k)))
+                        } else {
+                            Ok(None)
+                        }
+                    }
+                    SdlEvent::TextInput { text, .. } => {
+                        if !self.is_ctrl_pressed() {
+                            if let Some(c) = text.chars().next() {
+                                Ok(Some(Event::KeyPress(Key::Char(c))))
+                            } else {
+                                Ok(None)
+                            }
+                        } else {
+                            Ok(None)
+                        }
                     }
                     SdlEvent::MouseMotion { x, y, .. } => Ok(Some(Event::MouseMove { x, y })),
                     SdlEvent::MouseButtonDown { x, y, mouse_btn, .. } => {

@@ -92,10 +92,10 @@ fn render_ui_overlay(fb: &mut Framebuffer, state: &BrowserState) {
     use rashamon_renderer::framebuffer::Pixel;
 
     // Палитра Rashamon Arc
-    let bg_dark = Pixel { r: 15, g: 15, b: 15 };     // Основной фон
-    let accent = Pixel { r: 40, g: 40, b: 40 };      // Поля ввода
-    let text_main = Pixel { r: 200, g: 200, b: 200 }; // Текст
-    let highlight = Pixel { r: 100, g: 140, b: 255 }; // Приватный режим/Акцент
+    let bg_dark = Pixel { r: 15, g: 15, b: 15 };     // Основной фон (#0F0F0F)
+    let accent = Pixel { r: 40, g: 40, b: 40 };      // Поля ввода (#282828)
+    let text_main = Pixel { r: 220, g: 220, b: 220 }; // Текст (#DCDCDC)
+    let highlight = Pixel { r: 100, g: 140, b: 255 }; // Акцент
 
     // 1. Single Top Bar (44px - как в премиальных нативных приложениях)
     fb.fill_rect(0, 0, fb.width, 44, bg_dark);
@@ -110,10 +110,6 @@ fn render_ui_overlay(fb: &mut Framebuffer, state: &BrowserState) {
         fb.fill_rect(url_x + 10, 14, text_bar_w, 16, text_main);
     }
 
-    // Индикатор Private Mode (если активен)
-    if state.is_private {
-        fb.fill_rect(url_x - 35, 12, 20, 20, highlight);
-    }
 
     // 2. Command Palette (Оверлей)
     if state.show_palette {

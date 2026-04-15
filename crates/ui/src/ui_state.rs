@@ -4,8 +4,7 @@ pub struct BrowserState {
     pub tab_count: usize,
     pub mouse_x: u32,
     pub mouse_y: u32,
-    pub show_palette: bool,   // Добавлено
-    pub is_private: bool,     // Добавлено
+    pub show_palette: bool,
 }
 
 impl BrowserState {
@@ -17,7 +16,6 @@ impl BrowserState {
             mouse_x: 0,
             mouse_y: 0,
             show_palette: false,
-            is_private: false,
         }
     }
 

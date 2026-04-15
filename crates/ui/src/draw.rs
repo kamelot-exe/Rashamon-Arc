@@ -43,3 +43,52 @@ pub fn draw_icon_add(fb: &mut Framebuffer, cx: u32, cy: u32, size: u32, color: P
     fb.fill_rect(cx - s, cy, size + 1, 2, color);
     fb.fill_rect(cx, cy - s, 2, size + 1, color);
 }
+
+pub fn draw_icon_back(fb: &mut Framebuffer, cx: u32, cy: u32, size: u32, color: Pixel) {
+    let s = size / 2;
+    for i in 0..=s {
+        fb.set_pixel(cx - s + i, cy - i, color);
+        fb.set_pixel(cx - s + i, cy + i, color);
+    }
+    fb.fill_rect(cx - s, cy, s, 2, color);
+}
+
+pub fn draw_icon_forward(fb: &mut Framebuffer, cx: u32, cy: u32, size: u32, color: Pixel) {
+    let s = size / 2;
+    for i in 0..=s {
+        fb.set_pixel(cx + s - i, cy - i, color);
+        fb.set_pixel(cx + s - i, cy + i, color);
+    }
+    fb.fill_rect(cx, cy, s, 2, color);
+}
+
+pub fn draw_icon_reload(fb: &mut Framebuffer, cx: u32, cy: u32, size: u32, color: Pixel) {
+    let s = size;
+    // crude circle
+    for i in 0..=s {
+        let angle = (i as f32 / s as f32) * 2.0 * std::f32::consts::PI * 0.8;
+        let px = cx as i32 + (angle.cos() * s as f32) as i32;
+        let py = cy as i32 + (angle.sin() * s as f32) as i32;
+        fb.set_pixel(px as u32, py as u32, color);
+    }
+    // arrow head
+    fb.set_pixel(cx + s, cy - 2, color);
+    fb.set_pixel(cx + s, cy - 1, color);
+    fb.set_pixel(cx + s - 1, cy - 2, color);
+}
+
+pub fn draw_icon_lock(fb: &mut Framebuffer, cx: u32, cy: u32, color: Pixel) {
+    // U-shape
+    fb.fill_rect(cx - 4, cy - 6, 2, 4, color);
+    fb.fill_rect(cx + 3, cy - 6, 2, 4, color);
+    fb.fill_rect(cx - 4, cy - 3, 9, 2, color);
+    // Body
+    fb.fill_rect(cx - 6, cy - 1, 13, 8, color);
+}
+
+pub fn draw_icon_spinner(fb: &mut Framebuffer, cx: u32, cy: u32, size: u32, frame: u64, color: Pixel) {
+    let angle = (frame % 360) as f32 * (std::f32::consts::PI / 180.0);
+    let px = cx as i32 + (angle.cos() * size as f32) as i32;
+    let py = cy as i32 + (angle.sin() * size as f32) as i32;
+    fb.fill_rect(px as u32 - 1, py as u32 - 1, 3, 3, color);
+}

@@ -22,9 +22,11 @@ impl ColorPalette {
 #[derive(Clone, Copy, Debug)]
 pub struct Theme {
     // Core
-    pub bg: Pixel,
-    pub fg: Pixel,
-    pub border: Pixel,
+    pub bg: Pixel,              // Content area background
+    pub fg: Pixel,              // Primary text
+    pub border: Pixel,          // Subtle borders
+    pub surface: Pixel,         // Top bar background
+    pub placeholder: Pixel,     // Placeholder text
 
     // UI components
     pub tab_bg: Pixel,
@@ -34,6 +36,7 @@ pub struct Theme {
     pub tab_hover_bg: Pixel,
     pub address_bar_bg: Pixel,
     pub address_bar_fg: Pixel,
+    pub icon_fg: Pixel,
 
     // Accents
     pub accent: Pixel,
@@ -43,20 +46,25 @@ pub struct Theme {
 }
 
 pub const KAMELOT_DARK: Theme = Theme {
-    bg: Pixel { r: 11, g: 11, b: 11 },          // #0B0B0B (Content BG)
-    fg: Pixel { r: 241, g: 241, b: 241 },    // #F1F1F1 (Primary Text)
+    bg: Pixel { r: 11, g: 11, b: 11 },          // #0B0B0B
+    fg: Pixel { r: 241, g: 241, b: 241 },    // #F1F1F1
     border: Pixel { r: 43, g: 43, b: 43 },      // #2B2B2B
+    surface: Pixel { r: 17, g: 17, b: 17 },     // #111111
+    placeholder: Pixel { r: 100, g: 100, b: 100 },
+
     tab_bg: Pixel { r: 30, g: 30, b: 30 },      // #1E1E1E
-    tab_fg: Pixel { r: 160, g: 160, b: 160 },  // Dimmed text
-    tab_active_bg: Pixel { r: 17, g: 17, b: 17 }, // #111111 (Surface)
+    tab_fg: Pixel { r: 160, g: 160, b: 160 },
+    tab_active_bg: Pixel { r: 11, g: 11, b: 11 }, // Same as content bg
     tab_active_fg: Pixel { r: 241, g: 241, b: 241 },
     tab_hover_bg: Pixel { r: 45, g: 45, b: 45 },
     address_bar_bg: Pixel { r: 30, g: 30, b: 30 }, // #1E1E1E
     address_bar_fg: Pixel { r: 241, g: 241, b: 241 },
+    icon_fg: Pixel { r: 180, g: 180, b: 180 },
+
     accent: Pixel { r: 200, g: 107, b: 60 },    // #C86B3C
     accent_fg: Pixel { r: 255, g: 255, b: 255 },
-    security_ok: Pixel { r: 34, g: 139, b: 34 },  // ForestGreen
-    security_err: Pixel { r: 220, g: 20, b: 60 }, // Crimson
+    security_ok: Pixel { r: 34, g: 139, b: 34 },
+    security_err: Pixel { r: 220, g: 20, b: 60 },
 };
 
 pub const GRAPHITE_MINIMAL: Theme = Theme {

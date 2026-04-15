@@ -38,6 +38,12 @@ pub enum SecurityLevel {
     Insecure,
 }
 
+#[derive(Clone)]
+pub struct QuickLink {
+    pub title: String,
+    pub url: String,
+}
+
 pub struct BrowserState {
     pub tabs: Vec<TabState>,
     pub active_tab_index: usize,
@@ -48,6 +54,7 @@ pub struct BrowserState {
     pub palette: ColorPalette,
     pub address_bar_focused: bool,
     pub address_bar_content: String,
+    pub quick_links: Vec<QuickLink>,
 }
 
 impl BrowserState {
@@ -66,6 +73,12 @@ impl BrowserState {
             theme: get_theme(default_palette),
             address_bar_focused: false,
             address_bar_content: "".to_string(),
+            quick_links: vec![
+                QuickLink { title: "GitHub".to_string(), url: "https://github.com".to_string() },
+                QuickLink { title: "Rust Lang".to_string(), url: "https://www.rust-lang.org".to_string() },
+                QuickLink { title: "Servo".to_string(), url: "https://servo.org".to_string() },
+                QuickLink { title: "Hacker News".to_string(), url: "https://news.ycombinator.com".to_string() },
+            ],
         }
     }
 

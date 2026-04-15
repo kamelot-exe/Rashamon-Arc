@@ -139,29 +139,35 @@ impl BrowserState {
     }
 
     pub fn toggle_bookmark_for_active_tab(&mut self) {
-        if let Some(tab) = self.active_tab_mut() {
-            if tab.url.is_empty() { return; }
+        let (url, title, is_bookmarked) = match self.active_tab() {
+            Some(tab) if !tab.url.is_empty() => (tab.url.clone(), tab.title.clone(), tab.is_bookmarked),
+            _ => return,
+        };
 
-            if tab.is_bookmarked {
-                self.bookmarks.retain(|b| b.url != tab.url);
-                tab.is_bookmarked = false;
-            } else {
-                self.bookmarks.push(QuickLink {
-                    title: tab.title.clone(),
-                    url: tab.url.clone(),
-                });
-                tab.is_bookmarked = true;
-            }
+        if is_bookmarked {
+            self.bookmarks.retain(|b| b.url != url);
+        } else {
+            self.bookmarks.push(QuickLink { title, url });
+        }
+
+        if let Some(tab) = self.active_tab_mut() {
+            tab.is_bookmarked = !is_bookmarked;
         }
     }
 
     pub fn check_if_bookmarked(&mut self) {
-        if let Some(tab) = self.active_tab_mut() {
-            if tab.url.is_empty() {
-                tab.is_bookmarked = false;
+        let url = self.active_tab().map(|t| t.url.clone());
+        if let Some(url) = url {
+            if url.is_empty() {
+                if let Some(tab) = self.active_tab_mut() {
+                    tab.is_bookmarked = false;
+                }
                 return;
             }
-            tab.is_bookmarked = self.bookmarks.iter().any(|b| b.url == tab.url);
+            let is_bookmarked = self.bookmarks.iter().any(|b| b.url == url);
+            if let Some(tab) = self.active_tab_mut() {
+                tab.is_bookmarked = is_bookmarked;
+            }
         }
     }
 }

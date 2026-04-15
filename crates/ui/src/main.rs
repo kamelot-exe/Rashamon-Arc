@@ -193,20 +193,28 @@ fn handle_mouse_down(state: &mut BrowserState, engine: &mut RenderEngine, x: u32
         }
     } else {
         // New tab page quick links
+        let mut navigate_to_url = None;
         if let Some(tab) = state.active_tab() {
             if tab.url.is_empty() {
                 let mut link_x = (FB_WIDTH / 2) - (state.bookmarks.len() as u32 * 160 / 2);
                 let link_y = (FB_HEIGHT / 2) - 20;
                 for bookmark in &state.bookmarks {
                     if (link_x..link_x + 140).contains(&x) && (link_y..link_y + 80).contains(&y) {
-                        state.active_tab_mut().unwrap().url = bookmark.url.clone();
-                        engine.navigate(&bookmark.url).ok();
-                        return;
+                        navigate_to_url = Some(bookmark.url.clone());
+                        break;
                     }
                     link_x += 150;
                 }
             }
         }
+        if let Some(url) = navigate_to_url {
+            if let Some(tab) = state.active_tab_mut() {
+                tab.url = url.clone();
+                engine.navigate(&url).ok();
+            }
+            return;
+        }
+
         state.address_bar_focused = false;
         state.sync_address_bar();
     }

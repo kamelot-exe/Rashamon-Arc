@@ -16,14 +16,10 @@ pub fn draw_text(fb: &mut Framebuffer, x: u32, y: u32, text: &str, color: Pixel,
 }
 
 // Draws a rectangle with rounded corners (simulated).
-pub fn draw_rounded_rect(fb: &mut Framebuffer, x: u32, y: u32, w: u32, h: u32, r: u32, color: Pixel) {
-    if r == 0 || w < 2 * r || h < 2 * r {
-        fb.fill_rect(x, y, w, h, color);
-        return;
-    }
-    // Center
-    fb.fill_rect(x + r, y, w - 2 * r, h, color);
-    fb.fill_rect(x, y + r, w, h - 2 * r, color);
+pub fn draw_rounded_rect(fb: &mut Framebuffer, x: u32, y: u32, w: u32, h: u32, _r: u32, color: Pixel) {
+    // The previous implementation was drawing a plus-shape, leaving corners empty.
+    // This is a temporary fix to draw a solid rectangle to make the UI visible.
+    fb.fill_rect(x, y, w, h, color);
 }
 
 // --- Icon Drawing ---

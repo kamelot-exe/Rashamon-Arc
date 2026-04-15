@@ -1,10 +1,12 @@
 //! Rashamon UI — the main browser UI process.
 mod display;
 mod draw;
+mod font;
 mod input;
 mod theme;
 mod ui_state;
 
+use crate::font::FontManager;
 use rashamon_net::HttpClient;
 use rashamon_renderer::{Framebuffer, RenderEngine};
 use ui_state::BrowserState;
@@ -20,6 +22,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let video_subsystem = sdl_context.video()?;
     let _ = sdl_context.mouse().show_cursor(true);
     let event_pump = sdl_context.event_pump()?;
+
+    let font_data = include_bytes!("../assets/DejaVuSansMono.ttf");
+    let font_manager = FontManager::new(font_data)?;
 
     let mut fb = Framebuffer::new(FB_WIDTH, FB_HEIGHT);
     let mut engine = RenderEngine::new()?;
@@ -80,7 +85,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         fb.clear(state.theme.bg);
 
         engine.render(&mut fb)?;
-        render_ui(&mut fb, &state);
+        render_ui(&mut fb, &state, &font_manager);
         display.present(&fb)?;
 
         std::thread::sleep(std::time::Duration::from_millis(16));
@@ -224,7 +229,7 @@ fn handle_mouse_down(state: &mut BrowserState, engine: &mut RenderEngine, x: u32
     }
 }
 
-fn render_ui(fb: &mut Framebuffer, state: &BrowserState) {
+fn render_ui(fb: &mut Framebuffer, state: &BrowserState, font: &FontManager) {
     let theme = state.theme;
     const TOP_BAR_HEIGHT: u32 = 48;
 
@@ -232,7 +237,7 @@ fn render_ui(fb: &mut Framebuffer, state: &BrowserState) {
     // The background has already been cleared in the main loop.
     if let Some(tab) = state.active_tab() {
         if tab.url.is_empty() {
-            draw_new_tab_page(fb, state);
+            draw_new_tab_page(fb, state, font);
         }
     }
 
@@ -240,10 +245,10 @@ fn render_ui(fb: &mut Framebuffer, state: &BrowserState) {
     fb.fill_rect(0, 0, fb.width, TOP_BAR_HEIGHT, theme.surface);
     fb.fill_rect(0, TOP_BAR_HEIGHT - 1, fb.width, 1, theme.border);
 
-    draw_browser_chrome(fb, state);
+    draw_browser_chrome(fb, state, font);
 }
 
-fn draw_browser_chrome(fb: &mut Framebuffer, state: &BrowserState) {
+fn draw_browser_chrome(fb: &mut Framebuffer, state: &BrowserState, font: &FontManager) {
     const CONTROLS_START_X: u32 = 20;
     const TOP_BAR_Y_CENTER: u32 = 24;
 
@@ -254,11 +259,11 @@ fn draw_browser_chrome(fb: &mut Framebuffer, state: &BrowserState) {
     draw::draw_icon_forward(fb, CONTROLS_START_X + 45, TOP_BAR_Y_CENTER, 10, icon_color);
     draw::draw_icon_reload(fb, CONTROLS_START_X + 90, TOP_BAR_Y_CENTER, 7, icon_color);
 
-    draw_tabs(fb, state);
-    draw_address_bar(fb, state);
+    draw_tabs(fb, state, font);
+    draw_address_bar(fb, state, font);
 }
 
-fn draw_tabs(fb: &mut Framebuffer, state: &BrowserState) {
+fn draw_tabs(fb: &mut Framebuffer, state: &BrowserState, font: &FontManager) {
     let theme = state.theme;
     const TOP_BAR_HEIGHT: u32 = 48;
     const TAB_WIDTH: u32 = 220;
@@ -277,9 +282,9 @@ fn draw_tabs(fb: &mut Framebuffer, state: &BrowserState) {
         if is_active {
             fb.fill_rect(tab_x, TOP_BAR_HEIGHT - 2, TAB_WIDTH, 2, theme.bg);
         }
-        
+
         let title = if tab.title.is_empty() { "New Tab" } else { &tab.title };
-        draw::draw_text(fb, tab_x + 15, 18, title, fg, TAB_WIDTH - 45);
+        draw::draw_text(fb, font, tab_x + 15, 16, title, 14.0, fg, TAB_WIDTH - 45);
 
         if is_hovered || is_active {
             let close_x = tab_x + TAB_WIDTH - 20;
@@ -298,7 +303,7 @@ fn draw_tabs(fb: &mut Framebuffer, state: &BrowserState) {
     draw::draw_icon_add(fb, tab_x + 20, TOP_BAR_HEIGHT / 2, 16, theme.icon_fg);
 }
 
-fn draw_address_bar(fb: &mut Framebuffer, state: &BrowserState) {
+fn draw_address_bar(fb: &mut Framebuffer, state: &BrowserState, font: &FontManager) {
     let theme = state.theme;
     let bar_w = 700;
     let bar_h = 32;
@@ -314,7 +319,7 @@ fn draw_address_bar(fb: &mut Framebuffer, state: &BrowserState) {
     let icon_x = bar_x + 15;
     let icon_y = bar_y + bar_h / 2;
     let text_x = bar_x + 35;
-    let text_y = bar_y + 10;
+    let text_y = bar_y + 8;
 
     if let Some(tab) = state.active_tab() {
         if tab.is_loading {
@@ -329,22 +334,23 @@ fn draw_address_bar(fb: &mut Framebuffer, state: &BrowserState) {
     }
 
     if state.address_bar_content.is_empty() && !state.address_bar_focused {
-        draw::draw_text(fb, text_x, text_y, "Search or enter URL", theme.placeholder, bar_w - 80);
+        draw::draw_text(fb, font, text_x, text_y, "Search or enter URL", 15.0, theme.placeholder, bar_w - 80);
     } else {
-        draw::draw_text(fb, text_x, text_y, &state.address_bar_content, theme.address_bar_fg, bar_w - 80);
+        draw::draw_text(fb, font, text_x, text_y, &state.address_bar_content, 15.0, theme.address_bar_fg, bar_w - 80);
         if state.address_bar_focused && (state.frame_count / 30) % 2 == 0 {
-            let cursor_x = text_x + (state.address_bar_content.len() * 7) as u32;
-            fb.fill_rect(cursor_x + 1, text_y - 2, 2, 14, theme.accent);
+            let text_width = font.text_width(&state.address_bar_content, 15.0);
+            let cursor_x = text_x + text_width;
+            fb.fill_rect(cursor_x + 1, text_y, 2, 16, theme.accent);
         }
     }
 }
 
-fn draw_new_tab_page(fb: &mut Framebuffer, state: &BrowserState) {
+fn draw_new_tab_page(fb: &mut Framebuffer, state: &BrowserState, font: &FontManager) {
     let theme = state.theme;
     let center_x = fb.width / 2;
     let center_y = fb.height / 2;
 
-    draw::draw_text(fb, center_x - 50, center_y - 200, "Rashamon Arc", theme.fg, 200);
+    draw::draw_text(fb, font, center_x - 60, center_y - 200, "Rashamon Arc", 24.0, theme.fg, 200);
 
     let input_w = 600;
     let input_h = 44;
@@ -352,14 +358,15 @@ fn draw_new_tab_page(fb: &mut Framebuffer, state: &BrowserState) {
     draw::draw_rounded_rect(fb, center_x - input_w / 2, input_y, input_w, input_h, 6, theme.surface);
     fb.fill_rect(center_x - input_w/2 -1, input_y -1, input_w+2, input_h+2, theme.border);
     draw::draw_rounded_rect(fb, center_x - input_w / 2, input_y, input_w, input_h, 6, theme.surface);
-    draw::draw_text(fb, center_x - input_w / 2 + 20, input_y + 16, "Search or enter URL", theme.placeholder, input_w - 40);
+    draw::draw_text(fb, font, center_x - input_w / 2 + 20, input_y + 14, "Search or enter URL", 16.0, theme.placeholder, input_w - 40);
 
     if !state.bookmarks.is_empty() {
-        let mut link_x = center_x - (state.bookmarks.len() as u32 * 160 / 2);
+        let total_width = state.bookmarks.len() as u32 * 140 + (state.bookmarks.len() - 1) as u32 * 10;
+        let mut link_x = center_x - total_width / 2;
         let link_y = center_y - 20;
         for link in &state.bookmarks {
             draw::draw_rounded_rect(fb, link_x, link_y, 140, 80, 6, theme.surface);
-            draw::draw_text(fb, link_x + 15, link_y + 35, &link.title, theme.fg, 110);
+            draw::draw_text(fb, font, link_x + 15, link_y + 32, &link.title, 14.0, theme.fg, 110);
             link_x += 150;
         }
     }

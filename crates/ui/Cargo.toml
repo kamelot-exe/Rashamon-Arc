@@ -11,6 +11,8 @@ memmap2.workspace = true
 libc = "0.2"
 drm-fourcc = "2"
 sdl2 = "0.35"
+rusttype = "0.9"
+ab_glyph = "0.2"
 
 [[bin]]
 name = "rashamon-ui"

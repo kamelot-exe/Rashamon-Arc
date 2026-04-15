@@ -1,18 +1,20 @@
 //! UI drawing primitives.
 
+use crate::font::FontManager;
 use rashamon_renderer::framebuffer::{Framebuffer, Pixel};
 
 // A simple placeholder for text rendering.
-pub fn draw_text(fb: &mut Framebuffer, x: u32, y: u32, text: &str, color: Pixel, max_w: u32) {
-    let mut current_x = x;
-    for _ in text.chars() {
-        if current_x + 6 > x + max_w {
-            break;
-        }
-        // This is a very basic stub. A real implementation would use a font renderer.
-        fb.fill_rect(current_x, y, 5, 10, color);
-        current_x += 7; // Advance for next character
-    }
+pub fn draw_text(
+    fb: &mut Framebuffer,
+    font: &FontManager,
+    x: u32,
+    y: u32,
+    text: &str,
+    size: f32,
+    color: Pixel,
+    max_w: u32,
+) {
+    font.draw_text(fb, x, y, text, size, color, max_w);
 }
 
 // Draws a rectangle with rounded corners (simulated).

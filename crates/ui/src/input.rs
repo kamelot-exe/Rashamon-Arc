@@ -3,7 +3,7 @@
 //! Wraps SDL2 events for the main application loop.
 
 use sdl2::event::Event as SdlEvent;
-use sdl2::keyboard::{Keycode, Scancode};
+use sdl2::keyboard::Scancode;
 use sdl2::EventPump;
 use std::io;
 

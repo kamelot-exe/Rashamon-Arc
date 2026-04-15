@@ -3,12 +3,14 @@
 use rashamon_renderer::Framebuffer;
 use sdl2::pixels::PixelFormatEnum;
 use sdl2::render::{Canvas, Texture};
-use sdl2::video::{Window, VideoSubsystem};
+use sdl2::video::Window;
+use sdl2::VideoSubsystem;
 use std::io;
+use std::mem;
 
 pub struct Display {
     canvas: Canvas<Window>,
-    texture: Texture,
+    texture: Texture<'static>,
     width: u32,
     height: u32,
 }
@@ -31,6 +33,10 @@ impl Display {
         let texture = texture_creator
             .create_texture_streaming(PixelFormatEnum::RGB24, width, height)
             .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+
+        // Unsafely extend the texture's lifetime to 'static. This is a common
+        // workaround for this issue in older versions of the sdl2 crate.
+        let texture = unsafe { mem::transmute::<_, Texture<'static>>(texture) };
 
         canvas.clear();
         canvas.present();

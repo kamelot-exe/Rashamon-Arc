@@ -16,7 +16,7 @@ use std::os::unix::io::{AsRawFd, RawFd};
 use rashamon_renderer::Framebuffer;
 
 use libc::{
-    c_uint, c_void, off_t, ioctl, mmap, munmap, MAP_SHARED, PROT_READ, PROT_WRITE,
+    c_void, off_t, ioctl, mmap, munmap, MAP_SHARED, PROT_READ, PROT_WRITE,
 };
 
 const PROT_RW: i32 = libc::PROT_READ | libc::PROT_WRITE;
@@ -282,7 +282,7 @@ impl Display {
                 best_mode = Some(modes[0]);
             }
 
-            if let Some(mode) = best_mode {
+            if let Some(_mode) = best_mode {
                 connector_id = cid;
 
                 // Get encoder → CRTC.

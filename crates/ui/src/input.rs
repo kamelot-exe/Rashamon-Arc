@@ -48,8 +48,8 @@ impl InputHandler {
     pub fn poll_event(&mut self) -> Result<Option<Event>, io::Error> {
         match self.event_pump.poll_event() {
             Some(event) => {
-                self.ctrl_pressed = self.event_pump.keyboard_state().mod_state().contains(Mod::LCTRLMOD)
-                    || self.event_pump.keyboard_state().mod_state().contains(Mod::RCTRLMOD);
+                self.ctrl_pressed = self.event_pump.mod_state().contains(Mod::LCTRLMOD)
+                    || self.event_pump.mod_state().contains(Mod::RCTRLMOD);
 
                 match event {
                     SdlEvent::Quit { .. } => Ok(Some(Event::Quit)),

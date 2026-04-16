@@ -1,18 +1,16 @@
 //! Font rendering manager using rusttype.
 
-use ab_glyph::{FontRef, PxScale, point};
 use rashamon_renderer::framebuffer::{Framebuffer, Pixel};
-use rusttype::Font;
-use std::io;
+use rusttype::{Font, Scale, point};
 
 pub struct FontManager<'a> {
     font: Font<'a>,
 }
 
 impl<'a> FontManager<'a> {
-    pub fn new(font_data: &'a [u8]) -> io::Result<Self> {
+    pub fn new(font_data: &'a [u8]) -> std::io::Result<Self> {
         let font = Font::try_from_bytes(font_data)
-            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "failed to load font"))?;
+            .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "failed to load font"))?;
         Ok(Self { font })
     }
 
@@ -26,47 +24,39 @@ impl<'a> FontManager<'a> {
         color: Pixel,
         max_w: u32,
     ) {
-        let scale = PxScale::from(size);
-        let scaled_font = self.font.as_scaled(scale);
-
-        let mut current_x = x as f32;
+        let scale = Scale::uniform(size);
         let v_metrics = self.font.v_metrics(scale);
-        let y_pos = y as f32 + v_metrics.ascent;
+        let origin = point(x as f32, y as f32 + v_metrics.ascent);
+        let glyphs: Vec<_> = self.font.layout(text, scale, origin).collect();
 
-        for c in text.chars() {
-            if c.is_control() {
-                continue;
+        let limit_x = (x + max_w) as f32;
+        for glyph in &glyphs {
+            // Stop if we've exceeded max_w
+            if glyph.position().x > limit_x {
+                break;
             }
-            let glyph = self.font.glyph(c);
-            let h_metrics = glyph.h_metrics();
-            let scaled_glyph = scaled_font.scaled_glyph(c);
-
-            if let Some(outline) = scaled_glyph.outline() {
-                let bounds = outline.px_bounds();
-                if current_x + bounds.width() > (x + max_w) as f32 {
-                    break;
-                }
-
-                outline.draw(|px, py, v| {
-                    if v > 0.1 { // Only draw pixels with significant coverage
-                        let final_x = (current_x + bounds.min.x + px as f32) as u32;
-                        let final_y = (y_pos + bounds.min.y + py as f32) as u32;
-                        fb.set_pixel(final_x, final_y, color);
+            if let Some(bb) = glyph.pixel_bounding_box() {
+                glyph.draw(|gx, gy, v| {
+                    if v > 0.1 {
+                        let px = bb.min.x + gx as i32;
+                        let py = bb.min.y + gy as i32;
+                        if px >= 0 && py >= 0 {
+                            fb.set_pixel(px as u32, py as u32, color);
+                        }
                     }
                 });
             }
-            current_x += h_metrics.advance_width;
         }
     }
 
     pub fn text_width(&self, text: &str, size: f32) -> u32 {
-        let scale = PxScale::from(size);
-        let mut width = 0.0;
-        for c in text.chars() {
-            let glyph = self.font.glyph(c);
-            let h_metrics = glyph.h_metrics();
-            width += h_metrics.advance_width;
+        let scale = Scale::uniform(size);
+        let glyphs: Vec<_> = self.font.layout(text, scale, point(0.0, 0.0)).collect();
+        if glyphs.is_empty() {
+            return 0;
         }
-        (width * (size / self.font.height_unscaled())) as u32
+        let last = glyphs.last().unwrap();
+        let end_x = last.position().x + last.unpositioned().h_metrics().advance_width;
+        end_x.ceil() as u32
     }
 }

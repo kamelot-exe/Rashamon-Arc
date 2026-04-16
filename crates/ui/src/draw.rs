@@ -1,9 +1,25 @@
-//! UI drawing primitives.
+//! UI drawing primitives for Rashamon Arc.
 
 use crate::font::FontManager;
 use rashamon_renderer::framebuffer::{Framebuffer, Pixel};
 
-// A simple placeholder for text rendering.
+// Safe set_pixel using signed coordinates — clips silently.
+#[inline(always)]
+fn sp(fb: &mut Framebuffer, x: i32, y: i32, color: Pixel) {
+    if x >= 0 && y >= 0 {
+        fb.set_pixel(x as u32, y as u32, color);
+    }
+}
+
+// Draw a 2-pixel-thick line segment via integer coords.
+#[inline(always)]
+fn sp2(fb: &mut Framebuffer, x: i32, y: i32, dx: i32, dy: i32, color: Pixel) {
+    sp(fb, x, y, color);
+    sp(fb, x + dx, y + dy, color);
+}
+
+// ── Text ─────────────────────────────────────────────────────────────────────
+
 pub fn draw_text(
     fb: &mut Framebuffer,
     font: &FontManager,
@@ -17,93 +33,300 @@ pub fn draw_text(
     font.draw_text(fb, x, y, text, size, color, max_w);
 }
 
-// Draws a rectangle with rounded corners (simulated).
-pub fn draw_rounded_rect(fb: &mut Framebuffer, x: u32, y: u32, w: u32, h: u32, _r: u32, color: Pixel) {
-    // The previous implementation was drawing a plus-shape, leaving corners empty.
-    // This is a temporary fix to draw a solid rectangle to make the UI visible.
-    fb.fill_rect(x, y, w, h, color);
-}
+// ── Filled shapes ─────────────────────────────────────────────────────────────
 
-// --- Icon Drawing ---
-
-pub fn draw_icon_close(fb: &mut Framebuffer, cx: u32, cy: u32, size: u32, color: Pixel) {
-    let s = size / 2;
-    for i in 0..=s {
-        fb.set_pixel(cx - i, cy - i, color);
-        fb.set_pixel(cx + i, cy - i, color);
-        fb.set_pixel(cx - i, cy + i, color);
-        fb.set_pixel(cx + i, cy + i, color);
+/// Filled rectangle with rounded corners (all four corners).
+pub fn draw_rounded_rect(fb: &mut Framebuffer, x: u32, y: u32, w: u32, h: u32, r: u32, color: Pixel) {
+    if w == 0 || h == 0 { return; }
+    let r = r.min(w / 2).min(h / 2);
+    if r == 0 {
+        fb.fill_rect(x, y, w, h, color);
+        return;
     }
+
+    // Horizontal slabs
+    fb.fill_rect(x + r, y, w - 2 * r, h, color);
+    // Left/right side slabs (excluding corner areas)
+    fb.fill_rect(x, y + r, r, h - 2 * r, color);
+    fb.fill_rect(x + w - r, y + r, r, h - 2 * r, color);
+
+    // Four rounded corners using midpoint algorithm
+    fill_quarter_circle(fb, (x + r) as i32, (y + r) as i32, r as i32, color, 0);       // TL
+    fill_quarter_circle(fb, (x + w - r - 1) as i32, (y + r) as i32, r as i32, color, 1); // TR
+    fill_quarter_circle(fb, (x + r) as i32, (y + h - r - 1) as i32, r as i32, color, 2); // BL
+    fill_quarter_circle(fb, (x + w - r - 1) as i32, (y + h - r - 1) as i32, r as i32, color, 3); // BR
 }
 
-pub fn draw_icon_add(fb: &mut Framebuffer, cx: u32, cy: u32, size: u32, color: Pixel) {
-    let s = size / 2;
-    fb.fill_rect(cx - s, cy, size + 1, 2, color);
-    fb.fill_rect(cx, cy - s, 2, size + 1, color);
-}
-
-pub fn draw_icon_back(fb: &mut Framebuffer, cx: u32, cy: u32, size: u32, color: Pixel) {
-    let s = size / 2;
-    for i in 0..=s {
-        fb.set_pixel(cx - s + i, cy - i, color);
-        fb.set_pixel(cx - s + i, cy + i, color);
+/// Filled rect with only the top corners rounded (for tabs).
+pub fn draw_rounded_rect_top(fb: &mut Framebuffer, x: u32, y: u32, w: u32, h: u32, r: u32, color: Pixel) {
+    if w == 0 || h == 0 { return; }
+    let r = r.min(w / 2).min(h / 2);
+    if r == 0 {
+        fb.fill_rect(x, y, w, h, color);
+        return;
     }
-    fb.fill_rect(cx - s, cy, s, 2, color);
+    // Bottom full-width slab
+    fb.fill_rect(x, y + r, w, h - r, color);
+    // Top center slab
+    fb.fill_rect(x + r, y, w - 2 * r, r, color);
+    // Top corners
+    fill_quarter_circle(fb, (x + r) as i32, (y + r) as i32, r as i32, color, 0);          // TL
+    fill_quarter_circle(fb, (x + w - r - 1) as i32, (y + r) as i32, r as i32, color, 1);  // TR
 }
 
-pub fn draw_icon_forward(fb: &mut Framebuffer, cx: u32, cy: u32, size: u32, color: Pixel) {
-    let s = size / 2;
-    for i in 0..=s {
-        fb.set_pixel(cx + s - i, cy - i, color);
-        fb.set_pixel(cx + s - i, cy + i, color);
-    }
-    fb.fill_rect(cx, cy, s, 2, color);
-}
-
-pub fn draw_icon_reload(fb: &mut Framebuffer, cx: u32, cy: u32, size: u32, color: Pixel) {
-    let s = size;
-    // crude circle
-    for i in 0..=s {
-        let angle = (i as f32 / s as f32) * 2.0 * std::f32::consts::PI * 0.8;
-        let px = cx as i32 + (angle.cos() * s as f32) as i32;
-        let py = cy as i32 + (angle.sin() * s as f32) as i32;
-        fb.set_pixel(px as u32, py as u32, color);
-    }
-    // arrow head
-    fb.set_pixel(cx + s, cy - 2, color);
-    fb.set_pixel(cx + s, cy - 1, color);
-    fb.set_pixel(cx + s - 1, cy - 2, color);
-}
-
-pub fn draw_icon_lock(fb: &mut Framebuffer, cx: u32, cy: u32, color: Pixel) {
-    // U-shape
-    fb.fill_rect(cx - 4, cy - 6, 2, 4, color);
-    fb.fill_rect(cx + 3, cy - 6, 2, 4, color);
-    fb.fill_rect(cx - 4, cy - 3, 9, 2, color);
-    // Body
-    fb.fill_rect(cx - 6, cy - 1, 13, 8, color);
-}
-
-pub fn draw_icon_spinner(fb: &mut Framebuffer, cx: u32, cy: u32, size: u32, frame: u64, color: Pixel) {
-    let angle = (frame % 360) as f32 * (std::f32::consts::PI / 180.0);
-    let px = cx as i32 + (angle.cos() * size as f32) as i32;
-    let py = cy as i32 + (angle.sin() * size as f32) as i32;
-    fb.fill_rect(px as u32 - 1, py as u32 - 1, 3, 3, color);
-}
-
-pub fn draw_icon_star(fb: &mut Framebuffer, cx: u32, cy: u32, size: u32, color: Pixel, filled: bool) {
-    let s = size / 2;
-    if filled {
-        fb.fill_rect(cx - s, cy - s, size, size, color);
-    } else {
-        // Draw a hollow star shape (asterisk-like)
-        fb.fill_rect(cx - s, cy, size, 2, color);
-        fb.fill_rect(cx, cy - s, 2, size, color);
-        for i in 0..s {
-            fb.set_pixel(cx - i, cy - i, color);
-            fb.set_pixel(cx + i, cy - i, color);
-            fb.set_pixel(cx - i, cy + i, color);
-            fb.set_pixel(cx + i, cy + i, color);
+/// Draw a filled circle.
+pub fn draw_circle_filled(fb: &mut Framebuffer, cx: u32, cy: u32, r: u32, color: Pixel) {
+    let cx = cx as i32;
+    let cy = cy as i32;
+    let r = r as i32;
+    for dy in -r..=r {
+        let dx = ((r * r - dy * dy) as f32).sqrt() as i32;
+        for x in (cx - dx)..=(cx + dx) {
+            sp(fb, x, cy + dy, color);
         }
+    }
+}
+
+// Quarter-circle fill helper: quadrant 0=TL, 1=TR, 2=BL, 3=BR.
+fn fill_quarter_circle(fb: &mut Framebuffer, cx: i32, cy: i32, r: i32, color: Pixel, quad: u8) {
+    for dy in 0..=r {
+        let dx = ((r * r - dy * dy) as f32).sqrt() as i32;
+        match quad {
+            0 => { for px in (cx - dx)..=cx { sp(fb, px, cy - dy, color); } }
+            1 => { for px in cx..=(cx + dx) { sp(fb, px, cy - dy, color); } }
+            2 => { for px in (cx - dx)..=cx { sp(fb, px, cy + dy, color); } }
+            _ => { for px in cx..=(cx + dx) { sp(fb, px, cy + dy, color); } }
+        }
+    }
+}
+
+// ── Outline shapes ────────────────────────────────────────────────────────────
+
+/// Outline rounded rectangle (border only).
+pub fn draw_rounded_rect_outline(fb: &mut Framebuffer, x: i32, y: i32, w: i32, h: i32, r: i32, color: Pixel) {
+    if w <= 0 || h <= 0 { return; }
+    let r = r.min(w / 2).min(h / 2);
+    // Straight edges
+    for px in (x + r)..(x + w - r) {
+        sp(fb, px, y, color);
+        sp(fb, px, y + h - 1, color);
+    }
+    for py in (y + r)..(y + h - r) {
+        sp(fb, x, py, color);
+        sp(fb, x + w - 1, py, color);
+    }
+    // Corner arcs
+    outline_quarter_circle(fb, x + r, y + r, r, color, 0);
+    outline_quarter_circle(fb, x + w - r - 1, y + r, r, color, 1);
+    outline_quarter_circle(fb, x + r, y + h - r - 1, r, color, 2);
+    outline_quarter_circle(fb, x + w - r - 1, y + h - r - 1, r, color, 3);
+}
+
+fn outline_quarter_circle(fb: &mut Framebuffer, cx: i32, cy: i32, r: i32, color: Pixel, quad: u8) {
+    let steps = (r * 8).max(16);
+    for i in 0..=steps {
+        let angle = (i as f32 / steps as f32) * std::f32::consts::FRAC_PI_2;
+        let (ca, sa) = (angle.cos(), angle.sin());
+        let (px, py) = match quad {
+            0 => (cx - (ca * r as f32) as i32, cy - (sa * r as f32) as i32),
+            1 => (cx + (ca * r as f32) as i32, cy - (sa * r as f32) as i32),
+            2 => (cx - (ca * r as f32) as i32, cy + (sa * r as f32) as i32),
+            _ => (cx + (ca * r as f32) as i32, cy + (sa * r as f32) as i32),
+        };
+        sp(fb, px, py, color);
+    }
+}
+
+// ── Icons ─────────────────────────────────────────────────────────────────────
+
+/// Close icon — proper X, 2px thick.
+pub fn draw_icon_close(fb: &mut Framebuffer, cx: u32, cy: u32, size: u32, color: Pixel) {
+    let s = (size / 2) as i32;
+    let cx = cx as i32;
+    let cy = cy as i32;
+    for i in -s..=s {
+        sp2(fb, cx + i, cy + i, 1, 0, color);  // \ diagonal, 2px thick
+        sp2(fb, cx - i, cy + i, 1, 0, color);  // / diagonal, 2px thick
+    }
+}
+
+/// Back (left chevron) icon — 2px thick.
+pub fn draw_icon_back(fb: &mut Framebuffer, cx: u32, cy: u32, size: u32, color: Pixel) {
+    let s = (size / 2) as i32;
+    let cx = cx as i32;
+    let cy = cy as i32;
+    for i in 0..=s {
+        // upper arm: (cx, cy-s) → (cx-s, cy)
+        sp2(fb, cx - i, cy - (s - i), 0, 1, color);
+        // lower arm: (cx-s, cy) → (cx, cy+s)
+        sp2(fb, cx - i, cy + (s - i), 0, 1, color);
+    }
+}
+
+/// Forward (right chevron) icon — 2px thick.
+pub fn draw_icon_forward(fb: &mut Framebuffer, cx: u32, cy: u32, size: u32, color: Pixel) {
+    let s = (size / 2) as i32;
+    let cx = cx as i32;
+    let cy = cy as i32;
+    for i in 0..=s {
+        sp2(fb, cx + i, cy - (s - i), 0, 1, color);
+        sp2(fb, cx + i, cy + (s - i), 0, 1, color);
+    }
+}
+
+/// Reload / refresh icon — circular arrow.
+pub fn draw_icon_reload(fb: &mut Framebuffer, cx: u32, cy: u32, size: u32, color: Pixel) {
+    let r = size as f32;
+    let cx = cx as i32;
+    let cy = cy as i32;
+    let steps = 48;
+    // Arc covering ~270 degrees
+    let arc_frac = 0.78_f32;
+    for i in 0..steps {
+        let t = i as f32 / steps as f32;
+        let angle = t * 2.0 * std::f32::consts::PI * arc_frac + std::f32::consts::FRAC_PI_2;
+        let px = cx + (angle.cos() * r) as i32;
+        let py = cy + (angle.sin() * r) as i32;
+        sp(fb, px, py, color);
+        // 2px thick: offset ring
+        let px2 = cx + (angle.cos() * (r + 1.0)) as i32;
+        let py2 = cy + (angle.sin() * (r + 1.0)) as i32;
+        sp(fb, px2, py2, color);
+    }
+    // Arrow tip at the arc's end
+    let end_angle = 2.0 * std::f32::consts::PI * arc_frac + std::f32::consts::FRAC_PI_2;
+    let tip_x = cx + (end_angle.cos() * r) as i32;
+    let tip_y = cy + (end_angle.sin() * r) as i32;
+    sp(fb, tip_x - 3, tip_y, color);
+    sp(fb, tip_x - 2, tip_y, color);
+    sp(fb, tip_x - 2, tip_y + 1, color);
+    sp(fb, tip_x - 1, tip_y + 2, color);
+    sp(fb, tip_x - 1, tip_y + 3, color);
+}
+
+/// Add / new-tab icon — clean plus.
+pub fn draw_icon_add(fb: &mut Framebuffer, cx: u32, cy: u32, size: u32, color: Pixel) {
+    let s = (size / 2) as i32;
+    let cx = cx as i32;
+    let cy = cy as i32;
+    // Horizontal bar
+    for x in (cx - s)..=(cx + s) {
+        sp(fb, x, cy, color);
+        sp(fb, x, cy + 1, color);
+    }
+    // Vertical bar
+    for y in (cy - s)..=(cy + s) {
+        sp(fb, cx, y, color);
+        sp(fb, cx + 1, y, color);
+    }
+}
+
+/// Lock icon — shackle + body.
+pub fn draw_icon_lock(fb: &mut Framebuffer, cx: u32, cy: u32, color: Pixel) {
+    let cx = cx as i32;
+    let cy = cy as i32;
+    // Shackle (U-shape, 2px thick)
+    for px in (cx - 3)..=(cx + 3) {
+        sp(fb, px, cy - 6, color);
+        sp(fb, px, cy - 5, color);
+    }
+    sp(fb, cx - 3, cy - 6, color);
+    sp(fb, cx - 4, cy - 6, color);
+    sp(fb, cx - 4, cy - 5, color);
+    sp(fb, cx - 4, cy - 4, color);
+    sp(fb, cx - 4, cy - 3, color);
+    sp(fb, cx + 3, cy - 6, color);
+    sp(fb, cx + 4, cy - 6, color);
+    sp(fb, cx + 4, cy - 5, color);
+    sp(fb, cx + 4, cy - 4, color);
+    sp(fb, cx + 4, cy - 3, color);
+    // Body
+    for row in (cy - 2)..=(cy + 5) {
+        for col in (cx - 6)..=(cx + 6) {
+            sp(fb, col, row, color);
+        }
+    }
+    // Keyhole (dark, leave void in body) — draw bg-colored oval in body
+    // We skip this since we don't know the bg color here; just keep solid
+}
+
+/// Globe icon for non-secure or unknown URLs (simple circle with cross lines).
+pub fn draw_icon_globe(fb: &mut Framebuffer, cx: u32, cy: u32, color: Pixel) {
+    let cx = cx as i32;
+    let cy = cy as i32;
+    let r = 6_i32;
+    let steps = 40;
+    for i in 0..steps {
+        let angle = (i as f32 / steps as f32) * 2.0 * std::f32::consts::PI;
+        let px = cx + (angle.cos() * r as f32) as i32;
+        let py = cy + (angle.sin() * r as f32) as i32;
+        sp(fb, px, py, color);
+        sp(fb, px + 1, py, color);
+    }
+    // Horizontal equator line
+    for x in (cx - r)..=(cx + r) { sp(fb, x, cy, color); }
+    // Vertical meridian
+    for y in (cy - r)..=(cy + r) { sp(fb, cx, y, color); }
+    // Slightly compressed inner ellipse (latitude lines)
+    for i in 0..steps {
+        let angle = (i as f32 / steps as f32) * 2.0 * std::f32::consts::PI;
+        let px = cx + (angle.cos() * (r as f32 * 0.55)) as i32;
+        let py = cy + (angle.sin() * (r as f32 * 0.35)) as i32;
+        sp(fb, px, py, color);
+    }
+}
+
+/// Animated spinner — single bright dot orbiting a circle.
+pub fn draw_icon_spinner(fb: &mut Framebuffer, cx: u32, cy: u32, size: u32, frame: u64, color: Pixel) {
+    let r = size as f32;
+    let cx = cx as i32;
+    let cy = cy as i32;
+    let steps = 32;
+    // Draw faded trail dots
+    for i in 0..steps {
+        let angle = (frame as f32 * 0.12) + (i as f32 / steps as f32) * 2.0 * std::f32::consts::PI;
+        let px = cx + (angle.cos() * r) as i32;
+        let py = cy + (angle.sin() * r) as i32;
+        // Brightest at i=0 (head), fading
+        if i < 8 {
+            sp(fb, px, py, color);
+            sp(fb, px + 1, py, color);
+        } else if i < 16 {
+            let dim = Pixel { r: color.r / 2, g: color.g / 2, b: color.b / 2 };
+            sp(fb, px, py, dim);
+        }
+    }
+}
+
+/// Star / bookmark icon.
+pub fn draw_icon_star(fb: &mut Framebuffer, cx: u32, cy: u32, size: u32, color: Pixel, filled: bool) {
+    let s = (size / 2) as i32;
+    let cx = cx as i32;
+    let cy = cy as i32;
+    if filled {
+        // Simple filled diamond-ish star
+        for dy in -s..=s {
+            let dx = s - dy.abs();
+            for x in (cx - dx)..=(cx + dx) {
+                sp(fb, x, cy + dy, color);
+            }
+        }
+    } else {
+        // Outline diamond
+        for i in 0..=s {
+            sp(fb, cx - i, cy - (s - i), color);
+            sp(fb, cx + i, cy - (s - i), color);
+            sp(fb, cx - i, cy + (s - i), color);
+            sp(fb, cx + i, cy + (s - i), color);
+        }
+    }
+}
+
+/// Menu/dots icon (three horizontal dots).
+pub fn draw_icon_menu(fb: &mut Framebuffer, cx: u32, cy: u32, color: Pixel) {
+    let cx = cx as i32;
+    let cy = cy as i32;
+    for dot_x in [-5_i32, 0, 5] {
+        draw_circle_filled(fb, (cx + dot_x) as u32, cy as u32, 2, color);
     }
 }

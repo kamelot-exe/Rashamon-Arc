@@ -9,23 +9,19 @@ use std::io;
 use std::mem;
 
 pub struct Display {
-    canvas: Canvas<Window>,
+    canvas:  Canvas<Window>,
     texture: Texture<'static>,
-    width: u32,
-    height: u32,
+    fb_w:    u32,
+    fb_h:    u32,
 }
 
 impl Display {
-    /// Create a window of `win_w × win_h` pixels that displays a framebuffer
-    /// of `fb_w × fb_h` pixels (stretched to fill the window if sizes differ).
     pub fn new(
         video: &VideoSubsystem,
-        win_w: u32,
-        win_h: u32,
-        fb_w: u32,
-        fb_h: u32,
+        win_w: u32, win_h: u32,
+        fb_w:  u32, fb_h:  u32,
     ) -> io::Result<Self> {
-        eprintln!("[display] window {}x{}, fb {}x{} (SDL2)", win_w, win_h, fb_w, fb_h);
+        eprintln!("[display] window {}×{}, fb {}×{} (SDL2)", win_w, win_h, fb_w, fb_h);
 
         let window = video
             .window("Rashamon Arc", win_w, win_h)
@@ -35,39 +31,44 @@ impl Display {
 
         let mut canvas = window
             .into_canvas()
+            .accelerated()          // use GPU for the final blit
             .build()
             .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
 
-        let texture_creator = canvas.texture_creator();
-        // The texture matches the *framebuffer* dimensions, not the window.
-        // SDL2 will scale it to fill the window on copy.
-        let texture = texture_creator
-            .create_texture_streaming(PixelFormatEnum::RGB24, fb_w, fb_h)
+        let tc = canvas.texture_creator();
+
+        // BGR24 matches the framebuffer's in-memory layout exactly (b,g,r per
+        // pixel), so present() can copy rows with a single memcpy — no swap.
+        let texture = tc
+            .create_texture_streaming(PixelFormatEnum::BGR24, fb_w, fb_h)
             .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
 
-        // Extend texture lifetime past texture_creator (standard SDL2 Rust workaround).
+        // Extend lifetime past tc (standard SDL2 Rust workaround — tc is a
+        // zero-cost wrapper; the real resource is owned by the canvas/renderer).
         let texture = unsafe { mem::transmute::<_, Texture<'static>>(texture) };
 
         canvas.clear();
         canvas.present();
 
-        Ok(Self { canvas, texture, width: fb_w, height: fb_h })
+        Ok(Self { canvas, texture, fb_w, fb_h })
     }
 
+    /// Copy framebuffer to the SDL texture and blit to window.
+    /// The framebuffer stores pixels as BGR, and our texture is BGR24 —
+    /// so each row is a straight memcpy with no per-pixel conversion.
     pub fn present(&mut self, fb: &Framebuffer) -> io::Result<()> {
+        let fb_w    = self.fb_w as usize;
+        let fb_h    = self.fb_h as usize;
+        let stride  = fb.stride as usize;
+        let row_len = fb_w * 3; // bytes we want per row (no padding)
+
         self.texture
-            .with_lock(None, |buffer: &mut [u8], pitch: usize| {
-                for y in 0..self.height as usize {
-                    let src = y * fb.stride as usize;
+            .with_lock(None, |buf: &mut [u8], pitch: usize| {
+                for y in 0..fb_h {
+                    let src = y * stride;
                     let dst = y * pitch;
-                    let row_src = &fb.data[src..src + self.width as usize * 3];
-                    let row_dst = &mut buffer[dst..dst + self.width as usize * 3];
-                    for (i, chunk) in row_src.chunks_exact(3).enumerate() {
-                        // Framebuffer is BGR, SDL texture expects RGB
-                        row_dst[i * 3]     = chunk[2]; // R
-                        row_dst[i * 3 + 1] = chunk[1]; // G
-                        row_dst[i * 3 + 2] = chunk[0]; // B
-                    }
+                    buf[dst..dst + row_len]
+                        .copy_from_slice(&fb.data[src..src + row_len]);
                 }
             })
             .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;

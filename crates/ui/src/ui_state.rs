@@ -1,8 +1,6 @@
 //! Core browser state model for Rashamon Arc.
-//!
-//! Designed as an explicit, minimal state machine.
-//! All browser behaviour flows through BrowserState methods — no implicit logic.
 
+use crate::layout::{self, *};
 use crate::theme::{get_theme, ColorPalette, Theme};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -30,114 +28,140 @@ pub enum PageState {
 impl PageState {
     pub fn is_loading(&self) -> bool { matches!(self, Self::Loading) }
     pub fn is_new_tab(&self) -> bool { matches!(self, Self::NewTab) }
-    pub fn is_error(&self) -> bool { matches!(self, Self::Error(_)) }
+    pub fn is_error(&self)   -> bool { matches!(self, Self::Error(_)) }
 
     pub fn error_msg(&self) -> Option<&str> {
         if let Self::Error(m) = self { Some(m) } else { None }
     }
 }
 
+// ── DirtyFlags ────────────────────────────────────────────────────────────────
+
+/// Per-region repaint flags.
+/// Only dirty regions are cleared and redrawn each frame — avoiding full-screen
+/// repaints for common micro-events like cursor blink, hover, and typing.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct DirtyFlags {
+    pub tabs:    bool,   // y = 0 .. TAB_BAR_HEIGHT
+    pub chrome:  bool,   // y = TAB_BAR_HEIGHT .. TOP_BAR_HEIGHT
+    pub content: bool,   // y = TOP_BAR_HEIGHT .. FB_HEIGHT
+}
+
+impl DirtyFlags {
+    #[inline] pub fn any(self)    -> bool { self.tabs || self.chrome || self.content }
+    #[inline] pub fn all(&mut self) { self.tabs = true; self.chrome = true; self.content = true; }
+    #[inline] pub fn clear(&mut self) { *self = Self::default(); }
+}
+
+// ── HoveredRegion ─────────────────────────────────────────────────────────────
+
+/// Interactive UI region the cursor is currently over.
+/// Each variant maps to one DirtyFlags field so hover changes only repaint the
+/// affected strip, not the whole window.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HoveredRegion {
+    None,
+    Tab(usize),
+    TabClose(usize),
+    NewTabBtn,
+    NavBack,
+    NavForward,
+    NavReload,
+    AddressBar,
+    BookmarkStar,
+    QuickLink(usize),
+    RetryBtn,
+    ContentArea, // non-interactive content — no visual hover change
+}
+
 // ── NavigationEntry ───────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone)]
 pub struct NavigationEntry {
-    pub url: String,
+    pub url:         String,
     pub display_url: String,
-    pub title: String,
+    pub title:       String,
 }
 
 impl NavigationEntry {
     fn from_url(url: &str) -> Self {
         Self {
-            url: url.to_string(),
+            url:         url.to_string(),
             display_url: url.to_string(),
-            title: derive_title(url),
+            title:       derive_title(url).to_string(),
         }
     }
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
-pub fn derive_title(url: &str) -> String {
-    if url.is_empty() { return "New Tab".to_string(); }
+/// Borrows a short display title from a URL — zero allocation.
+pub fn derive_title(url: &str) -> &str {
+    if url.is_empty() { return "New Tab"; }
     url.trim_start_matches("https://")
        .trim_start_matches("http://")
        .trim_start_matches("www.")
        .split('/')
        .next()
        .unwrap_or(url)
-       .to_string()
 }
 
 // ── TabState ──────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone)]
 pub struct TabState {
-    pub id: TabId,
-    pub title: String,
-    pub url: String,
-    pub display_url: String,
-    pub page_state: PageState,
-    pub is_pinned: bool,
-    pub is_bookmarked: bool,
-    pub history: Vec<NavigationEntry>,
-    pub history_index: usize,
+    pub id:                 TabId,
+    pub title:              String,
+    pub url:                String,
+    pub display_url:        String,
+    pub page_state:         PageState,
+    pub is_pinned:          bool,
+    pub is_bookmarked:      bool,
+    pub history:            Vec<NavigationEntry>,
+    pub history_index:      usize,
     pub last_committed_url: String,
-    pub load_start_frame: u64,
+    pub load_start_frame:   u64,
 }
 
 impl TabState {
     pub fn new_tab() -> Self {
         Self {
-            id: TabId::next(),
-            title: "New Tab".to_string(),
-            url: String::new(),
-            display_url: String::new(),
-            page_state: PageState::NewTab,
-            is_pinned: false,
-            is_bookmarked: false,
-            history: Vec::new(),
-            history_index: 0,
+            id:                 TabId::next(),
+            title:              "New Tab".to_string(),
+            url:                String::new(),
+            display_url:        String::new(),
+            page_state:         PageState::NewTab,
+            is_pinned:          false,
+            is_bookmarked:      false,
+            history:            Vec::new(),
+            history_index:      0,
             last_committed_url: String::new(),
-            load_start_frame: 0,
+            load_start_frame:   0,
         }
     }
 
-    pub fn can_go_back(&self) -> bool { self.history_index > 0 }
+    pub fn can_go_back(&self)    -> bool { self.history_index > 0 }
+    pub fn can_go_forward(&self) -> bool { self.history_index + 1 < self.history.len() }
 
-    pub fn can_go_forward(&self) -> bool {
-        self.history_index + 1 < self.history.len()
-    }
-
-    /// Commit a successful navigation into the history stack.
     fn commit(&mut self, url: &str, title: &str) {
-        // Truncate forward entries when navigating to a new URL.
         if self.history_index + 1 < self.history.len() {
             self.history.truncate(self.history_index + 1);
         }
-        let entry = NavigationEntry {
-            url: url.to_string(),
+        self.history.push(NavigationEntry {
+            url:         url.to_string(),
             display_url: url.to_string(),
-            title: title.to_string(),
-        };
-        self.history.push(entry);
-        self.history_index = self.history.len() - 1;
+            title:       title.to_string(),
+        });
+        self.history_index      = self.history.len() - 1;
         self.last_committed_url = url.to_string();
     }
 
-    /// Best title to display in the tab strip.
     pub fn tab_title(&self) -> &str {
         match &self.page_state {
-            PageState::NewTab  => "New Tab",
-            PageState::Loading => {
-                if self.title.is_empty() { "Loading…" } else { &self.title }
-            }
-            PageState::Loaded  => {
-                if self.title.is_empty() { &self.url } else { &self.title }
-            }
-            PageState::Error(_) => {
-                if self.title.is_empty() { "Error" } else { &self.title }
-            }
+            PageState::NewTab   => "New Tab",
+            PageState::Loading  => if self.title.is_empty() { "Loading…" } else { &self.title },
+            PageState::Loaded   => if self.title.is_empty() { &self.url }   else { &self.title },
+            PageState::Error(_) => if self.title.is_empty() { "Error" }     else { &self.title },
         }
     }
 }
@@ -146,94 +170,277 @@ impl TabState {
 
 #[derive(Clone)]
 pub struct QuickLink {
-    pub title: String,
-    pub url: String,
+    pub title:       String,
+    pub url:         String,
+    /// Pre-uppercased first char — avoids per-frame String allocation.
+    pub first_upper: char,
+}
+
+impl QuickLink {
+    pub fn new(title: impl Into<String>, url: impl Into<String>) -> Self {
+        let title = title.into();
+        let first_upper = title.chars()
+            .next()
+            .and_then(|c| c.to_uppercase().next())
+            .unwrap_or('?');
+        Self { title, url: url.into(), first_upper }
+    }
 }
 
 // ── BrowserState ──────────────────────────────────────────────────────────────
 
 pub struct BrowserState {
-    pub tabs: Vec<TabState>,
+    pub tabs:          Vec<TabState>,
     pub active_tab_id: TabId,
 
-    pub mouse_x: u32,
-    pub mouse_y: u32,
+    pub mouse_x:     u32,
+    pub mouse_y:     u32,
     pub frame_count: u64,
 
-    pub theme: Theme,
+    pub theme:   Theme,
     pub palette: ColorPalette,
 
-    /// Single source of truth for the address bar text field.
     pub address_bar_focused: bool,
-    pub address_bar_input: String,
+    pub address_bar_input:   String,
 
     pub bookmarks: Vec<QuickLink>,
 
-    /// Visual press state for nav buttons (1=back, 2=fwd, 3=reload).
-    pub nav_btn_pressed: u8,
+    pub nav_btn_pressed:       u8,
     pub nav_btn_pressed_frame: u64,
+
+    // ── Layout cache ──────────────────────────────────────────────────────────
+    /// Cached tab strip width — recomputed only when tab count changes.
+    pub tab_width:  u32,
+    /// Active tab's index in `tabs` — avoids O(n) scan per frame.
+    pub active_pos: usize,
+
+    // ── Dirty-region rendering ────────────────────────────────────────────────
+    /// Region-level repaint flags — set by state mutations, cleared after render.
+    pub dirty:          DirtyFlags,
+    /// Bumped in `cycle_theme` so the render cache knows to recompute layout.
+    pub theme_version:  u64,
+    /// Which interactive region the cursor is over — dirty only on region change.
+    pub hovered_region: HoveredRegion,
 }
 
 impl BrowserState {
     pub fn new() -> Self {
-        let palette = ColorPalette::KamelotDark;
+        let palette   = ColorPalette::KamelotDark;
         let first_tab = TabState::new_tab();
-        let first_id = first_tab.id;
-        Self {
-            tabs: vec![first_tab],
+        let first_id  = first_tab.id;
+        let mut s = Self {
+            tabs:          vec![first_tab],
             active_tab_id: first_id,
-            mouse_x: 0,
-            mouse_y: 0,
-            frame_count: 0,
+            mouse_x:       0,
+            mouse_y:       0,
+            frame_count:   0,
             palette,
-            theme: get_theme(palette),
+            theme:         get_theme(palette),
             address_bar_focused: false,
-            address_bar_input: String::new(),
+            address_bar_input:   String::new(),
             bookmarks: vec![
-                QuickLink { title: "GitHub".to_string(),      url: "https://github.com".to_string() },
-                QuickLink { title: "Hacker News".to_string(), url: "https://news.ycombinator.com".to_string() },
-                QuickLink { title: "Rust Lang".to_string(),   url: "https://www.rust-lang.org".to_string() },
-                QuickLink { title: "MDN".to_string(),         url: "https://developer.mozilla.org".to_string() },
-                QuickLink { title: "Servo".to_string(),       url: "https://servo.org".to_string() },
-                QuickLink { title: "Crates.io".to_string(),   url: "https://crates.io".to_string() },
+                QuickLink::new("GitHub",      "https://github.com"),
+                QuickLink::new("Hacker News", "https://news.ycombinator.com"),
+                QuickLink::new("Rust Lang",   "https://www.rust-lang.org"),
+                QuickLink::new("MDN",         "https://developer.mozilla.org"),
+                QuickLink::new("Servo",       "https://servo.org"),
+                QuickLink::new("Crates.io",   "https://crates.io"),
             ],
-            nav_btn_pressed: 0,
+            nav_btn_pressed:       0,
             nav_btn_pressed_frame: 0,
+            tab_width:      0,
+            active_pos:     0,
+            dirty:          DirtyFlags { tabs: true, chrome: true, content: true },
+            theme_version:  0,
+            hovered_region: HoveredRegion::None,
+        };
+        s.update_layout();
+        s
+    }
+
+    // ── Private helpers ───────────────────────────────────────────────────────
+
+    fn update_layout(&mut self) {
+        self.tab_width  = layout::tab_width(self.tabs.len());
+        self.active_pos = self.tabs.iter()
+            .position(|t| t.id == self.active_tab_id)
+            .unwrap_or(0);
+    }
+
+    fn update_bookmark_flag(&mut self) {
+        let url   = self.active_tab().map(|t| t.url.clone()).unwrap_or_default();
+        let is_bm = !url.is_empty() && self.bookmarks.iter().any(|b| b.url == url);
+        if let Some(tab) = self.active_tab_mut() {
+            tab.is_bookmarked = is_bm;
         }
     }
 
-    // ── Tab accessors ─────────────────────────────────────────────────────────
+    /// Dirty only the hover-affected region for a given interactive element.
+    fn dirty_for_hover(region: HoveredRegion, d: &mut DirtyFlags) {
+        match region {
+            HoveredRegion::Tab(_) | HoveredRegion::TabClose(_) | HoveredRegion::NewTabBtn
+                => d.tabs = true,
+            HoveredRegion::NavBack | HoveredRegion::NavForward | HoveredRegion::NavReload
+            | HoveredRegion::AddressBar | HoveredRegion::BookmarkStar
+                => d.chrome = true,
+            HoveredRegion::QuickLink(_) | HoveredRegion::RetryBtn
+                => d.content = true,
+            // Moving within content area (non-interactive) → no visual change.
+            HoveredRegion::None | HoveredRegion::ContentArea => {}
+        }
+    }
+
+    /// Dirty chrome and, if the active tab is a new-tab page, content as well.
+    /// Used for address-bar events (typing, focus, blink) because the new-tab
+    /// search box mirrors the address bar input.
+    pub fn dirty_address_bar(&mut self) {
+        self.dirty.chrome = true;
+        if self.is_on_new_tab() {
+            self.dirty.content = true;
+        }
+    }
+
+    fn compute_hover_region(&self, x: u32, y: u32) -> HoveredRegion {
+        let tw = self.tab_width;
+
+        if y < TAB_BAR_HEIGHT {
+            for (i, _) in self.tabs.iter().enumerate() {
+                let lx = TAB_START_X + i as u32 * (tw + TAB_SEP);
+                let rx = lx + tw;
+                if x >= lx && x < rx {
+                    return if x >= lx + tw.saturating_sub(18) {
+                        HoveredRegion::TabClose(i)
+                    } else {
+                        HoveredRegion::Tab(i)
+                    };
+                }
+            }
+            let add_x = TAB_START_X + self.tabs.len() as u32 * (tw + TAB_SEP);
+            if x >= add_x && x < add_x + TAB_NEW_BTN_W {
+                return HoveredRegion::NewTabBtn;
+            }
+            return HoveredRegion::None;
+        }
+
+        if y < TOP_BAR_HEIGHT {
+            let r: u32 = 16;
+            if x >= 12 && x < 12 + r * 2 { return HoveredRegion::NavBack;    }
+            if x >= 54 && x < 54 + r * 2 { return HoveredRegion::NavForward; }
+            if x >= 96 && x < 96 + r * 2 { return HoveredRegion::NavReload;  }
+
+            let bar_x = (FB_WIDTH - ADDR_BAR_W) / 2;
+            let bar_y = TAB_BAR_HEIGHT + (CHROME_BAR_HEIGHT - ADDR_BAR_H) / 2;
+            if x >= bar_x && x < bar_x + ADDR_BAR_W && y >= bar_y && y < bar_y + ADDR_BAR_H {
+                return if x >= bar_x + ADDR_BAR_W - 26 {
+                    HoveredRegion::BookmarkStar
+                } else {
+                    HoveredRegion::AddressBar
+                };
+            }
+            return HoveredRegion::None;
+        }
+
+        // Content area
+        match self.active_tab().map(|t| &t.page_state) {
+            Some(PageState::Error(_)) => {
+                let (bx, by) = retry_btn_pos();
+                if x >= bx && x < bx + RETRY_BTN_W && y >= by && y < by + RETRY_BTN_H {
+                    return HoveredRegion::RetryBtn;
+                }
+            }
+            Some(PageState::NewTab) => {
+                let num = self.bookmarks.len().min(6) as u32;
+                if num > 0 {
+                    let cx    = FB_WIDTH / 2;
+                    let cy    = TOP_BAR_HEIGHT + (FB_HEIGHT - TOP_BAR_HEIGHT) / 2;
+                    let row_w = num * QUICK_LINK_W + (num - 1) * QUICK_LINK_GAP;
+                    let mut lx = cx.saturating_sub(row_w / 2);
+                    let ly    = cy + 46;
+                    for i in 0..num as usize {
+                        if x >= lx && x < lx + QUICK_LINK_W && y >= ly && y < ly + QUICK_LINK_H {
+                            return HoveredRegion::QuickLink(i);
+                        }
+                        lx += QUICK_LINK_W + QUICK_LINK_GAP;
+                    }
+                }
+            }
+            _ => {}
+        }
+
+        HoveredRegion::ContentArea
+    }
+
+    // ── Public accessors ──────────────────────────────────────────────────────
 
     pub fn active_tab(&self) -> Option<&TabState> {
+        // Fast path: cached index is almost always correct.
+        if let Some(t) = self.tabs.get(self.active_pos) {
+            if t.id == self.active_tab_id { return Some(t); }
+        }
+        // Fallback: O(n) scan (only hits if active_pos is stale).
         self.tabs.iter().find(|t| t.id == self.active_tab_id)
     }
 
     pub fn active_tab_mut(&mut self) -> Option<&mut TabState> {
-        self.tabs.iter_mut().find(|t| t.id == self.active_tab_id)
+        // Fast path: cached index is almost always correct.
+        let id = self.active_tab_id;
+        if let Some(t) = self.tabs.get(self.active_pos) {
+            if t.id == id {
+                return self.tabs.get_mut(self.active_pos);
+            }
+        }
+        self.tabs.iter_mut().find(|t| t.id == id)
     }
 
-    /// Index of the active tab in the tab Vec (for positional rendering).
-    pub fn active_tab_pos(&self) -> usize {
-        self.tabs.iter().position(|t| t.id == self.active_tab_id).unwrap_or(0)
+    pub fn is_on_new_tab(&self) -> bool {
+        self.active_tab().map_or(false, |t| t.page_state.is_new_tab())
+    }
+
+    // ── Mouse / hover ─────────────────────────────────────────────────────────
+
+    /// Store raw cursor position and dirty only the region whose hover state changed.
+    pub fn set_mouse_pos(&mut self, x: u32, y: u32) {
+        self.mouse_x = x;
+        self.mouse_y = y;
+        let region = self.compute_hover_region(x, y);
+        if region != self.hovered_region {
+            Self::dirty_for_hover(region,              &mut self.dirty);
+            Self::dirty_for_hover(self.hovered_region, &mut self.dirty);
+            self.hovered_region = region;
+        }
+    }
+
+    // ── Address bar input ─────────────────────────────────────────────────────
+
+    pub fn type_char(&mut self, c: char) {
+        self.address_bar_input.push(c);
+        self.dirty_address_bar();
+    }
+
+    pub fn type_backspace(&mut self) {
+        if self.address_bar_input.pop().is_some() {
+            self.dirty_address_bar();
+        }
     }
 
     // ── Tab lifecycle ─────────────────────────────────────────────────────────
 
     pub fn open_new_tab(&mut self) {
         let tab = TabState::new_tab();
-        let id = tab.id;
+        let id  = tab.id;
         self.tabs.push(tab);
         self.activate_tab(id);
     }
 
     pub fn close_tab(&mut self, id: TabId) {
         if self.tabs.len() == 1 {
-            // Replace the last tab with a fresh New Tab instead of emptying the vec.
-            let fresh = TabState::new_tab();
+            let fresh    = TabState::new_tab();
             let fresh_id = fresh.id;
-            self.tabs[0] = fresh;
+            self.tabs[0]       = fresh;
             self.active_tab_id = fresh_id;
             self.sync_address_bar();
+            self.update_layout();
+            self.dirty.all();
             return;
         }
         let Some(idx) = self.tabs.iter().position(|t| t.id == id) else { return };
@@ -241,105 +448,116 @@ impl BrowserState {
         self.tabs.remove(idx);
         if closing_active {
             let new_idx = idx.min(self.tabs.len() - 1);
-            let new_id = self.tabs[new_idx].id;
+            let new_id  = self.tabs[new_idx].id;
             self.activate_tab(new_id);
         }
+        self.update_layout();
+        self.dirty.all();
     }
 
     pub fn activate_tab(&mut self, id: TabId) {
         if self.tabs.iter().any(|t| t.id == id) {
-            self.active_tab_id = id;
+            self.active_tab_id   = id;
             self.address_bar_focused = false;
             self.sync_address_bar();
+            self.update_layout();
+            self.update_bookmark_flag();
+            self.dirty.all();
         }
     }
 
     // ── Navigation ────────────────────────────────────────────────────────────
 
-    /// Start navigating the active tab to `url`. Returns url for caller to hand
-    /// to the render engine.
     pub fn begin_navigate(&mut self, url: &str) -> Option<String> {
         if url.is_empty() { return None; }
         let frame = self.frame_count;
-        let url = url.to_string();
+        let url   = url.to_string();
         if let Some(tab) = self.active_tab_mut() {
-            tab.url = url.clone();
-            tab.display_url = url.clone();
-            tab.title = derive_title(&url);
-            tab.page_state = PageState::Loading;
+            tab.url              = url.clone();
+            tab.display_url      = url.clone();
+            tab.title            = derive_title(&url).to_string();
+            tab.page_state       = PageState::Loading;
             tab.load_start_frame = frame;
         }
-        self.address_bar_input = url.clone();
+        self.address_bar_input   = url.clone();
         self.address_bar_focused = false;
+        self.update_bookmark_flag();
+        self.dirty.all();
         Some(url)
     }
 
-    /// Called by the main loop once loading has resolved successfully.
     pub fn resolve_loading(&mut self, engine_title: String) {
         let url = match self.active_tab() {
             Some(t) if t.page_state.is_loading() => t.url.clone(),
             _ => return,
         };
-        let title = if engine_title.is_empty() { derive_title(&url) } else { engine_title };
+        let title = if engine_title.is_empty() {
+            derive_title(&url).to_string()
+        } else {
+            engine_title
+        };
         if let Some(tab) = self.active_tab_mut() {
-            tab.title = title.clone();
+            tab.title      = title.clone();
             tab.page_state = PageState::Loaded;
             tab.commit(&url, &title);
         }
+        // Tab title changed, icon changed, page content changed.
+        self.dirty.all();
     }
 
-    /// Called when loading times out or the engine signals an error.
     pub fn fail_loading(&mut self, message: &str) {
         if let Some(tab) = self.active_tab_mut() {
             if tab.page_state.is_loading() {
                 tab.page_state = PageState::Error(message.to_string());
+                self.dirty.all();
             }
         }
     }
 
-    /// Navigate back within the active tab's history.
-    /// Returns the URL to load, or None if at the beginning.
     pub fn go_back(&mut self) -> Option<String> {
         let frame = self.frame_count;
-        let tab = self.active_tab_mut()?;
+        let tab   = self.active_tab_mut()?;
         if !tab.can_go_back() { return None; }
         tab.history_index -= 1;
         let entry = tab.history[tab.history_index].clone();
-        tab.url = entry.url.clone();
-        tab.display_url = entry.display_url.clone();
-        tab.title = entry.title.clone();
-        tab.page_state = PageState::Loading;
+        tab.url              = entry.url.clone();
+        tab.display_url      = entry.display_url.clone();
+        tab.title            = entry.title.clone();
+        tab.page_state       = PageState::Loading;
         tab.load_start_frame = frame;
         self.address_bar_input = entry.url.clone();
+        self.update_bookmark_flag();
+        self.dirty.all();
         Some(entry.url)
     }
 
-    /// Navigate forward within the active tab's history.
     pub fn go_forward(&mut self) -> Option<String> {
         let frame = self.frame_count;
-        let tab = self.active_tab_mut()?;
+        let tab   = self.active_tab_mut()?;
         if !tab.can_go_forward() { return None; }
         tab.history_index += 1;
         let entry = tab.history[tab.history_index].clone();
-        tab.url = entry.url.clone();
-        tab.display_url = entry.display_url.clone();
-        tab.title = entry.title.clone();
-        tab.page_state = PageState::Loading;
+        tab.url              = entry.url.clone();
+        tab.display_url      = entry.display_url.clone();
+        tab.title            = entry.title.clone();
+        tab.page_state       = PageState::Loading;
         tab.load_start_frame = frame;
         self.address_bar_input = entry.url.clone();
+        self.update_bookmark_flag();
+        self.dirty.all();
         Some(entry.url)
     }
 
-    /// Reload the active tab. Returns the URL to reload, or None.
     pub fn reload(&mut self) -> Option<String> {
         let frame = self.frame_count;
-        let url = self.active_tab()
+        let url   = self.active_tab()
             .filter(|t| !t.url.is_empty())
             .map(|t| t.url.clone())?;
         if let Some(tab) = self.active_tab_mut() {
-            tab.page_state = PageState::Loading;
+            tab.page_state       = PageState::Loading;
             tab.load_start_frame = frame;
         }
+        self.dirty.all();
         Some(url)
     }
 
@@ -348,40 +566,43 @@ impl BrowserState {
     pub fn sync_address_bar(&mut self) {
         let url = self.active_tab().map(|t| t.url.clone()).unwrap_or_default();
         self.address_bar_input = url;
+        // sync_address_bar is called internally from activate/close; callers set
+        // the appropriate dirty flags themselves.
     }
 
     pub fn focus_address_bar(&mut self) {
         self.address_bar_focused = true;
+        self.dirty_address_bar();
     }
 
     pub fn cancel_address_bar_edit(&mut self) {
         self.address_bar_focused = false;
         self.sync_address_bar();
+        self.dirty_address_bar();
     }
 
     // ── Theme ─────────────────────────────────────────────────────────────────
 
     pub fn cycle_theme(&mut self) {
-        let next = self.palette.cycle();
+        let next     = self.palette.cycle();
         self.palette = next;
-        self.theme = get_theme(next);
+        self.theme   = get_theme(next);
+        self.theme_version += 1;
+        self.dirty.all();
     }
 
-    // ── Mouse / input helpers ─────────────────────────────────────────────────
-
-    pub fn set_mouse_pos(&mut self, x: u32, y: u32) {
-        self.mouse_x = x;
-        self.mouse_y = y;
-    }
+    // ── Nav button press indicator ────────────────────────────────────────────
 
     pub fn press_nav_btn(&mut self, id: u8) {
-        self.nav_btn_pressed = id;
+        self.nav_btn_pressed       = id;
         self.nav_btn_pressed_frame = self.frame_count;
+        self.dirty.chrome = true;
     }
 
     pub fn tick_nav_btn(&mut self) {
         if self.nav_btn_pressed != 0 && self.frame_count > self.nav_btn_pressed_frame + 12 {
             self.nav_btn_pressed = 0;
+            self.dirty.chrome    = true;
         }
     }
 
@@ -395,18 +616,11 @@ impl BrowserState {
         if was {
             self.bookmarks.retain(|b| b.url != url);
         } else {
-            self.bookmarks.push(QuickLink { title, url });
+            self.bookmarks.push(QuickLink::new(title, url));
         }
         if let Some(tab) = self.active_tab_mut() {
             tab.is_bookmarked = !was;
         }
-    }
-
-    pub fn refresh_bookmark_flag(&mut self) {
-        let url = self.active_tab().map(|t| t.url.clone()).unwrap_or_default();
-        let is_bm = !url.is_empty() && self.bookmarks.iter().any(|b| b.url == url);
-        if let Some(tab) = self.active_tab_mut() {
-            tab.is_bookmarked = is_bm;
-        }
+        self.dirty.chrome = true;
     }
 }

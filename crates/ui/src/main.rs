@@ -3,69 +3,33 @@ mod display;
 mod draw;
 mod font;
 mod input;
+mod layout;
 mod theme;
 mod ui_state;
 
 use crate::font::FontManager;
+use crate::layout::*;
 use rashamon_net::HttpClient;
-use rashamon_renderer::{framebuffer::Pixel, Framebuffer, RenderEngine};
-use ui_state::{BrowserState, PageState, TabId, derive_title};
-
-// ── Layout ────────────────────────────────────────────────────────────────────
-
-const FB_WIDTH: u32       = 1920;
-const FB_HEIGHT: u32      = 1080;
-const TAB_BAR_HEIGHT: u32 = 38;
-const CHROME_BAR_HEIGHT: u32 = 44;
-const TOP_BAR_HEIGHT: u32 = TAB_BAR_HEIGHT + CHROME_BAR_HEIGHT; // 82
-
-const TAB_START_X: u32  = 8;
-const TAB_SEP: u32       = 2;
-const TAB_MAX_W: u32     = 180;
-const TAB_MIN_W: u32     = 80;
-const TAB_NEW_BTN_W: u32 = 36;
-
-const ADDR_BAR_W: u32 = 700;
-const ADDR_BAR_H: u32 = 30;
-const ADDR_BAR_R: u32 = 15;
+use rashamon_renderer::{Framebuffer, RenderEngine};
+use ui_state::{BrowserState, DirtyFlags, PageState, derive_title};
 
 // Loading timing (at 60 fps)
-const LOAD_MIN_FRAMES: u64     = 60;  // 1 s minimum for visible loading state
-const LOAD_TIMEOUT_FRAMES: u64 = 360; // 6 s → error
-
-// Retry button (shared by draw + click hit-test)
-const RETRY_BTN_W: u32 = 140;
-const RETRY_BTN_H: u32 = 38;
+const LOAD_MIN_FRAMES:     u64 = 60;   // 1 s minimum visible loading state
+const LOAD_TIMEOUT_FRAMES: u64 = 360;  // 6 s → show error
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
-/// Scale a window-space coordinate to FB-space, clamped to [0, max-1].
 #[inline]
 fn scale(v: i32, factor: f32, max: u32) -> u32 {
     ((v.max(0) as f32 * factor) as u32).min(max - 1)
 }
 
-fn compute_tab_width(n: usize) -> u32 {
-    let avail = FB_WIDTH.saturating_sub(TAB_START_X + TAB_NEW_BTN_W + 12);
-    ((avail / n.max(1) as u32).saturating_sub(TAB_SEP))
-        .min(TAB_MAX_W)
-        .max(TAB_MIN_W)
-}
-
-fn retry_btn_pos() -> (u32, u32) {
-    let cx = FB_WIDTH / 2;
-    let cy = TOP_BAR_HEIGHT + (FB_HEIGHT - TOP_BAR_HEIGHT) / 2;
-    (cx.saturating_sub(RETRY_BTN_W / 2), cy + 80)
-}
-
-/// Parse raw address-bar text into a full URL or DuckDuckGo search.
+/// Resolve raw address-bar text to a full URL or DuckDuckGo search.
 fn resolve_url(raw: &str) -> String {
     let raw = raw.trim();
-    if raw.is_empty() { return String::new(); }
-    if raw.contains("://") { return raw.to_string(); }
-    if !raw.contains(' ') && raw.contains('.') {
-        return format!("https://{raw}");
-    }
+    if raw.is_empty()                          { return String::new(); }
+    if raw.contains("://")                     { return raw.to_string(); }
+    if !raw.contains(' ') && raw.contains('.') { return format!("https://{raw}"); }
     format!("https://duckduckgo.com/?q={}", raw.replace(' ', "+"))
 }
 
@@ -78,28 +42,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let video = sdl.video()?;
     let _     = sdl.mouse().show_cursor(true);
 
-    // Enable text input so SDL fires TextInput events for printable keys.
-    // Must be called before the event loop starts.
     let text_input = video.text_input();
     text_input.start();
 
-    // Query actual display resolution so the window fits the screen.
-    // We keep the logical FB at FB_WIDTH×FB_HEIGHT for all layout maths,
-    // but scale mouse coordinates from window space → FB space.
     let (win_w, win_h) = video
         .current_display_mode(0)
         .map(|m| (m.w as u32, m.h as u32))
         .unwrap_or((FB_WIDTH, FB_HEIGHT));
-    let win_w = win_w.min(FB_WIDTH);
-    let win_h = win_h.min(FB_HEIGHT);
+    let win_w   = win_w.min(FB_WIDTH);
+    let win_h   = win_h.min(FB_HEIGHT);
     let scale_x = FB_WIDTH  as f32 / win_w as f32;
     let scale_y = FB_HEIGHT as f32 / win_h as f32;
     eprintln!("[main] window {}x{}, scale {:.2}x{:.2}", win_w, win_h, scale_x, scale_y);
 
     let event_pump = sdl.event_pump()?;
 
-    let font_data   = include_bytes!("../assets/DejaVuSansMono.ttf");
-    let font        = FontManager::new(font_data)?;
+    let font_data = include_bytes!("../assets/DejaVuSansMono.ttf");
+    let font      = FontManager::new(font_data)?;
     let mut fb      = Framebuffer::new(FB_WIDTH, FB_HEIGHT);
     let mut engine  = RenderEngine::new()?;
     let _http       = HttpClient::new();
@@ -107,7 +66,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut display = display::Display::new(&video, win_w, win_h, FB_WIDTH, FB_HEIGHT)?;
     let mut input   = input::InputHandler::new(event_pump)?;
 
-    // Optional command-line URL
     if let Some(arg_url) = std::env::args().nth(1) {
         let url = resolve_url(&arg_url);
         if let Some(url) = state.begin_navigate(&url) {
@@ -115,12 +73,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    let mut running = true;
+    let mut running          = true;
+    let mut last_blink_phase = 0u64;
+
     while running {
         state.frame_count += 1;
         state.tick_nav_btn();
 
-        // ── Events: drain the ENTIRE queue each frame ─────────────────────────
+        // ── Events ────────────────────────────────────────────────────────────
         while let Some(ev) = input.poll_event()? {
             match ev {
                 input::Event::Quit => { running = false; break; }
@@ -128,30 +88,66 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 input::Event::KeyPress(k) =>
                     on_key(&mut state, &mut engine, &mut running, k, &input)?,
 
-                // Scale window-space coords → FB-space before any hit-testing.
                 input::Event::MouseMove { x, y } => {
                     let fx = scale(x, scale_x, FB_WIDTH);
                     let fy = scale(y, scale_y, FB_HEIGHT);
+                    // Internally computes hover region and dirties only the
+                    // affected strip when the region changes.
                     state.set_mouse_pos(fx, fy);
                 }
+
                 input::Event::MouseDown { x, y, button } if button == 1 => {
                     let fx = scale(x, scale_x, FB_WIDTH);
                     let fy = scale(y, scale_y, FB_HEIGHT);
                     on_click(&mut state, &mut engine, fx, fy);
                 }
+
                 _ => {}
             }
         }
 
         // ── Loading state machine ─────────────────────────────────────────────
         tick_loading(&mut state, &mut engine);
-        state.refresh_bookmark_flag();
 
-        // ── Render ────────────────────────────────────────────────────────────
-        fb.clear(state.theme.bg);
-        engine.render(&mut fb)?;
-        render_ui(&mut fb, &state, &font);
-        display.present(&fb)?;
+        // ── Continuous-animation dirty ────────────────────────────────────────
+
+        // Loading: spinner in chrome, progress bar in tab strip, overlay in content.
+        if state.active_tab().map_or(false, |t| t.page_state.is_loading()) {
+            state.dirty.tabs    = true;
+            state.dirty.chrome  = true;
+            state.dirty.content = true;
+        }
+
+        // Cursor blink: only the address bar strip (and content if new-tab search box).
+        if state.address_bar_focused {
+            let blink = state.frame_count / 28;
+            if blink != last_blink_phase {
+                last_blink_phase = blink;
+                state.dirty_address_bar();
+            }
+        }
+
+        // ── Render — only dirty regions ───────────────────────────────────────
+        if state.dirty.any() {
+            let dirty = state.dirty;
+            state.dirty.clear();
+
+            // Content area: clear + engine render + page-state overlay.
+            // Engine render is skipped for non-Loaded states (they self-clear).
+            if dirty.content {
+                let page = state.active_tab().map(|t| &t.page_state);
+                if matches!(page, Some(PageState::Loaded) | None) {
+                    // Engine renders the web page; fill first so blank tabs
+                    // don't show stale content.
+                    fb.fill_rect(0, TOP_BAR_HEIGHT, FB_WIDTH,
+                        FB_HEIGHT - TOP_BAR_HEIGHT, state.theme.bg);
+                    engine.render(&mut fb)?;
+                }
+            }
+
+            render_ui(&mut fb, &state, &font, dirty);
+            display.present(&fb)?;
+        }
 
         std::thread::sleep(std::time::Duration::from_millis(16));
     }
@@ -180,11 +176,11 @@ fn tick_loading(state: &mut BrowserState, engine: &mut RenderEngine) {
 // ── Keyboard ──────────────────────────────────────────────────────────────────
 
 fn on_key(
-    state: &mut BrowserState,
-    engine: &mut RenderEngine,
+    state:   &mut BrowserState,
+    engine:  &mut RenderEngine,
     running: &mut bool,
-    key: input::Key,
-    input: &input::InputHandler,
+    key:     input::Key,
+    input:   &input::InputHandler,
 ) -> Result<(), Box<dyn std::error::Error>> {
     match key {
         input::Key::Escape => {
@@ -204,7 +200,6 @@ fn on_key(
         input::Key::Char('w') if input.is_ctrl_pressed() => {
             let id = state.active_tab_id;
             state.close_tab(id);
-            // Re-navigate engine to whichever tab is now active
             if let Some(url) = state.active_tab().map(|t| t.url.clone()).filter(|u| !u.is_empty()) {
                 engine.navigate(&url).ok();
             }
@@ -230,11 +225,11 @@ fn on_key(
         }
 
         input::Key::Backspace if state.address_bar_focused => {
-            state.address_bar_input.pop();
+            state.type_backspace();
         }
 
         input::Key::Char(c) if state.address_bar_focused => {
-            state.address_bar_input.push(c);
+            state.type_char(c);
         }
 
         _ => {}
@@ -255,28 +250,23 @@ fn on_click(state: &mut BrowserState, engine: &mut RenderEngine, x: u32, y: u32)
 }
 
 fn click_tab_bar(state: &mut BrowserState, engine: &mut RenderEngine, x: u32) {
-    let tw = compute_tab_width(state.tabs.len());
+    let tw = state.tab_width;
 
-    // Collect (tab_id, left_x, right_x, close_x) to avoid borrowing issues
-    let slots: Vec<(TabId, u32, u32, u32)> = state.tabs.iter().enumerate().map(|(i, t)| {
-        let lx = TAB_START_X + i as u32 * (tw + TAB_SEP);
+    // Iterate directly — no Vec allocation.
+    for i in 0..state.tabs.len() {
+        let lx      = TAB_START_X + i as u32 * (tw + TAB_SEP);
+        let rx      = lx + tw;
         let close_x = lx + tw.saturating_sub(18);
-        (t.id, lx, lx + tw, close_x)
-    }).collect();
 
-    for (id, lx, rx, close_x) in &slots {
-        if x >= *close_x && x < *rx {
-            // Close button
-            state.close_tab(*id);
-            if let Some(url) = state.active_tab().map(|t| t.url.clone()).filter(|u| !u.is_empty()) {
-                engine.navigate(&url).ok();
-            }
-            return;
-        }
-        if x >= *lx && x < *rx {
-            // Tab body — activate
-            if *id != state.active_tab_id {
-                state.activate_tab(*id);
+        if x >= lx && x < rx {
+            let id = state.tabs[i].id;
+            if x >= close_x {
+                state.close_tab(id);
+                if let Some(url) = state.active_tab().map(|t| t.url.clone()).filter(|u| !u.is_empty()) {
+                    engine.navigate(&url).ok();
+                }
+            } else if id != state.active_tab_id {
+                state.activate_tab(id);
                 if let Some(url) = state.active_tab().map(|t| t.url.clone()).filter(|u| !u.is_empty()) {
                     engine.navigate(&url).ok();
                 }
@@ -285,7 +275,6 @@ fn click_tab_bar(state: &mut BrowserState, engine: &mut RenderEngine, x: u32) {
         }
     }
 
-    // New tab (+) button
     let next_x = TAB_START_X + state.tabs.len() as u32 * (tw + TAB_SEP);
     if x >= next_x && x < next_x + TAB_NEW_BTN_W {
         state.open_new_tab();
@@ -295,49 +284,36 @@ fn click_tab_bar(state: &mut BrowserState, engine: &mut RenderEngine, x: u32) {
 fn click_chrome_bar(state: &mut BrowserState, engine: &mut RenderEngine, x: u32, y: u32) {
     let btn_r: u32 = 16;
 
-    // Back
     if x >= 12 && x < 12 + btn_r * 2 {
         state.press_nav_btn(1);
-        if let Some(url) = state.go_back() {
-            engine.navigate(&url).ok();
-        }
+        if let Some(url) = state.go_back() { engine.navigate(&url).ok(); }
         return;
     }
-    // Forward
     if x >= 54 && x < 54 + btn_r * 2 {
         state.press_nav_btn(2);
-        if let Some(url) = state.go_forward() {
-            engine.navigate(&url).ok();
-        }
+        if let Some(url) = state.go_forward() { engine.navigate(&url).ok(); }
         return;
     }
-    // Reload
     if x >= 96 && x < 96 + btn_r * 2 {
         state.press_nav_btn(3);
-        if let Some(url) = state.reload() {
-            engine.navigate(&url).ok();
-        }
+        if let Some(url) = state.reload() { engine.navigate(&url).ok(); }
         return;
     }
 
-    // Address bar
     let bar_x = (FB_WIDTH - ADDR_BAR_W) / 2;
     let bar_y = TAB_BAR_HEIGHT + (CHROME_BAR_HEIGHT - ADDR_BAR_H) / 2;
 
-    // Bookmark star (rightmost 26px of bar)
     if x >= bar_x + ADDR_BAR_W - 26 && x < bar_x + ADDR_BAR_W
         && y >= bar_y && y < bar_y + ADDR_BAR_H
     {
         state.toggle_bookmark();
         return;
     }
-
     if x >= bar_x && x < bar_x + ADDR_BAR_W && y >= bar_y && y < bar_y + ADDR_BAR_H {
         state.focus_address_bar();
         return;
     }
 
-    // Clicking elsewhere in chrome → cancel editing
     state.cancel_address_bar_edit();
 }
 
@@ -346,11 +322,9 @@ fn click_content(state: &mut BrowserState, engine: &mut RenderEngine, x: u32, y:
 
     match page {
         Some(PageState::Error(_)) => {
-            let (bx, by) = retry_btn_pos();
+            let (bx, by) = layout::retry_btn_pos();
             if x >= bx && x < bx + RETRY_BTN_W && y >= by && y < by + RETRY_BTN_H {
-                if let Some(url) = state.reload() {
-                    engine.navigate(&url).ok();
-                }
+                if let Some(url) = state.reload() { engine.navigate(&url).ok(); }
                 return;
             }
         }
@@ -359,7 +333,6 @@ fn click_content(state: &mut BrowserState, engine: &mut RenderEngine, x: u32, y:
             let cx = FB_WIDTH / 2;
             let cy = TOP_BAR_HEIGHT + (FB_HEIGHT - TOP_BAR_HEIGHT) / 2;
 
-            // Search box → focus address bar
             let sw: u32 = 600;
             let sh: u32 = 48;
             let sx = cx.saturating_sub(sw / 2);
@@ -369,25 +342,22 @@ fn click_content(state: &mut BrowserState, engine: &mut RenderEngine, x: u32, y:
                 return;
             }
 
-            // Quick link cards
             let num = state.bookmarks.len().min(6) as u32;
             if num > 0 {
-                let cw: u32 = 120;
-                let ch: u32 = 100;
-                let gap: u32 = 16;
-                let row_w = num * cw + (num - 1) * gap;
+                let row_w = num * QUICK_LINK_W + (num - 1) * QUICK_LINK_GAP;
                 let mut lx = cx.saturating_sub(row_w / 2);
                 let ly = cy + 46;
+                // Collect URLs first to avoid borrow-during-navigation issues.
                 let urls: Vec<String> = state.bookmarks.iter().take(6)
                     .map(|b| b.url.clone()).collect();
                 for url in urls {
-                    if x >= lx && x < lx + cw && y >= ly && y < ly + ch {
+                    if x >= lx && x < lx + QUICK_LINK_W && y >= ly && y < ly + QUICK_LINK_H {
                         if let Some(url) = state.begin_navigate(&url) {
                             engine.navigate(&url).ok();
                         }
                         return;
                     }
-                    lx += cw + gap;
+                    lx += QUICK_LINK_W + QUICK_LINK_GAP;
                 }
             }
         }
@@ -398,74 +368,84 @@ fn click_content(state: &mut BrowserState, engine: &mut RenderEngine, x: u32, y:
     state.cancel_address_bar_edit();
 }
 
-// ── Top-level render ──────────────────────────────────────────────────────────
+// ── Top-level render (region-aware) ──────────────────────────────────────────
 
-fn render_ui(fb: &mut Framebuffer, state: &BrowserState, font: &FontManager) {
-    let theme = state.theme;
+/// Repaint only the regions marked dirty. Each region self-clears before
+/// drawing so there is no stale overdraw from the previous frame.
+fn render_ui(
+    fb:    &mut Framebuffer,
+    state: &BrowserState,
+    font:  &FontManager,
+    dirty: DirtyFlags,
+) {
+    let theme      = state.theme;
+    let tw         = state.tab_width;
+    let active_pos = state.active_pos;
 
-    // Content-area overlays (under the chrome)
-    match state.active_tab().map(|t| &t.page_state) {
-        Some(PageState::NewTab)    => draw_new_tab(fb, state, font),
-        Some(PageState::Loading)   => draw_loading(fb, state, font),
-        Some(PageState::Error(_))  => draw_error(fb, state, font),
-        Some(PageState::Loaded) | None => {} // engine rendered the page
+    // ── Content area ─────────────────────────────────────────────────────────
+    if dirty.content {
+        match state.active_tab().map(|t| &t.page_state) {
+            Some(PageState::NewTab)   => draw_new_tab(fb, state, font),
+            Some(PageState::Loading)  => draw_loading(fb, state, font),
+            Some(PageState::Error(_)) => draw_error(fb, state, font),
+            Some(PageState::Loaded) | None => {
+                // Web content already rendered by engine.render in main loop.
+            }
+        }
     }
 
-    // Tab bar
-    fb.fill_rect(0, 0, fb.width, TAB_BAR_HEIGHT, theme.tab_bar_bg);
-    draw_tab_row(fb, state, font);
+    // ── Tab strip ─────────────────────────────────────────────────────────────
+    if dirty.tabs {
+        fb.fill_rect(0, 0, fb.width, TAB_BAR_HEIGHT, theme.tab_bar_bg);
+        draw_tab_row(fb, state, font);
+        // Full-width border, then erase the active tab's segment so the active
+        // tab visually blends into the chrome bar below.
+        fb.fill_rect(0, TAB_BAR_HEIGHT - 1, fb.width, 1, theme.border);
+        let active_x = TAB_START_X + active_pos as u32 * (tw + TAB_SEP);
+        fb.fill_rect(active_x, TAB_BAR_HEIGHT - 1, tw, 2, theme.surface);
+    }
 
-    // Separator between tab row and chrome row
-    fb.fill_rect(0, TAB_BAR_HEIGHT - 1, fb.width, 1, theme.border);
-    // Erase separator under the active tab for the "connected" look
-    let tw = compute_tab_width(state.tabs.len());
-    let active_pos = state.active_tab_pos();
-    let active_x = TAB_START_X + active_pos as u32 * (tw + TAB_SEP);
-    fb.fill_rect(active_x, TAB_BAR_HEIGHT - 1, tw, 2, theme.surface);
-
-    // Chrome row
-    fb.fill_rect(0, TAB_BAR_HEIGHT, fb.width, CHROME_BAR_HEIGHT, theme.surface);
-    draw_chrome_row(fb, state, font);
-    fb.fill_rect(0, TOP_BAR_HEIGHT, fb.width, 1, theme.border);
+    // ── Chrome row ────────────────────────────────────────────────────────────
+    if dirty.chrome {
+        fb.fill_rect(0, TAB_BAR_HEIGHT, fb.width, CHROME_BAR_HEIGHT, theme.surface);
+        draw_chrome_row(fb, state, font);
+        // Separator between chrome and content.
+        fb.fill_rect(0, TOP_BAR_HEIGHT, fb.width, 1, theme.border);
+    }
 }
 
 // ── Tab row ───────────────────────────────────────────────────────────────────
 
 fn draw_tab_row(fb: &mut Framebuffer, state: &BrowserState, font: &FontManager) {
     let theme = state.theme;
-    let tw = compute_tab_width(state.tabs.len());
+    let tw    = state.tab_width;
     const TOP: u32 = 4;
-    const H: u32   = TAB_BAR_HEIGHT - TOP;
+    const H:   u32 = TAB_BAR_HEIGHT - TOP;
 
     for (i, tab) in state.tabs.iter().enumerate() {
-        let tx = TAB_START_X + i as u32 * (tw + TAB_SEP);
+        let tx         = TAB_START_X + i as u32 * (tw + TAB_SEP);
         let is_active  = tab.id == state.active_tab_id;
         let is_hovered = state.mouse_y < TAB_BAR_HEIGHT
             && state.mouse_x >= tx && state.mouse_x < tx + tw;
 
-        let bg = if is_active { theme.tab_active_bg }
-                 else if is_hovered { theme.tab_hover_bg }
-                 else { theme.tab_bg };
+        let bg = if is_active      { theme.tab_active_bg }
+                 else if is_hovered { theme.tab_hover_bg  }
+                 else               { theme.tab_bg        };
         let fg = if is_active { theme.tab_active_fg } else { theme.tab_fg };
 
         draw::draw_rounded_rect_top(fb, tx, TOP, tw, H, 6, bg);
 
         if is_active {
-            // Extend down to merge visually with chrome row
             fb.fill_rect(tx, TAB_BAR_HEIGHT - 2, tw, 3, theme.surface);
-            // Left accent bar
             fb.fill_rect(tx, TOP + 4, 2, H - 8, theme.accent);
         }
 
-        // Title
-        let title = tab.tab_title();
-        let title_x = tx + 14;
-        let title_y = TOP + (H / 2).saturating_sub(7);
+        let title_x       = tx + 14;
+        let title_y       = TOP + (H / 2).saturating_sub(7);
         let close_reserve = if is_active || is_hovered { 24 } else { 8 };
-        let max_title_w = tw.saturating_sub(title_x - tx + close_reserve);
-        draw::draw_text(fb, font, title_x, title_y, title, 13.0, fg, max_title_w);
+        let max_title_w   = tw.saturating_sub(title_x - tx + close_reserve);
+        draw::draw_text(fb, font, title_x, title_y, tab.tab_title(), 13.0, fg, max_title_w);
 
-        // Close button
         if is_active || is_hovered {
             let cx = tx + tw.saturating_sub(16);
             let cy = TOP + H / 2;
@@ -478,13 +458,11 @@ fn draw_tab_row(fb: &mut Framebuffer, state: &BrowserState, font: &FontManager) 
             draw::draw_icon_close(fb, cx, cy, 7, fg);
         }
 
-        // Loading progress bar at bottom edge of tab
         if tab.page_state.is_loading() {
             let anim = (state.frame_count * 4 % tw as u64) as u32;
             fb.fill_rect(tx, TAB_BAR_HEIGHT - 3, anim, 2, theme.accent);
         }
 
-        // Error dot
         if tab.page_state.is_error() {
             let dot_x = tx + tw.saturating_sub(28);
             fb.fill_rect(dot_x, TOP + H / 2 - 3, 6, 6, theme.security_err);
@@ -495,8 +473,7 @@ fn draw_tab_row(fb: &mut Framebuffer, state: &BrowserState, font: &FontManager) 
         }
     }
 
-    // New tab (+) button
-    let add_x = TAB_START_X + state.tabs.len() as u32 * (tw + TAB_SEP);
+    let add_x  = TAB_START_X + state.tabs.len() as u32 * (tw + TAB_SEP);
     let add_cx = add_x + TAB_NEW_BTN_W / 2;
     let add_cy = TOP + H / 2;
     let add_hot = state.mouse_y < TAB_BAR_HEIGHT
@@ -510,7 +487,7 @@ fn draw_tab_row(fb: &mut Framebuffer, state: &BrowserState, font: &FontManager) 
 // ── Chrome row ────────────────────────────────────────────────────────────────
 
 fn draw_chrome_row(fb: &mut Framebuffer, state: &BrowserState, font: &FontManager) {
-    let cy = TAB_BAR_HEIGHT + CHROME_BAR_HEIGHT / 2;
+    let cy          = TAB_BAR_HEIGHT + CHROME_BAR_HEIGHT / 2;
     let can_back    = state.active_tab().map_or(false, |t| t.can_go_back());
     let can_forward = state.active_tab().map_or(false, |t| t.can_go_forward());
 
@@ -539,9 +516,9 @@ fn draw_nav_btn(fb: &mut Framebuffer, state: &BrowserState, cx: u32, cy: u32, bt
         draw::draw_circle_filled(fb, cx, cy, r, theme.control_hover_bg);
     }
 
-    let color = if pressed { theme.accent_fg }
-                else if !enabled { theme.fg_secondary }
-                else { theme.icon_fg };
+    let color = if pressed      { theme.accent_fg     }
+                else if !enabled { theme.fg_secondary  }
+                else             { theme.icon_fg        };
 
     match btn {
         NavBtn::Back    => draw::draw_icon_back(fb, cx, cy, 10, color),
@@ -553,33 +530,30 @@ fn draw_nav_btn(fb: &mut Framebuffer, state: &BrowserState, cx: u32, cy: u32, bt
 // ── Address bar ───────────────────────────────────────────────────────────────
 
 fn draw_address_bar(fb: &mut Framebuffer, state: &BrowserState, font: &FontManager) {
-    let theme = state.theme;
-    let bar_x = (FB_WIDTH - ADDR_BAR_W) / 2;
-    let bar_y = TAB_BAR_HEIGHT + (CHROME_BAR_HEIGHT - ADDR_BAR_H) / 2;
+    let theme  = state.theme;
+    let bar_x  = (FB_WIDTH - ADDR_BAR_W) / 2;
+    let bar_y  = TAB_BAR_HEIGHT + (CHROME_BAR_HEIGHT - ADDR_BAR_H) / 2;
 
-    // Background + border
     let bg     = if state.address_bar_focused { theme.address_bar_bg_focused } else { theme.address_bar_bg };
     let border = if state.address_bar_focused { theme.address_bar_border_focused } else { theme.address_bar_border };
     draw::draw_rounded_rect(fb, bar_x.saturating_sub(1), bar_y.saturating_sub(1),
         ADDR_BAR_W + 2, ADDR_BAR_H + 2, ADDR_BAR_R + 1, border);
     draw::draw_rounded_rect(fb, bar_x, bar_y, ADDR_BAR_W, ADDR_BAR_H, ADDR_BAR_R, bg);
 
-    // Left icon (lock / globe / spinner / error)
     let icon_x = bar_x + 14;
     let icon_y = bar_y + ADDR_BAR_H / 2;
     if let Some(tab) = state.active_tab() {
         match &tab.page_state {
-            PageState::Loading => draw::draw_icon_spinner(fb, icon_x, icon_y, 5, state.frame_count, theme.icon_fg),
-            PageState::Error(_) => draw::draw_circle_filled(fb, icon_x, icon_y, 5, theme.security_err),
+            PageState::Loading   => draw::draw_icon_spinner(fb, icon_x, icon_y, 5, state.frame_count, theme.icon_fg),
+            PageState::Error(_)  => draw::draw_circle_filled(fb, icon_x, icon_y, 5, theme.security_err),
             _ if tab.url.starts_with("https://") => draw::draw_icon_lock(fb, icon_x, icon_y, theme.security_ok),
-            _ if !tab.url.is_empty() => draw::draw_icon_globe(fb, icon_x, icon_y, theme.icon_fg),
+            _ if !tab.url.is_empty()             => draw::draw_icon_globe(fb, icon_x, icon_y, theme.icon_fg),
             _ => {}
         }
     }
 
-    // Text
-    let tx = bar_x + 34;
-    let ty = bar_y + (ADDR_BAR_H.saturating_sub(14)) / 2;
+    let tx    = bar_x + 34;
+    let ty    = bar_y + (ADDR_BAR_H.saturating_sub(14)) / 2;
     let max_w = ADDR_BAR_W.saturating_sub(34 + 30);
 
     if state.address_bar_input.is_empty() && !state.address_bar_focused {
@@ -587,15 +561,16 @@ fn draw_address_bar(fb: &mut Framebuffer, state: &BrowserState, font: &FontManag
     } else {
         draw::draw_text(fb, font, tx, ty, &state.address_bar_input, 14.0, theme.address_bar_fg, max_w);
         if state.address_bar_focused && (state.frame_count / 28) % 2 == 0 {
+            // text_width is cached: after the first call for this input string,
+            // subsequent calls (every blink phase) hit the cache with no font work.
             let cw = font.text_width(&state.address_bar_input, 14.0);
             let cx = (tx + cw + 1).min(bar_x + ADDR_BAR_W - 34);
             fb.fill_rect(cx, ty, 2, 15, theme.accent);
         }
     }
 
-    // Bookmark star
     if let Some(tab) = state.active_tab() {
-        let star_x = bar_x + ADDR_BAR_W - 18;
+        let star_x   = bar_x + ADDR_BAR_W - 18;
         let star_col = if tab.is_bookmarked { theme.accent } else { theme.icon_fg };
         draw::draw_icon_star(fb, star_x, icon_y, 11, star_col, tab.is_bookmarked);
     }
@@ -604,21 +579,20 @@ fn draw_address_bar(fb: &mut Framebuffer, state: &BrowserState, font: &FontManag
 // ── New Tab page ──────────────────────────────────────────────────────────────
 
 fn draw_new_tab(fb: &mut Framebuffer, state: &BrowserState, font: &FontManager) {
-    let theme = state.theme;
-    let cx = FB_WIDTH / 2;
+    let theme     = state.theme;
+    let cx        = FB_WIDTH / 2;
     let content_h = FB_HEIGHT - TOP_BAR_HEIGHT;
-    let cy = TOP_BAR_HEIGHT + content_h / 2;
+    let cy        = TOP_BAR_HEIGHT + content_h / 2;
 
     fb.fill_rect(0, TOP_BAR_HEIGHT, FB_WIDTH, content_h, theme.bg);
 
-    // Branding
     let brand = "rashamon arc";
-    let bw = font.text_width(brand, 32.0);
+    let bw    = font.text_width(brand, 32.0);
     draw::draw_text(fb, font, cx.saturating_sub(bw / 2), cy.saturating_sub(200), brand, 32.0, theme.fg, 600);
 
     let tagline = "your private arc of the web";
-    let tw = font.text_width(tagline, 15.0);
-    draw::draw_text(fb, font, cx.saturating_sub(tw / 2), cy.saturating_sub(156),
+    let tgw     = font.text_width(tagline, 15.0);
+    draw::draw_text(fb, font, cx.saturating_sub(tgw / 2), cy.saturating_sub(156),
         tagline, 15.0, theme.fg_secondary, 600);
 
     // Search box
@@ -634,27 +608,29 @@ fn draw_new_tab(fb: &mut Framebuffer, state: &BrowserState, font: &FontManager) 
 
     if state.address_bar_input.is_empty() {
         let hint = "Search or enter URL";
-        let hw = font.text_width(hint, 15.0);
+        let hw   = font.text_width(hint, 15.0);
         draw::draw_text(fb, font, sx + (sw - hw) / 2,
             sy + (sh.saturating_sub(14)) / 2, hint, 15.0, theme.placeholder, sw - 40);
     } else {
         draw::draw_text(fb, font, sx + 24, sy + (sh.saturating_sub(14)) / 2,
             &state.address_bar_input, 15.0, theme.address_bar_fg, sw - 48);
         if state.address_bar_focused && (state.frame_count / 28) % 2 == 0 {
-            let cw = font.text_width(&state.address_bar_input, 15.0);
+            // Reuses cached width computed moments ago in draw_address_bar.
+            let cw    = font.text_width(&state.address_bar_input, 15.0);
             let cur_x = (sx + 24 + cw + 1).min(sx + sw - 24);
             fb.fill_rect(cur_x, sy + (sh.saturating_sub(16)) / 2, 2, 16, theme.accent);
         }
     }
 
     let hints = "Ctrl+T  new tab   \u{2022}   Ctrl+W  close   \u{2022}   Ctrl+P  theme   \u{2022}   Ctrl+R  reload";
-    let hw = font.text_width(hints, 11.0);
+    let hw    = font.text_width(hints, 11.0);
     draw::draw_text(fb, font, cx.saturating_sub(hw / 2), sy + sh + 14,
         hints, 11.0, theme.fg_secondary, 900);
 
-    // Quick links
     draw_quick_links(fb, state, font, cx, cy);
 }
+
+use rashamon_renderer::framebuffer::Pixel;
 
 const FAVICON_COLORS: [Pixel; 8] = [
     Pixel { r: 79,  g: 140, b: 255 },
@@ -669,49 +645,50 @@ const FAVICON_COLORS: [Pixel; 8] = [
 
 fn draw_quick_links(fb: &mut Framebuffer, state: &BrowserState, font: &FontManager, cx: u32, cy: u32) {
     let theme = state.theme;
-    let cw: u32 = 120;
-    let ch: u32 = 100;
-    let gap: u32 = 16;
-    let num = state.bookmarks.len().min(6) as u32;
+    let num   = state.bookmarks.len().min(6) as u32;
     if num == 0 { return; }
 
-    let row_w = num * cw + (num - 1) * gap;
+    let row_w      = num * QUICK_LINK_W + (num - 1) * QUICK_LINK_GAP;
     let mut card_x = cx.saturating_sub(row_w / 2);
-    let card_y = cy + 46;
+    let card_y     = cy + 46;
 
     let lbl = "Quick access";
-    let lw = font.text_width(lbl, 11.0);
+    let lw  = font.text_width(lbl, 11.0);
     draw::draw_text(fb, font, cx.saturating_sub(lw / 2), card_y.saturating_sub(20),
         lbl, 11.0, theme.fg_secondary, 200);
 
     for (i, bm) in state.bookmarks.iter().take(6).enumerate() {
         let fav_col = FAVICON_COLORS[i % FAVICON_COLORS.len()];
-        let hovered = state.mouse_y >= card_y && state.mouse_y < card_y + ch
-            && state.mouse_x >= card_x && state.mouse_x < card_x + cw
+        let hovered = state.mouse_y >= card_y && state.mouse_y < card_y + QUICK_LINK_H
+            && state.mouse_x >= card_x && state.mouse_x < card_x + QUICK_LINK_W
             && state.mouse_y >= TOP_BAR_HEIGHT;
 
         let card_bg = if hovered { theme.new_tab_card_hover_bg } else { theme.new_tab_card_bg };
-        draw::draw_rounded_rect(fb, card_x, card_y, cw, ch, 10, card_bg);
+        draw::draw_rounded_rect(fb, card_x, card_y, QUICK_LINK_W, QUICK_LINK_H, 10, card_bg);
         if hovered {
-            draw::draw_rounded_rect_outline(fb, card_x as i32, card_y as i32, cw as i32, ch as i32, 10, theme.accent);
+            draw::draw_rounded_rect_outline(fb, card_x as i32, card_y as i32,
+                QUICK_LINK_W as i32, QUICK_LINK_H as i32, 10, theme.accent);
         }
 
-        let fav_cx = card_x + cw / 2;
+        let fav_cx = card_x + QUICK_LINK_W / 2;
         let fav_cy = card_y + 32;
         draw::draw_circle_filled(fb, fav_cx, fav_cy, 20, fav_col);
 
-        let first: String = bm.title.chars().next().unwrap_or('?').to_uppercase().collect();
-        let lw = font.text_width(&first, 16.0);
+        // Stack-allocated buffer — no heap allocation for single char.
+        let mut ch_buf = [0u8; 4];
+        let ch_str     = bm.first_upper.encode_utf8(&mut ch_buf);
+        let lw         = font.text_width(ch_str, 16.0);
         draw::draw_text(fb, font, fav_cx.saturating_sub(lw / 2), fav_cy.saturating_sub(8),
-            &first, 16.0, Pixel::WHITE, 24);
+            ch_str, 16.0, Pixel::WHITE, 24);
 
-        let title_y = card_y + ch - 28;
-        let max_tw = cw.saturating_sub(12);
+        let title_y = card_y + QUICK_LINK_H - 28;
+        let max_tw  = QUICK_LINK_W.saturating_sub(12);
+        // text_width for bookmark titles: cache hit after first render frame.
         let title_w = font.text_width(&bm.title, 12.0).min(max_tw);
-        let title_x = card_x + (cw - title_w) / 2;
+        let title_x = card_x + (QUICK_LINK_W - title_w) / 2;
         draw::draw_text(fb, font, title_x, title_y, &bm.title, 12.0, theme.fg, max_tw);
 
-        card_x += cw + gap;
+        card_x += QUICK_LINK_W + QUICK_LINK_GAP;
     }
 }
 
@@ -719,27 +696,30 @@ fn draw_quick_links(fb: &mut Framebuffer, state: &BrowserState, font: &FontManag
 
 fn draw_loading(fb: &mut Framebuffer, state: &BrowserState, font: &FontManager) {
     let theme = state.theme;
-    let cx = FB_WIDTH / 2;
-    let cy = TOP_BAR_HEIGHT + (FB_HEIGHT - TOP_BAR_HEIGHT) / 2;
+    let cx    = FB_WIDTH / 2;
+    let cy    = TOP_BAR_HEIGHT + (FB_HEIGHT - TOP_BAR_HEIGHT) / 2;
 
     fb.fill_rect(0, TOP_BAR_HEIGHT, FB_WIDTH, FB_HEIGHT - TOP_BAR_HEIGHT, theme.bg);
 
     draw::draw_icon_spinner(fb, cx, cy.saturating_sub(20), 14, state.frame_count, theme.fg_secondary);
 
-    let dots = match (state.frame_count / 18) % 4 { 1 => ".", 2 => "..", _ => "..." };
-    let msg = format!("Loading{dots}");
-    let mw = font.text_width(&msg, 14.0);
-    draw::draw_text(fb, font, cx.saturating_sub(mw / 2), cy + 8, &msg, 14.0, theme.fg_secondary, 200);
+    // Static string array — no allocation per frame.
+    const LOADING_MSGS: [&str; 4] = ["Loading...", "Loading.", "Loading..", "Loading..."];
+    let msg = LOADING_MSGS[((state.frame_count / 18) % 4) as usize];
+    let mw  = font.text_width(msg, 14.0);
+    draw::draw_text(fb, font, cx.saturating_sub(mw / 2), cy + 8, msg, 14.0, theme.fg_secondary, 200);
 
-    // Hostname hint
-    if let Some(host) = state.active_tab().map(|t| derive_title(&t.url)) {
-        let hw = font.text_width(&host, 12.0);
-        draw::draw_text(fb, font, cx.saturating_sub(hw / 2), cy + 30,
-            &host, 12.0, theme.placeholder, 600);
+    // derive_title borrows from tab.url — zero allocation.
+    if let Some(tab) = state.active_tab() {
+        if !tab.url.is_empty() {
+            let host = derive_title(&tab.url);
+            let hw   = font.text_width(host, 12.0);
+            draw::draw_text(fb, font, cx.saturating_sub(hw / 2), cy + 30,
+                host, 12.0, theme.placeholder, 600);
+        }
     }
 
-    // Progress bar at top of content area
-    let elapsed = state.frame_count.saturating_sub(
+    let elapsed  = state.frame_count.saturating_sub(
         state.active_tab().map_or(0, |t| t.load_start_frame));
     let progress = ((elapsed as f32 / LOAD_MIN_FRAMES as f32) * FB_WIDTH as f32) as u32;
     fb.fill_rect(0, TOP_BAR_HEIGHT + 1, progress.min(FB_WIDTH - 4), 2, theme.accent);
@@ -749,47 +729,45 @@ fn draw_loading(fb: &mut Framebuffer, state: &BrowserState, font: &FontManager) 
 
 fn draw_error(fb: &mut Framebuffer, state: &BrowserState, font: &FontManager) {
     let theme = state.theme;
-    let cx = FB_WIDTH / 2;
-    let cy = TOP_BAR_HEIGHT + (FB_HEIGHT - TOP_BAR_HEIGHT) / 2;
+    let cx    = FB_WIDTH / 2;
+    let cy    = TOP_BAR_HEIGHT + (FB_HEIGHT - TOP_BAR_HEIGHT) / 2;
 
     fb.fill_rect(0, TOP_BAR_HEIGHT, FB_WIDTH, FB_HEIGHT - TOP_BAR_HEIGHT, theme.bg);
 
-    // Error circle
     let icon_cy = cy.saturating_sub(72);
     draw::draw_circle_filled(fb, cx, icon_cy, 30, theme.security_err);
     draw::draw_icon_close(fb, cx, icon_cy, 16, Pixel::WHITE);
 
-    // Title
     let title = "Page couldn't be loaded";
-    let tw = font.text_width(title, 20.0);
+    let tw    = font.text_width(title, 20.0);
     draw::draw_text(fb, font, cx.saturating_sub(tw / 2), cy.saturating_sub(18),
         title, 20.0, theme.fg, 700);
 
-    // Error message
     let msg = state.active_tab()
         .and_then(|t| t.page_state.error_msg())
         .unwrap_or("The page is unavailable");
-    let mw = font.text_width(msg, 14.0);
+    let mw  = font.text_width(msg, 14.0);
     draw::draw_text(fb, font, cx.saturating_sub(mw / 2), cy + 14, msg, 14.0, theme.fg_secondary, 700);
 
-    // URL
-    if let Some(url) = state.active_tab().map(|t| t.url.as_str()).filter(|u| !u.is_empty()) {
-        let uw = font.text_width(url, 12.0).min(800);
-        draw::draw_text(fb, font, cx.saturating_sub(uw / 2), cy + 40, url, 12.0, theme.placeholder, 800);
+    if let Some(tab) = state.active_tab() {
+        if !tab.url.is_empty() {
+            let uw = font.text_width(&tab.url, 12.0).min(800);
+            draw::draw_text(fb, font, cx.saturating_sub(uw / 2), cy + 40,
+                &tab.url, 12.0, theme.placeholder, 800);
+        }
     }
 
-    // Retry button
-    let (bx, by) = retry_btn_pos();
-    let hovered = state.mouse_x >= bx && state.mouse_x < bx + RETRY_BTN_W
+    let (bx, by) = layout::retry_btn_pos();
+    let hovered  = state.mouse_x >= bx && state.mouse_x < bx + RETRY_BTN_W
         && state.mouse_y >= by && state.mouse_y < by + RETRY_BTN_H;
-    let btn_bg  = if hovered { theme.accent } else { theme.surface };
-    let btn_brd = if hovered { theme.accent } else { theme.border };
+    let btn_bg  = if hovered { theme.accent  } else { theme.surface };
+    let btn_brd = if hovered { theme.accent  } else { theme.border  };
     draw::draw_rounded_rect(fb, bx.saturating_sub(1), by.saturating_sub(1),
         RETRY_BTN_W + 2, RETRY_BTN_H + 2, 9, btn_brd);
     draw::draw_rounded_rect(fb, bx, by, RETRY_BTN_W, RETRY_BTN_H, 8, btn_bg);
 
-    let lbl = "Try again";
-    let lw = font.text_width(lbl, 14.0);
+    let lbl    = "Try again";
+    let lw     = font.text_width(lbl, 14.0);
     let lbl_fg = if hovered { theme.accent_fg } else { theme.fg };
     draw::draw_text(fb, font,
         bx + (RETRY_BTN_W.saturating_sub(lw)) / 2,

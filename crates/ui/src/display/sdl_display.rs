@@ -16,10 +16,19 @@ pub struct Display {
 }
 
 impl Display {
-    pub fn new(video: &VideoSubsystem, width: u32, height: u32) -> io::Result<Self> {
-        eprintln!("[display] {}x{} SDL2 output", width, height);
+    /// Create a window of `win_w × win_h` pixels that displays a framebuffer
+    /// of `fb_w × fb_h` pixels (stretched to fill the window if sizes differ).
+    pub fn new(
+        video: &VideoSubsystem,
+        win_w: u32,
+        win_h: u32,
+        fb_w: u32,
+        fb_h: u32,
+    ) -> io::Result<Self> {
+        eprintln!("[display] window {}x{}, fb {}x{} (SDL2)", win_w, win_h, fb_w, fb_h);
+
         let window = video
-            .window("Rashamon Arc", width, height)
+            .window("Rashamon Arc", win_w, win_h)
             .position_centered()
             .build()
             .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
@@ -30,55 +39,44 @@ impl Display {
             .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
 
         let texture_creator = canvas.texture_creator();
+        // The texture matches the *framebuffer* dimensions, not the window.
+        // SDL2 will scale it to fill the window on copy.
         let texture = texture_creator
-            .create_texture_streaming(PixelFormatEnum::RGB24, width, height)
+            .create_texture_streaming(PixelFormatEnum::RGB24, fb_w, fb_h)
             .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
 
-        // Unsafely extend the texture's lifetime to 'static. This is a common
-        // workaround for this issue in older versions of the sdl2 crate.
+        // Extend texture lifetime past texture_creator (standard SDL2 Rust workaround).
         let texture = unsafe { mem::transmute::<_, Texture<'static>>(texture) };
 
         canvas.clear();
         canvas.present();
 
-        Ok(Self {
-            canvas,
-            texture,
-            width,
-            height,
-        })
+        Ok(Self { canvas, texture, width: fb_w, height: fb_h })
     }
 
     pub fn present(&mut self, fb: &Framebuffer) -> io::Result<()> {
         self.texture
             .with_lock(None, |buffer: &mut [u8], pitch: usize| {
-                let fb_w = fb.width as usize;
-                let fb_h = fb.height as usize;
-
-                for y in 0..fb_h {
-                    let fb_row_start = y * fb.stride as usize;
-                    let texture_row_start = y * pitch;
-
-                    let fb_row = &fb.data[fb_row_start..fb_row_start + fb_w * 3];
-                    let texture_row = &mut buffer[texture_row_start..texture_row_start + fb_w * 3];
-
-                    for (i, chunk) in fb_row.chunks_exact(3).enumerate() {
-                        // Framebuffer is BGR, SDL texture is RGB
-                        let b = chunk[0];
-                        let g = chunk[1];
-                        let r = chunk[2];
-                        texture_row[i * 3] = r;
-                        texture_row[i * 3 + 1] = g;
-                        texture_row[i * 3 + 2] = b;
+                for y in 0..self.height as usize {
+                    let src = y * fb.stride as usize;
+                    let dst = y * pitch;
+                    let row_src = &fb.data[src..src + self.width as usize * 3];
+                    let row_dst = &mut buffer[dst..dst + self.width as usize * 3];
+                    for (i, chunk) in row_src.chunks_exact(3).enumerate() {
+                        // Framebuffer is BGR, SDL texture expects RGB
+                        row_dst[i * 3]     = chunk[2]; // R
+                        row_dst[i * 3 + 1] = chunk[1]; // G
+                        row_dst[i * 3 + 2] = chunk[0]; // B
                     }
                 }
             })
             .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
 
         self.canvas.clear();
-        self.canvas.copy(&self.texture, None, None).unwrap();
+        self.canvas
+            .copy(&self.texture, None, None)
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
         self.canvas.present();
-
         Ok(())
     }
 }

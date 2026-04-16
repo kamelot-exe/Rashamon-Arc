@@ -39,6 +39,12 @@ const RETRY_BTN_H: u32 = 38;
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
+/// Scale a window-space coordinate to FB-space, clamped to [0, max-1].
+#[inline]
+fn scale(v: i32, factor: f32, max: u32) -> u32 {
+    ((v.max(0) as f32 * factor) as u32).min(max - 1)
+}
+
 fn compute_tab_width(n: usize) -> u32 {
     let avail = FB_WIDTH.saturating_sub(TAB_START_X + TAB_NEW_BTN_W + 12);
     ((avail / n.max(1) as u32).saturating_sub(TAB_SEP))
@@ -68,19 +74,38 @@ fn resolve_url(raw: &str) -> String {
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     eprintln!("=== Rashamon Arc ===");
 
-    let sdl           = sdl2::init()?;
-    let video         = sdl.video()?;
-    let _             = sdl.mouse().show_cursor(true);
-    let event_pump    = sdl.event_pump()?;
+    let sdl   = sdl2::init()?;
+    let video = sdl.video()?;
+    let _     = sdl.mouse().show_cursor(true);
 
-    let font_data     = include_bytes!("../assets/DejaVuSansMono.ttf");
-    let font          = FontManager::new(font_data)?;
-    let mut fb        = Framebuffer::new(FB_WIDTH, FB_HEIGHT);
-    let mut engine    = RenderEngine::new()?;
-    let _http         = HttpClient::new();
-    let mut state     = BrowserState::new();
-    let mut display   = display::Display::new(&video, FB_WIDTH, FB_HEIGHT)?;
-    let mut input     = input::InputHandler::new(event_pump)?;
+    // Enable text input so SDL fires TextInput events for printable keys.
+    // Must be called before the event loop starts.
+    let text_input = video.text_input();
+    text_input.start();
+
+    // Query actual display resolution so the window fits the screen.
+    // We keep the logical FB at FB_WIDTH×FB_HEIGHT for all layout maths,
+    // but scale mouse coordinates from window space → FB space.
+    let (win_w, win_h) = video
+        .current_display_mode(0)
+        .map(|m| (m.w as u32, m.h as u32))
+        .unwrap_or((FB_WIDTH, FB_HEIGHT));
+    let win_w = win_w.min(FB_WIDTH);
+    let win_h = win_h.min(FB_HEIGHT);
+    let scale_x = FB_WIDTH  as f32 / win_w as f32;
+    let scale_y = FB_HEIGHT as f32 / win_h as f32;
+    eprintln!("[main] window {}x{}, scale {:.2}x{:.2}", win_w, win_h, scale_x, scale_y);
+
+    let event_pump = sdl.event_pump()?;
+
+    let font_data   = include_bytes!("../assets/DejaVuSansMono.ttf");
+    let font        = FontManager::new(font_data)?;
+    let mut fb      = Framebuffer::new(FB_WIDTH, FB_HEIGHT);
+    let mut engine  = RenderEngine::new()?;
+    let _http       = HttpClient::new();
+    let mut state   = BrowserState::new();
+    let mut display = display::Display::new(&video, win_w, win_h, FB_WIDTH, FB_HEIGHT)?;
+    let mut input   = input::InputHandler::new(event_pump)?;
 
     // Optional command-line URL
     if let Some(arg_url) = std::env::args().nth(1) {
@@ -95,16 +120,25 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         state.frame_count += 1;
         state.tick_nav_btn();
 
-        // ── Events ────────────────────────────────────────────────────────────
-        if let Some(ev) = input.poll_event()? {
+        // ── Events: drain the ENTIRE queue each frame ─────────────────────────
+        while let Some(ev) = input.poll_event()? {
             match ev {
-                input::Event::Quit => running = false,
+                input::Event::Quit => { running = false; break; }
+
                 input::Event::KeyPress(k) =>
                     on_key(&mut state, &mut engine, &mut running, k, &input)?,
-                input::Event::MouseMove { x, y } =>
-                    state.set_mouse_pos(x.max(0) as u32, y.max(0) as u32),
-                input::Event::MouseDown { x, y, button } if button == 1 =>
-                    on_click(&mut state, &mut engine, x as u32, y as u32),
+
+                // Scale window-space coords → FB-space before any hit-testing.
+                input::Event::MouseMove { x, y } => {
+                    let fx = scale(x, scale_x, FB_WIDTH);
+                    let fy = scale(y, scale_y, FB_HEIGHT);
+                    state.set_mouse_pos(fx, fy);
+                }
+                input::Event::MouseDown { x, y, button } if button == 1 => {
+                    let fx = scale(x, scale_x, FB_WIDTH);
+                    let fy = scale(y, scale_y, FB_HEIGHT);
+                    on_click(&mut state, &mut engine, fx, fy);
+                }
                 _ => {}
             }
         }

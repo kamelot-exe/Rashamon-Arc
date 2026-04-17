@@ -3,8 +3,19 @@ name = "rashamon-renderer"
 version.workspace = true
 edition.workspace = true
 
+[features]
+# Enable real Servo rendering.  Requires system GL/EGL libs and the servo crate.
+# Build: cargo build --release --features rashamon-renderer/servo
+servo = []
+
 [dependencies]
 rashamon-ipc.workspace = true
 rashamon-sandbox.workspace = true
 memmap2.workspace = true
 libc = "0.2"
+
+# Uncomment when servo git dep is pinned and system libs are confirmed:
+# [dependencies.servo]
+# git = "https://github.com/servo/servo"
+# rev  = "COMMIT_SHA_HERE"
+# optional = true

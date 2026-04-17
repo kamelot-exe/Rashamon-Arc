@@ -1,67 +1,51 @@
-//! Render engine abstraction — wraps Servo or WPE WebKit.
+//! RenderEngine — dispatcher over whichever ContentEngine backend is active.
 
+use crate::engine_trait::{ContentEngine, EngineEvent, EngineFrame};
 use crate::framebuffer::Framebuffer;
 use crate::servo_host::ServoHost;
 
-/// The rendering engine.
-pub enum RenderEngine {
-    Servo(ServoHost),
-    // WpeWebKit — placeholder for fallback research path
+/// Top-level handle the browser shell holds.
+///
+/// Backed by `ServoHost` (real Servo when `feature = "servo"` is enabled,
+/// stub otherwise).  Adding a second engine variant is a one-line change here.
+pub struct RenderEngine {
+    inner: Box<dyn ContentEngine>,
 }
 
 impl RenderEngine {
-    /// Create a new render engine. Attempts Servo first.
     pub fn new() -> Result<Self, Box<dyn std::error::Error>> {
-        let servo = ServoHost::new()?;
-        Ok(Self::Servo(servo))
+        let host = ServoHost::new()?;
+        Ok(Self { inner: Box::new(host) })
     }
 
-    /// Navigate to a URL.
     pub fn navigate(&mut self, url: &str) -> Result<(), Box<dyn std::error::Error>> {
-        match self {
-            Self::Servo(host) => host.navigate(url),
-        }
+        self.inner.navigate(url)
     }
 
-    /// Render the current page into the framebuffer.
-    pub fn render(&mut self, fb: &mut Framebuffer) -> Result<(), Box<dyn std::error::Error>> {
-        match self {
-            Self::Servo(host) => host.render(fb),
-        }
+    pub fn go_back(&mut self)    -> Result<(), Box<dyn std::error::Error>> { self.inner.go_back() }
+    pub fn go_forward(&mut self) -> Result<(), Box<dyn std::error::Error>> { self.inner.go_forward() }
+    pub fn reload(&mut self)     -> Result<(), Box<dyn std::error::Error>> { self.inner.reload() }
+
+    pub fn scroll(&mut self, delta_y: i32) { self.inner.scroll(delta_y); }
+
+    /// Composite engine content into the framebuffer content region.
+    /// Returns `EngineFrame::Ready` when real pixels were written.
+    pub fn render_into(
+        &mut self,
+        fb:  &mut Framebuffer,
+        x:   u32,
+        y:   u32,
+        w:   u32,
+        h:   u32,
+    ) -> Result<EngineFrame, Box<dyn std::error::Error>> {
+        self.inner.render_into(fb, x, y, w, h)
     }
 
-    /// Go back in history.
-    pub fn go_back(&mut self) -> Result<(), Box<dyn std::error::Error>> {
-        match self {
-            Self::Servo(host) => host.go_back(),
-        }
+    /// Drain engine events.  Call once per frame to sync title/url/load state.
+    pub fn poll_events(&mut self) -> Vec<EngineEvent> {
+        self.inner.poll_events()
     }
 
-    /// Go forward in history.
-    pub fn go_forward(&mut self) -> Result<(), Box<dyn std::error::Error>> {
-        match self {
-            Self::Servo(host) => host.go_forward(),
-        }
-    }
-
-    /// Reload the current page.
-    pub fn reload(&mut self) -> Result<(), Box<dyn std::error::Error>> {
-        match self {
-            Self::Servo(host) => host.reload(),
-        }
-    }
-
-    /// Get the current page title.
-    pub fn title(&self) -> Option<String> {
-        match self {
-            Self::Servo(host) => host.title(),
-        }
-    }
-
-    /// Get the current URL.
-    pub fn url(&self) -> Option<String> {
-        match self {
-            Self::Servo(host) => host.url(),
-        }
-    }
+    pub fn title(&self)       -> Option<String> { self.inner.title() }
+    pub fn current_url(&self) -> Option<String> { self.inner.current_url() }
 }

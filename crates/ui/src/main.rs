@@ -14,7 +14,7 @@ use crate::font::FontManager;
 use crate::layout::*;
 use crate::page::{PageNode, parse_html, is_low_content};
 use rashamon_net::HttpClient;
-use rashamon_renderer::{Framebuffer, RenderEngine};
+use rashamon_renderer::{Framebuffer, RenderEngine, EngineEvent, EngineFrame};
 use rashamon_renderer::framebuffer::Pixel;
 use ui_state::{BrowserState, DirtyFlags, OverlayKind, PageState, TabId, derive_title};
 
@@ -293,7 +293,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     if state.overlay != OverlayKind::None {
                         state.overlay_scroll_by(-delta);
                     } else {
-                        state.scroll_by(-delta * SCROLL_WHEEL);
+                        let px = -delta * SCROLL_WHEEL;
+                        state.scroll_by(px);
+                        engine.scroll(px);
                     }
                 }
 
@@ -385,11 +387,47 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
 
+        // ── Engine events — sync title/url/load state from Servo ─────────────
+        for ev in engine.poll_events() {
+            match ev {
+                EngineEvent::TitleChanged(t) => {
+                    if let Some(tab) = state.active_tab_mut() { tab.title = t; }
+                    state.dirty.chrome = true;
+                }
+                EngineEvent::UrlChanged(u) => {
+                    if let Some(tab) = state.active_tab_mut() { tab.url = u; }
+                    state.dirty.chrome = true;
+                }
+                EngineEvent::LoadComplete => {
+                    state.resolve_engine_loading();
+                    save_dirty.history = true;
+                }
+                EngineEvent::LoadFailed(reason) => { state.fail_loading(&reason); }
+                EngineEvent::ContentHeightChanged(h) => { state.set_content_height(h); }
+                EngineEvent::LoadStarted => {}
+            }
+        }
+
         // ── Render ────────────────────────────────────────────────────────────
         if state.dirty.any() {
             let dirty = state.dirty;
             state.dirty.clear();
-            render_ui(&mut fb, &state, &font, dirty);
+
+            // Ask the engine to composite content pixels first.
+            // When Servo is active it returns Ready and owns the content rect;
+            // the stub always returns NotReady so the text renderer takes over.
+            let engine_rendered = if dirty.content
+                && state.overlay == OverlayKind::None
+                && state.active_tab().map_or(false, |t| matches!(t.page_state, PageState::Loaded))
+            {
+                engine.render_into(&mut fb, 0, TOP_BAR_HEIGHT, FB_WIDTH, FB_HEIGHT - TOP_BAR_HEIGHT)
+                    .unwrap_or(EngineFrame::NotReady)
+                    == EngineFrame::Ready
+            } else {
+                false
+            };
+
+            render_ui(&mut fb, &state, &font, dirty, engine_rendered);
             display.present(&fb)?;
         }
 
@@ -646,7 +684,15 @@ fn click_content(state: &mut BrowserState, engine: &mut RenderEngine, x: u32, y:
 
 // ── Top-level render ──────────────────────────────────────────────────────────
 
-fn render_ui(fb: &mut Framebuffer, state: &BrowserState, font: &FontManager, dirty: DirtyFlags) {
+/// `engine_rendered`: Servo (or future engine) already wrote content pixels into
+/// `fb` for the content rect — skip the text renderer for `PageState::Loaded`.
+fn render_ui(
+    fb:              &mut Framebuffer,
+    state:           &BrowserState,
+    font:            &FontManager,
+    dirty:           DirtyFlags,
+    engine_rendered: bool,
+) {
     let theme      = state.theme;
     let tw         = state.tab_width;
     let active_pos = state.active_pos;
@@ -665,6 +711,9 @@ fn render_ui(fb: &mut Framebuffer, state: &BrowserState, font: &FontManager, dir
                 }
                 Some(PageState::Loading)  => draw_loading(fb, state, font),
                 Some(PageState::Error(_)) => draw_error(fb, state, font),
+                Some(PageState::Loaded) if engine_rendered => {
+                    // Engine composited pixels directly into fb — nothing to do.
+                }
                 Some(PageState::Loaded)   => {
                     let (nodes, scroll_y) = state.active_tab()
                         .map(|t| (t.current_nodes(), t.scroll_y))

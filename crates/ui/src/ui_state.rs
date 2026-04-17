@@ -677,6 +677,25 @@ impl BrowserState {
         self.dirty.all();
     }
 
+    /// Called when the rendering engine (Servo) signals load complete.
+    /// Unlike `resolve_loading`, there are no nodes — the engine owns the pixels.
+    pub fn resolve_engine_loading(&mut self) {
+        let url = match self.active_tab() {
+            Some(t) if t.page_state.is_loading() => t.url.clone(),
+            _ => return,
+        };
+        let title = self.active_tab()
+            .map(|t| if t.title.is_empty() { derive_title(&url).to_string() } else { t.title.clone() })
+            .unwrap_or_else(|| derive_title(&url).to_string());
+        if let Some(tab) = self.active_tab_mut() {
+            tab.title      = title.clone();
+            tab.page_state = PageState::Loaded;
+            tab.scroll_y   = 0;
+        }
+        self.record_visit(&url, &title);
+        self.dirty.all();
+    }
+
     pub fn fail_loading(&mut self, message: &str) {
         if let Some(tab) = self.active_tab_mut() {
             if tab.page_state.is_loading() {

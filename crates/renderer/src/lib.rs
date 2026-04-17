@@ -1,15 +1,14 @@
 //! Rashamon Renderer — browser rendering engine integration.
 //!
-//! Supports:
-//! - Servo as primary engine
-//! - WPE WebKit as fallback research path
-//! - Framebuffer-first rendering
-//! - Software rendering (GPU abstraction later)
+//! Default build: stub mode (text renderer fallback active in the shell).
+//! `--features servo`: real Servo embedding via WebRender + GL readback.
 
 mod engine;
+mod engine_trait;
 pub mod framebuffer;
+mod servo_embedder;
 mod servo_host;
 
 pub use engine::RenderEngine;
+pub use engine_trait::{ContentEngine, EngineEvent, EngineFrame};
 pub use framebuffer::Framebuffer;
-pub use servo_host::ServoHost;

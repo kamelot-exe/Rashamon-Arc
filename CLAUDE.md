@@ -14,3 +14,14 @@ Steps to follow:
 3. `git push origin main`
 
 Do this without asking for confirmation — the user expects it to happen automatically after each significant task.
+
+## Build after every major task
+
+After committing, always delete the old release build and create a fresh one:
+
+```bash
+cargo clean --release 2>/dev/null || true
+cargo build --release --package rashamon-ui
+```
+
+Run the new build to verify it starts without errors.

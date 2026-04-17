@@ -15,12 +15,20 @@ use rashamon_net::HttpClient;
 use rashamon_renderer::{Framebuffer, RenderEngine};
 use ui_state::{BrowserState, DirtyFlags, PageState, TabId, derive_title};
 
-use std::collections::HashMap;
 use std::sync::mpsc;
 
 // Loading timing (at 60 fps)
 const LOAD_MIN_FRAMES:     u64 = 60;   // 1 s minimum visible loading state
 const LOAD_TIMEOUT_FRAMES: u64 = 360;  // 6 s → show error
+
+// Page layout constants (shared between render and measure)
+const MARGIN:  u32 = 120;
+const MAX_W:   u32 = 880;
+const PAD_TOP: u32 = 28;
+
+// Scroll speeds
+const SCROLL_LINE: i32 = 40;  // pixels per keyboard arrow press
+const SCROLL_WHEEL: i32 = 80; // pixels per mouse wheel notch
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -29,7 +37,6 @@ fn scale(v: i32, factor: f32, max: u32) -> u32 {
     ((v.max(0) as f32 * factor) as u32).min(max - 1)
 }
 
-/// Resolve raw address-bar text to a full URL or DuckDuckGo search.
 fn resolve_url(raw: &str) -> String {
     let raw = raw.trim();
     if raw.is_empty()                          { return String::new(); }
@@ -40,19 +47,16 @@ fn resolve_url(raw: &str) -> String {
 
 // ── Fetch / parse pipeline ────────────────────────────────────────────────────
 
-/// Result sent back from the fetch thread to the main loop.
 enum FetchOutcome {
     Success { title: Option<String>, nodes: Vec<PageNode> },
     Failure(String),
 }
 
-/// One in-flight background fetch (one per navigation).
 struct PendingFetch {
     tab_id:   TabId,
     receiver: mpsc::Receiver<FetchOutcome>,
 }
 
-/// Fetch, parse, and return the page outcome — runs on a background thread.
 fn do_fetch(url: String) -> FetchOutcome {
     let mut client = HttpClient::new();
     match client.fetch_text(&url) {
@@ -67,13 +71,53 @@ fn do_fetch(url: String) -> FetchOutcome {
     }
 }
 
-/// Spawn a background fetch thread for the active tab's current URL.
-/// Replaces any previously-pending fetch (the old thread will send to a
-/// dropped receiver and clean itself up silently).
 fn spawn_fetch(tab_id: TabId, url: String) -> PendingFetch {
     let (tx, rx) = mpsc::channel();
     std::thread::spawn(move || { let _ = tx.send(do_fetch(url)); });
     PendingFetch { tab_id, receiver: rx }
+}
+
+// ── Content height measurement ────────────────────────────────────────────────
+
+/// Measure the total rendered height of page nodes without drawing.
+/// Mirrors the layout logic in draw_page_content exactly.
+fn measure_content_height(nodes: &[PageNode], font: &FontManager) -> u32 {
+    let mut h: u32 = PAD_TOP;
+
+    for node in nodes {
+        match node {
+            PageNode::Heading { level, text } => {
+                let (size, before, after): (f32, u32, u32) = match level {
+                    1 => (28.0, 18, 10),
+                    2 => (22.0, 14, 8),
+                    _ => (17.0, 10, 6),
+                };
+                h += before;
+                let lines = wrap_text(text, font, size, MAX_W);
+                h += lines.len() as u32 * (size as u32 + 4);
+                h += after;
+            }
+            PageNode::Paragraph(text) => {
+                if text.trim().is_empty() { continue; }
+                h += 4;
+                let lines = wrap_text(text, font, 14.0, MAX_W);
+                h += lines.len() as u32 * 22 + 10;
+            }
+            PageNode::ListItem(text) => {
+                let with_bullet = format!("  \u{2022}  {text}");
+                let lines = wrap_text(&with_bullet, font, 13.0, MAX_W);
+                h += lines.len() as u32 * 20 + 3;
+            }
+            PageNode::Pre(text) => {
+                h += 8;
+                h += text.lines().count() as u32 * 18 + 30;
+            }
+            PageNode::HRule => {
+                h += 24;
+            }
+        }
+    }
+    h + 60 // bottom padding so last line is not flush against the edge
 }
 
 // ── Main ──────────────────────────────────────────────────────────────────────
@@ -109,11 +153,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut display = display::Display::new(&video, win_w, win_h, FB_WIDTH, FB_HEIGHT)?;
     let mut input   = input::InputHandler::new(event_pump)?;
 
-    // Per-tab rendered page content — populated on successful fetch.
-    let mut page_content: HashMap<TabId, Vec<PageNode>> = HashMap::new();
-    // Background fetch in flight.
+    // In-flight fetch and buffered result.
     let mut pending_fetch:    Option<PendingFetch>          = None;
-    // Fetch result received but waiting for LOAD_MIN_FRAMES visual delay.
     let mut buffered_outcome: Option<(TabId, FetchOutcome)> = None;
 
     if let Some(arg_url) = std::env::args().nth(1) {
@@ -142,8 +183,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 input::Event::MouseMove { x, y } => {
                     let fx = scale(x, scale_x, FB_WIDTH);
                     let fy = scale(y, scale_y, FB_HEIGHT);
-                    // Internally computes hover region and dirties only the
-                    // affected strip when the region changes.
                     state.set_mouse_pos(fx, fy);
                 }
 
@@ -153,12 +192,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     on_click(&mut state, &mut engine, fx, fy);
                 }
 
+                // Mouse wheel: positive SDL delta = wheel forward = scroll toward page top.
+                input::Event::MouseWheel { delta } => {
+                    state.scroll_by(-delta * SCROLL_WHEEL);
+                }
+
                 _ => {}
             }
         }
 
         // ── Spawn fetch for any navigation that just started ──────────────────
-        // After the event loop so all state mutations this frame are settled.
         if let Some(tab) = state.active_tab() {
             if tab.page_state.is_loading() {
                 let already_fetching = pending_fetch.as_ref()
@@ -179,11 +222,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 Ok(outcome) => {
                     let tab_id = pf.tab_id;
                     pending_fetch = None;
-                    // Buffer until LOAD_MIN_FRAMES visual delay has elapsed.
                     buffered_outcome = Some((tab_id, outcome));
                 }
                 Err(mpsc::TryRecvError::Disconnected) => {
-                    // Thread exited without sending — treat as failure.
                     let tab_id = pf.tab_id;
                     pending_fetch = None;
                     if state.active_tab().map_or(false,
@@ -192,7 +233,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         state.fail_loading("Connection lost");
                     }
                 }
-                Err(mpsc::TryRecvError::Empty) => {} // still in flight
+                Err(mpsc::TryRecvError::Empty) => {}
             }
         }
 
@@ -209,8 +250,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let (_, outcome) = buffered_outcome.take().unwrap();
                 match outcome {
                     FetchOutcome::Success { title, nodes } => {
-                        page_content.insert(tab_id, nodes);
-                        state.resolve_loading(title.unwrap_or_default());
+                        let h = measure_content_height(&nodes, &font);
+                        state.resolve_loading(title.unwrap_or_default(), nodes);
+                        state.set_content_height(h);
                     }
                     FetchOutcome::Failure(reason) => {
                         state.fail_loading(&reason);
@@ -219,22 +261,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
 
-        // ── Loading timeout (hard fallback) ───────────────────────────────────
+        // ── Loading timeout ───────────────────────────────────────────────────
         tick_loading(&mut state, &mut engine);
 
-        // ── Stale content cleanup (tabs that were closed) ─────────────────────
-        page_content.retain(|id, _| state.tabs.iter().any(|t| t.id == *id));
-
         // ── Continuous-animation dirty ────────────────────────────────────────
-
-        // Loading: spinner in chrome, progress bar in tab strip, overlay in content.
         if state.active_tab().map_or(false, |t| t.page_state.is_loading()) {
             state.dirty.tabs    = true;
             state.dirty.chrome  = true;
             state.dirty.content = true;
         }
 
-        // Cursor blink: only the address bar strip (and content if new-tab search box).
         if state.address_bar_focused {
             let blink = state.frame_count / 28;
             if blink != last_blink_phase {
@@ -243,12 +279,25 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
 
+        // ── Lazily compute content height before first render (e.g. after back/forward) ──
+        if state.dirty.content {
+            if let Some(tab) = state.active_tab() {
+                if matches!(tab.page_state, PageState::Loaded) && tab.content_height == 0 {
+                    let nodes: Vec<PageNode> = tab.current_nodes().to_vec();
+                    if !nodes.is_empty() {
+                        let h = measure_content_height(&nodes, &font);
+                        state.set_content_height(h);
+                    }
+                }
+            }
+        }
+
         // ── Render — only dirty regions ───────────────────────────────────────
         if state.dirty.any() {
             let dirty = state.dirty;
             state.dirty.clear();
 
-            render_ui(&mut fb, &state, &font, dirty, &page_content);
+            render_ui(&mut fb, &state, &font, dirty);
             display.present(&fb)?;
         }
 
@@ -259,8 +308,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 // ── Loading state machine ─────────────────────────────────────────────────────
 
-/// Hard-timeout watchdog. Normal loading is driven by fetch results;
-/// this only fires if no fetch result arrived within LOAD_TIMEOUT_FRAMES.
 fn tick_loading(state: &mut BrowserState, _engine: &mut RenderEngine) {
     let Some(tab) = state.active_tab() else { return };
     if !tab.page_state.is_loading() { return; }
@@ -330,6 +377,16 @@ fn on_key(
             state.type_char(c);
         }
 
+        // Scroll keys — only when not editing the address bar.
+        input::Key::Up   if !state.address_bar_focused => state.scroll_by(-SCROLL_LINE),
+        input::Key::Down if !state.address_bar_focused => state.scroll_by(SCROLL_LINE),
+        input::Key::PageUp   if !state.address_bar_focused => {
+            state.scroll_by(-((FB_HEIGHT - TOP_BAR_HEIGHT) as i32));
+        }
+        input::Key::PageDown if !state.address_bar_focused => {
+            state.scroll_by((FB_HEIGHT - TOP_BAR_HEIGHT) as i32);
+        }
+
         _ => {}
     }
     Ok(())
@@ -350,7 +407,6 @@ fn on_click(state: &mut BrowserState, engine: &mut RenderEngine, x: u32, y: u32)
 fn click_tab_bar(state: &mut BrowserState, engine: &mut RenderEngine, x: u32) {
     let tw = state.tab_width;
 
-    // Iterate directly — no Vec allocation.
     for i in 0..state.tabs.len() {
         let lx      = TAB_START_X + i as u32 * (tw + TAB_SEP);
         let rx      = lx + tw;
@@ -445,7 +501,6 @@ fn click_content(state: &mut BrowserState, engine: &mut RenderEngine, x: u32, y:
                 let row_w = num * QUICK_LINK_W + (num - 1) * QUICK_LINK_GAP;
                 let mut lx = cx.saturating_sub(row_w / 2);
                 let ly = cy + 46;
-                // Collect URLs first to avoid borrow-during-navigation issues.
                 let urls: Vec<String> = state.bookmarks.iter().take(6)
                     .map(|b| b.url.clone()).collect();
                 for url in urls {
@@ -468,14 +523,11 @@ fn click_content(state: &mut BrowserState, engine: &mut RenderEngine, x: u32, y:
 
 // ── Top-level render (region-aware) ──────────────────────────────────────────
 
-/// Repaint only the regions marked dirty. Each region self-clears before
-/// drawing so there is no stale overdraw from the previous frame.
 fn render_ui(
-    fb:           &mut Framebuffer,
-    state:        &BrowserState,
-    font:         &FontManager,
-    dirty:        DirtyFlags,
-    page_content: &HashMap<TabId, Vec<PageNode>>,
+    fb:    &mut Framebuffer,
+    state: &BrowserState,
+    font:  &FontManager,
+    dirty: DirtyFlags,
 ) {
     let theme      = state.theme;
     let tw         = state.tab_width;
@@ -487,12 +539,11 @@ fn render_ui(
             Some(PageState::NewTab)   => draw_new_tab(fb, state, font),
             Some(PageState::Loading)  => draw_loading(fb, state, font),
             Some(PageState::Error(_)) => draw_error(fb, state, font),
-            Some(PageState::Loaded) => {
-                let nodes = state.active_tab()
-                    .and_then(|t| page_content.get(&t.id))
-                    .map(|v| v.as_slice())
-                    .unwrap_or(&[]);
-                draw_loaded(fb, state, font, nodes);
+            Some(PageState::Loaded)   => {
+                let (nodes, scroll_y) = state.active_tab()
+                    .map(|t| (t.current_nodes(), t.scroll_y))
+                    .unwrap_or((&[], 0));
+                draw_loaded(fb, state, font, nodes, scroll_y);
             }
             None => {}
         }
@@ -502,8 +553,6 @@ fn render_ui(
     if dirty.tabs {
         fb.fill_rect(0, 0, fb.width, TAB_BAR_HEIGHT, theme.tab_bar_bg);
         draw_tab_row(fb, state, font);
-        // Full-width border, then erase the active tab's segment so the active
-        // tab visually blends into the chrome bar below.
         fb.fill_rect(0, TAB_BAR_HEIGHT - 1, fb.width, 1, theme.border);
         let active_x = TAB_START_X + active_pos as u32 * (tw + TAB_SEP);
         fb.fill_rect(active_x, TAB_BAR_HEIGHT - 1, tw, 2, theme.surface);
@@ -513,7 +562,6 @@ fn render_ui(
     if dirty.chrome {
         fb.fill_rect(0, TAB_BAR_HEIGHT, fb.width, CHROME_BAR_HEIGHT, theme.surface);
         draw_chrome_row(fb, state, font);
-        // Separator between chrome and content.
         fb.fill_rect(0, TOP_BAR_HEIGHT, fb.width, 1, theme.border);
     }
 }
@@ -620,9 +668,9 @@ fn draw_nav_btn(fb: &mut Framebuffer, state: &BrowserState, cx: u32, cy: u32, bt
         draw::draw_circle_filled(fb, cx, cy, r, theme.control_hover_bg);
     }
 
-    let color = if pressed      { theme.accent_fg     }
+    let color = if pressed       { theme.accent_fg    }
                 else if !enabled { theme.fg_secondary  }
-                else             { theme.icon_fg        };
+                else             { theme.icon_fg       };
 
     match btn {
         NavBtn::Back    => draw::draw_icon_back(fb, cx, cy, 10, color),
@@ -665,8 +713,6 @@ fn draw_address_bar(fb: &mut Framebuffer, state: &BrowserState, font: &FontManag
     } else {
         draw::draw_text(fb, font, tx, ty, &state.address_bar_input, 14.0, theme.address_bar_fg, max_w);
         if state.address_bar_focused && (state.frame_count / 28) % 2 == 0 {
-            // text_width is cached: after the first call for this input string,
-            // subsequent calls (every blink phase) hit the cache with no font work.
             let cw = font.text_width(&state.address_bar_input, 14.0);
             let cx = (tx + cw + 1).min(bar_x + ADDR_BAR_W - 34);
             fb.fill_rect(cx, ty, 2, 15, theme.accent);
@@ -699,7 +745,6 @@ fn draw_new_tab(fb: &mut Framebuffer, state: &BrowserState, font: &FontManager) 
     draw::draw_text(fb, font, cx.saturating_sub(tgw / 2), cy.saturating_sub(156),
         tagline, 15.0, theme.fg_secondary, 600);
 
-    // Search box
     let sw: u32 = 600;
     let sh: u32 = 48;
     let sr: u32 = 24;
@@ -719,7 +764,6 @@ fn draw_new_tab(fb: &mut Framebuffer, state: &BrowserState, font: &FontManager) 
         draw::draw_text(fb, font, sx + 24, sy + (sh.saturating_sub(14)) / 2,
             &state.address_bar_input, 15.0, theme.address_bar_fg, sw - 48);
         if state.address_bar_focused && (state.frame_count / 28) % 2 == 0 {
-            // Reuses cached width computed moments ago in draw_address_bar.
             let cw    = font.text_width(&state.address_bar_input, 15.0);
             let cur_x = (sx + 24 + cw + 1).min(sx + sw - 24);
             fb.fill_rect(cur_x, sy + (sh.saturating_sub(16)) / 2, 2, 16, theme.accent);
@@ -778,7 +822,6 @@ fn draw_quick_links(fb: &mut Framebuffer, state: &BrowserState, font: &FontManag
         let fav_cy = card_y + 32;
         draw::draw_circle_filled(fb, fav_cx, fav_cy, 20, fav_col);
 
-        // Stack-allocated buffer — no heap allocation for single char.
         let mut ch_buf = [0u8; 4];
         let ch_str     = bm.first_upper.encode_utf8(&mut ch_buf);
         let lw         = font.text_width(ch_str, 16.0);
@@ -787,7 +830,6 @@ fn draw_quick_links(fb: &mut Framebuffer, state: &BrowserState, font: &FontManag
 
         let title_y = card_y + QUICK_LINK_H - 28;
         let max_tw  = QUICK_LINK_W.saturating_sub(12);
-        // text_width for bookmark titles: cache hit after first render frame.
         let title_w = font.text_width(&bm.title, 12.0).min(max_tw);
         let title_x = card_x + (QUICK_LINK_W - title_w) / 2;
         draw::draw_text(fb, font, title_x, title_y, &bm.title, 12.0, theme.fg, max_tw);
@@ -807,13 +849,11 @@ fn draw_loading(fb: &mut Framebuffer, state: &BrowserState, font: &FontManager) 
 
     draw::draw_icon_spinner(fb, cx, cy.saturating_sub(20), 14, state.frame_count, theme.fg_secondary);
 
-    // Static string array — no allocation per frame.
     const LOADING_MSGS: [&str; 4] = ["Loading...", "Loading.", "Loading..", "Loading..."];
     let msg = LOADING_MSGS[((state.frame_count / 18) % 4) as usize];
     let mw  = font.text_width(msg, 14.0);
     draw::draw_text(fb, font, cx.saturating_sub(mw / 2), cy + 8, msg, 14.0, theme.fg_secondary, 200);
 
-    // derive_title borrows from tab.url — zero allocation.
     if let Some(tab) = state.active_tab() {
         if !tab.url.is_empty() {
             let host = derive_title(&tab.url);
@@ -831,59 +871,62 @@ fn draw_loading(fb: &mut Framebuffer, state: &BrowserState, font: &FontManager) 
 
 // ── Loaded page ───────────────────────────────────────────────────────────────
 
-/// Dispatch to real page renderer when content is available,
-/// or fall back to the metadata card for tabs with no fetched content yet.
 fn draw_loaded(
-    fb:    &mut Framebuffer,
-    state: &BrowserState,
-    font:  &FontManager,
-    nodes: &[PageNode],
+    fb:       &mut Framebuffer,
+    state:    &BrowserState,
+    font:     &FontManager,
+    nodes:    &[PageNode],
+    scroll_y: u32,
 ) {
     if !nodes.is_empty() {
-        draw_page_content(fb, state, font, nodes);
+        draw_page_content(fb, state, font, nodes, scroll_y);
     } else {
         draw_loaded_card(fb, state, font);
     }
 }
 
-/// Minimal text-first page renderer.
-/// Lays out PageNodes top-to-bottom with word-wrapped text and clipping.
+/// Text-first page renderer with vertical scroll support.
+///
+/// All y coordinates are computed in screen space as i32 so content above the
+/// viewport (scroll_y > 0) gets negative coordinates and is simply not drawn.
+/// Only lines within [TOP_BAR_HEIGHT, FB_HEIGHT) are sent to the framebuffer.
 fn draw_page_content(
-    fb:    &mut Framebuffer,
-    state: &BrowserState,
-    font:  &FontManager,
-    nodes: &[PageNode],
+    fb:       &mut Framebuffer,
+    state:    &BrowserState,
+    font:     &FontManager,
+    nodes:    &[PageNode],
+    scroll_y: u32,
 ) {
     let theme = state.theme;
 
-    // Page background
     fb.fill_rect(0, TOP_BAR_HEIGHT, FB_WIDTH, FB_HEIGHT - TOP_BAR_HEIGHT, theme.bg);
-    // Separator between chrome and content
     fb.fill_rect(0, TOP_BAR_HEIGHT, FB_WIDTH, 1, theme.border);
 
-    const MARGIN:   u32 = 120;   // left edge of text
-    const MAX_W:    u32 = 880;   // max text column width
-    const PAD_TOP:  u32 = 28;
+    let vp_top = TOP_BAR_HEIGHT as i32;
+    let vp_bot = FB_HEIGHT as i32;
 
-    let mut y = TOP_BAR_HEIGHT + PAD_TOP;
-    let clip_y = FB_HEIGHT.saturating_sub(24);
+    // y starts below the chrome bar, shifted up by the scroll offset.
+    let mut y: i32 = vp_top + PAD_TOP as i32 - scroll_y as i32;
 
-    for node in nodes {
-        if y >= clip_y { break; }
+    'outer: for node in nodes {
+        // Stop rendering once we are well past the bottom of the viewport.
+        if y > vp_bot + 200 { break; }
 
         match node {
             PageNode::Heading { level, text } => {
-                let (size, color, before, after): (f32, _, u32, u32) = match level {
-                    1 => (28.0, theme.fg,           18, 10),
-                    2 => (22.0, theme.fg,           14, 8),
-                    _ => (17.0, theme.fg,           10, 6),
+                let (size, color, before, after): (f32, _, i32, i32) = match level {
+                    1 => (28.0, theme.fg,  18, 10),
+                    2 => (22.0, theme.fg,  14, 8),
+                    _ => (17.0, theme.fg,  10, 6),
                 };
                 y += before;
-                if y >= clip_y { break; }
                 for line in wrap_text(text, font, size, MAX_W) {
-                    draw::draw_text(fb, font, MARGIN, y, &line, size, color, MAX_W);
-                    y += size as u32 + 4;
-                    if y >= clip_y { break; }
+                    let line_h = size as i32 + 4;
+                    if y + line_h > vp_top && y < vp_bot {
+                        draw::draw_text(fb, font, MARGIN, y as u32, &line, size, color, MAX_W);
+                    }
+                    y += line_h;
+                    if y > vp_bot + 200 { break 'outer; }
                 }
                 y += after;
             }
@@ -892,9 +935,11 @@ fn draw_page_content(
                 if text.trim().is_empty() { continue; }
                 y += 4;
                 for line in wrap_text(text, font, 14.0, MAX_W) {
-                    if y >= clip_y { break; }
-                    draw::draw_text(fb, font, MARGIN, y, &line, 14.0, theme.fg_secondary, MAX_W);
+                    if y + 22 > vp_top && y < vp_bot {
+                        draw::draw_text(fb, font, MARGIN, y as u32, &line, 14.0, theme.fg_secondary, MAX_W);
+                    }
                     y += 22;
+                    if y > vp_bot + 200 { break 'outer; }
                 }
                 y += 10;
             }
@@ -902,9 +947,11 @@ fn draw_page_content(
             PageNode::ListItem(text) => {
                 let with_bullet = format!("  \u{2022}  {text}");
                 for line in wrap_text(&with_bullet, font, 13.0, MAX_W) {
-                    if y >= clip_y { break; }
-                    draw::draw_text(fb, font, MARGIN, y, &line, 13.0, theme.fg_secondary, MAX_W);
+                    if y + 20 > vp_top && y < vp_bot {
+                        draw::draw_text(fb, font, MARGIN, y as u32, &line, 13.0, theme.fg_secondary, MAX_W);
+                    }
                     y += 20;
+                    if y > vp_bot + 200 { break 'outer; }
                 }
                 y += 3;
             }
@@ -912,28 +959,51 @@ fn draw_page_content(
             PageNode::Pre(text) => {
                 y += 8;
                 let lines: Vec<&str> = text.lines().collect();
-                let block_h = ((lines.len() as u32) * 18 + 16).min(clip_y.saturating_sub(y));
-                fb.fill_rect(MARGIN.saturating_sub(8), y.saturating_sub(4),
-                    MAX_W + 16, block_h, theme.surface);
+                let block_h = lines.len() as i32 * 18 + 16;
+                // Draw pre background only for the visible portion.
+                if y < vp_bot && y + block_h > vp_top {
+                    let fill_y = y.max(vp_top) as u32;
+                    let fill_h = ((y + block_h).min(vp_bot) - fill_y as i32).max(0) as u32;
+                    fb.fill_rect(MARGIN.saturating_sub(8), fill_y, MAX_W + 16, fill_h, theme.surface);
+                }
                 for line in &lines {
-                    if y >= clip_y { break; }
-                    draw::draw_text(fb, font, MARGIN, y, line, 12.0, theme.fg, MAX_W + 8);
+                    if y + 18 > vp_top && y < vp_bot {
+                        draw::draw_text(fb, font, MARGIN, y as u32, line, 12.0, theme.fg, MAX_W + 8);
+                    }
                     y += 18;
+                    if y > vp_bot + 200 { break 'outer; }
                 }
                 y += 14;
             }
 
             PageNode::HRule => {
                 y += 8;
-                fb.fill_rect(MARGIN, y, MAX_W, 1, theme.border);
+                if y >= vp_top && y < vp_bot {
+                    fb.fill_rect(MARGIN, y as u32, MAX_W, 1, theme.border);
+                }
                 y += 16;
             }
         }
     }
+
+    // Minimal scroll position indicator — a thin right-edge thumb.
+    let tab = match state.active_tab() { Some(t) => t, None => return };
+    if tab.content_height > (FB_HEIGHT - TOP_BAR_HEIGHT) {
+        let track_h  = (FB_HEIGHT - TOP_BAR_HEIGHT) as u32;
+        let thumb_h  = ((track_h as u64 * track_h as u64)
+                        / tab.content_height as u64).max(24).min(track_h as u64) as u32;
+        let max_off  = tab.content_height.saturating_sub(track_h);
+        let thumb_y  = if max_off > 0 {
+            TOP_BAR_HEIGHT + (scroll_y as u64 * (track_h - thumb_h) as u64 / max_off as u64) as u32
+        } else {
+            TOP_BAR_HEIGHT
+        };
+        fb.fill_rect(FB_WIDTH - 4, TOP_BAR_HEIGHT, 4, track_h, theme.surface);
+        fb.fill_rect(FB_WIDTH - 4, thumb_y, 4, thumb_h, theme.fg_secondary);
+    }
 }
 
-/// Word-wrap `text` into lines of at most `max_w` pixels at `size`.
-/// Measures each word individually for O(words) total font calls.
+/// Word-wrap `text` into lines no wider than `max_w` pixels.
 fn wrap_text(text: &str, font: &FontManager, size: f32, max_w: u32) -> Vec<String> {
     let space_w = font.text_width(" ", size);
     let mut lines   = Vec::new();
@@ -941,7 +1011,7 @@ fn wrap_text(text: &str, font: &FontManager, size: f32, max_w: u32) -> Vec<Strin
     let mut line_w  = 0u32;
 
     for word in text.split_whitespace() {
-        let ww = font.text_width(word, size);
+        let ww  = font.text_width(word, size);
         let gap = if line.is_empty() { 0 } else { space_w };
         if !line.is_empty() && line_w + gap + ww > max_w {
             lines.push(std::mem::take(&mut line));
@@ -955,8 +1025,8 @@ fn wrap_text(text: &str, font: &FontManager, size: f32, max_w: u32) -> Vec<Strin
     lines
 }
 
-/// Fallback card shown when a page is Loaded but content hasn't arrived yet
-/// (e.g. navigated back to a committed entry without a re-fetch).
+/// Fallback shown when a tab is Loaded but has no page content
+/// (e.g. history entries that pre-date the content model).
 fn draw_loaded_card(fb: &mut Framebuffer, state: &BrowserState, font: &FontManager) {
     let theme = state.theme;
     let cx    = FB_WIDTH / 2;

@@ -11,6 +11,8 @@ pub enum Event {
     KeyPress(Key),
     MouseMove { x: i32, y: i32 },
     MouseDown { x: i32, y: i32, button: u8 },
+    /// Vertical scroll wheel delta: positive = scroll up (toward page top).
+    MouseWheel { delta: i32 },
 }
 
 #[derive(Debug)]
@@ -22,6 +24,8 @@ pub enum Key {
     Right,
     Up,
     Down,
+    PageUp,
+    PageDown,
     Char(char),
 }
 
@@ -68,6 +72,8 @@ impl InputHandler {
                         Scancode::Right     => Some(Key::Right),
                         Scancode::Up        => Some(Key::Up),
                         Scancode::Down      => Some(Key::Down),
+                        Scancode::PageUp    => Some(Key::PageUp),
+                        Scancode::PageDown  => Some(Key::PageDown),
                         // Ctrl+shortcuts — captured here so they work even
                         // when SDL text-input mode is active.
                         Scancode::T if self.ctrl_pressed => Some(Key::Char('t')),
@@ -91,6 +97,8 @@ impl InputHandler {
                 SdlEvent::MouseButtonDown { x, y, mouse_btn, .. } => {
                     Some(Event::MouseDown { x, y, button: mouse_btn as u8 })
                 }
+
+                SdlEvent::MouseWheel { y, .. } => Some(Event::MouseWheel { delta: y }),
 
                 // All other SDL events (WindowEvent, FocusGained, Exposed …)
                 // are silently consumed; the loop continues to the next event.

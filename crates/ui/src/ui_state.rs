@@ -1,6 +1,7 @@
 //! Core browser state model for Rashamon Arc.
 
 use crate::layout::{self, *};
+use crate::page::PageNode;
 use crate::theme::{get_theme, ColorPalette, Theme};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -38,20 +39,12 @@ impl PageState {
 // ── NavResult ─────────────────────────────────────────────────────────────────
 
 /// Outcome classified at navigation-submit time, before any loading begins.
-///
-/// `WillLoad`     — URL is structurally valid; tab enters Loading then Loaded.
-/// `WillFail(why)` — URL is unsupported/malformed; tab goes straight to Error.
-///
-/// Storing the result on the tab means `commit_navigation` reads a predetermined
-/// verdict rather than racing a timer to guess whether the page is reachable.
 #[derive(Debug, Clone, PartialEq)]
 pub enum NavResult {
     WillLoad,
     WillFail(String),
 }
 
-/// Classify a fully-resolved URL at submit time.
-/// Called by `begin_navigate` and `reload` before any state change.
 fn classify_url(url: &str) -> NavResult {
     if url.is_empty() {
         return NavResult::WillFail("No address entered".into());
@@ -70,27 +63,21 @@ fn classify_url(url: &str) -> NavResult {
 
 // ── DirtyFlags ────────────────────────────────────────────────────────────────
 
-/// Per-region repaint flags.
-/// Only dirty regions are cleared and redrawn each frame — avoiding full-screen
-/// repaints for common micro-events like cursor blink, hover, and typing.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct DirtyFlags {
-    pub tabs:    bool,   // y = 0 .. TAB_BAR_HEIGHT
-    pub chrome:  bool,   // y = TAB_BAR_HEIGHT .. TOP_BAR_HEIGHT
-    pub content: bool,   // y = TOP_BAR_HEIGHT .. FB_HEIGHT
+    pub tabs:    bool,
+    pub chrome:  bool,
+    pub content: bool,
 }
 
 impl DirtyFlags {
-    #[inline] pub fn any(self)    -> bool { self.tabs || self.chrome || self.content }
+    #[inline] pub fn any(self)      -> bool { self.tabs || self.chrome || self.content }
     #[inline] pub fn all(&mut self) { self.tabs = true; self.chrome = true; self.content = true; }
     #[inline] pub fn clear(&mut self) { *self = Self::default(); }
 }
 
 // ── HoveredRegion ─────────────────────────────────────────────────────────────
 
-/// Interactive UI region the cursor is currently over.
-/// Each variant maps to one DirtyFlags field so hover changes only repaint the
-/// affected strip, not the whole window.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HoveredRegion {
     None,
@@ -104,35 +91,41 @@ pub enum HoveredRegion {
     BookmarkStar,
     QuickLink(usize),
     RetryBtn,
-    ContentArea, // non-interactive content — no visual hover change
+    ContentArea,
 }
 
 // ── NavigationEntry ───────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone)]
 pub struct NavigationEntry {
-    pub url:         String,
-    pub display_url: String,
-    pub title:       String,
-    /// `None` → page committed successfully.
-    /// `Some(reason)` → navigation failed; restoring this entry shows an Error page.
-    pub error_msg:   Option<String>,
+    pub url:            String,
+    pub display_url:    String,
+    pub title:          String,
+    pub error_msg:      Option<String>,
+    /// Rendered content captured at commit time for instant back/forward restoration.
+    pub nodes:          Vec<PageNode>,
+    /// Scroll position saved when navigating away from this entry.
+    pub scroll_y:       u32,
+    /// Cached content height for scroll clamping after restoration.
+    pub content_height: u32,
 }
 
 impl NavigationEntry {
-    fn new(url: &str, title: &str, error_msg: Option<String>) -> Self {
+    fn new(url: &str, title: &str, error_msg: Option<String>, nodes: Vec<PageNode>) -> Self {
         Self {
-            url:         url.to_string(),
-            display_url: url.to_string(),
-            title:       title.to_string(),
+            url:            url.to_string(),
+            display_url:    url.to_string(),
+            title:          title.to_string(),
             error_msg,
+            nodes,
+            scroll_y:       0,
+            content_height: 0,
         }
     }
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
-/// Borrows a short display title from a URL — zero allocation.
 pub fn derive_title(url: &str) -> &str {
     if url.is_empty() { return "New Tab"; }
     url.trim_start_matches("https://")
@@ -158,8 +151,12 @@ pub struct TabState {
     pub history_index:      usize,
     pub last_committed_url: String,
     pub load_start_frame:   u64,
-    /// Pre-classified navigation outcome — set at submit time, read at commit time.
     pub nav_result:         NavResult,
+    /// Current vertical scroll offset in pixels for the visible content.
+    pub scroll_y:           u32,
+    /// Total rendered content height — used for scroll clamping.
+    /// Zero means "not yet measured"; measured lazily before first render.
+    pub content_height:     u32,
 }
 
 impl TabState {
@@ -177,29 +174,38 @@ impl TabState {
             last_committed_url: String::new(),
             load_start_frame:   0,
             nav_result:         NavResult::WillLoad,
+            scroll_y:           0,
+            content_height:     0,
         }
     }
 
     pub fn can_go_back(&self)    -> bool { self.history_index > 0 }
     pub fn can_go_forward(&self) -> bool { self.history_index + 1 < self.history.len() }
 
-    fn commit(&mut self, url: &str, title: &str, error_msg: Option<String>) {
+    /// Rendered nodes for the currently committed history entry.
+    pub fn current_nodes(&self) -> &[PageNode] {
+        self.history.get(self.history_index)
+            .map(|e| e.nodes.as_slice())
+            .unwrap_or(&[])
+    }
+
+    fn commit(&mut self, url: &str, title: &str, error_msg: Option<String>, nodes: Vec<PageNode>) {
         if self.history_index + 1 < self.history.len() {
             self.history.truncate(self.history_index + 1);
         }
-        // Reload: the URL matches the current history entry — update in-place
-        // rather than pushing a duplicate entry that would break back/forward.
+        // Reload: same URL — update title + nodes in-place instead of pushing duplicate.
         if error_msg.is_none() {
             if let Some(cur) = self.history.get_mut(self.history_index) {
                 if cur.url == url {
                     cur.title     = title.to_string();
                     cur.error_msg = None;
+                    if !nodes.is_empty() { cur.nodes = nodes; }
                     self.last_committed_url = url.to_string();
                     return;
                 }
             }
         }
-        self.history.push(NavigationEntry::new(url, title, error_msg));
+        self.history.push(NavigationEntry::new(url, title, error_msg, nodes));
         self.history_index      = self.history.len() - 1;
         self.last_committed_url = url.to_string();
     }
@@ -220,7 +226,6 @@ impl TabState {
 pub struct QuickLink {
     pub title:       String,
     pub url:         String,
-    /// Pre-uppercased first char — avoids per-frame String allocation.
     pub first_upper: char,
 }
 
@@ -256,18 +261,11 @@ pub struct BrowserState {
     pub nav_btn_pressed:       u8,
     pub nav_btn_pressed_frame: u64,
 
-    // ── Layout cache ──────────────────────────────────────────────────────────
-    /// Cached tab strip width — recomputed only when tab count changes.
     pub tab_width:  u32,
-    /// Active tab's index in `tabs` — avoids O(n) scan per frame.
     pub active_pos: usize,
 
-    // ── Dirty-region rendering ────────────────────────────────────────────────
-    /// Region-level repaint flags — set by state mutations, cleared after render.
     pub dirty:          DirtyFlags,
-    /// Bumped in `cycle_theme` so the render cache knows to recompute layout.
     pub theme_version:  u64,
-    /// Which interactive region the cursor is over — dirty only on region change.
     pub hovered_region: HoveredRegion,
 }
 
@@ -323,7 +321,6 @@ impl BrowserState {
         }
     }
 
-    /// Dirty only the hover-affected region for a given interactive element.
     fn dirty_for_hover(region: HoveredRegion, d: &mut DirtyFlags) {
         match region {
             HoveredRegion::Tab(_) | HoveredRegion::TabClose(_) | HoveredRegion::NewTabBtn
@@ -333,14 +330,10 @@ impl BrowserState {
                 => d.chrome = true,
             HoveredRegion::QuickLink(_) | HoveredRegion::RetryBtn
                 => d.content = true,
-            // Moving within content area (non-interactive) → no visual change.
             HoveredRegion::None | HoveredRegion::ContentArea => {}
         }
     }
 
-    /// Dirty chrome and, if the active tab is a new-tab page, content as well.
-    /// Used for address-bar events (typing, focus, blink) because the new-tab
-    /// search box mirrors the address bar input.
     pub fn dirty_address_bar(&mut self) {
         self.dirty.chrome = true;
         if self.is_on_new_tab() {
@@ -388,7 +381,6 @@ impl BrowserState {
             return HoveredRegion::None;
         }
 
-        // Content area
         match self.active_tab().map(|t| &t.page_state) {
             Some(PageState::Error(_)) => {
                 let (bx, by) = retry_btn_pos();
@@ -421,16 +413,13 @@ impl BrowserState {
     // ── Public accessors ──────────────────────────────────────────────────────
 
     pub fn active_tab(&self) -> Option<&TabState> {
-        // Fast path: cached index is almost always correct.
         if let Some(t) = self.tabs.get(self.active_pos) {
             if t.id == self.active_tab_id { return Some(t); }
         }
-        // Fallback: O(n) scan (only hits if active_pos is stale).
         self.tabs.iter().find(|t| t.id == self.active_tab_id)
     }
 
     pub fn active_tab_mut(&mut self) -> Option<&mut TabState> {
-        // Fast path: cached index is almost always correct.
         let id = self.active_tab_id;
         if let Some(t) = self.tabs.get(self.active_pos) {
             if t.id == id {
@@ -446,7 +435,6 @@ impl BrowserState {
 
     // ── Mouse / hover ─────────────────────────────────────────────────────────
 
-    /// Store raw cursor position and dirty only the region whose hover state changed.
     pub fn set_mouse_pos(&mut self, x: u32, y: u32) {
         self.mouse_x = x;
         self.mouse_y = y;
@@ -458,7 +446,7 @@ impl BrowserState {
         }
     }
 
-    // ── Address bar input ─────────────────────────────────────────────────────
+    // ── Address bar ───────────────────────────────────────────────────────────
 
     pub fn type_char(&mut self, c: char) {
         self.address_bar_input.push(c);
@@ -505,7 +493,7 @@ impl BrowserState {
 
     pub fn activate_tab(&mut self, id: TabId) {
         if self.tabs.iter().any(|t| t.id == id) {
-            self.active_tab_id   = id;
+            self.active_tab_id       = id;
             self.address_bar_focused = false;
             self.sync_address_bar();
             self.update_layout();
@@ -522,20 +510,19 @@ impl BrowserState {
         let frame  = self.frame_count;
         let url    = url.to_string();
 
-        // Extract error reason before moving `result` into the tab.
         let fail_reason = match &result {
             NavResult::WillFail(s) => Some(s.clone()),
             NavResult::WillLoad    => None,
         };
 
         if let Some(reason) = fail_reason {
-            // Invalid / unsupported URL — skip Loading, go straight to Error.
             if let Some(tab) = self.active_tab_mut() {
                 tab.url         = url.clone();
                 tab.display_url = url.clone();
                 tab.title       = derive_title(&url).to_string();
                 tab.page_state  = PageState::Error(reason);
                 tab.nav_result  = result;
+                tab.scroll_y    = 0;
             }
             self.address_bar_input   = url;
             self.address_bar_focused = false;
@@ -544,7 +531,6 @@ impl BrowserState {
             return None;
         }
 
-        // Structurally valid URL — enter Loading.
         if let Some(tab) = self.active_tab_mut() {
             tab.url              = url.clone();
             tab.display_url      = url.clone();
@@ -552,6 +538,8 @@ impl BrowserState {
             tab.page_state       = PageState::Loading;
             tab.load_start_frame = frame;
             tab.nav_result       = result;
+            tab.scroll_y         = 0;
+            tab.content_height   = 0;
         }
         self.address_bar_input   = url.clone();
         self.address_bar_focused = false;
@@ -560,9 +548,6 @@ impl BrowserState {
         Some(url)
     }
 
-    /// Commit the in-progress navigation for the active tab.
-    /// Called from `tick_loading` after the minimum UX delay has elapsed.
-    /// Reads the pre-classified `NavResult` — no timer-driven guessing.
     pub fn commit_navigation(&mut self) {
         let (url, result) = match self.active_tab() {
             Some(t) if t.page_state.is_loading() => (t.url.clone(), t.nav_result.clone()),
@@ -580,24 +565,21 @@ impl BrowserState {
                 if let Some(tab) = self.active_tab_mut() {
                     tab.title      = title.clone();
                     tab.page_state = PageState::Loaded;
-                    tab.commit(&url, &title, None);
+                    tab.scroll_y   = 0;
+                    tab.commit(&url, &title, None, vec![]);
                 }
             }
             NavResult::WillFail(reason) => {
-                // Defensive: WillFail shouldn't reach Loading normally, but
-                // reload() on a bad URL can produce this.
                 if let Some(tab) = self.active_tab_mut() {
                     tab.page_state = PageState::Error(reason);
-                    // Failed navigations are not committed to history.
                 }
             }
         }
         self.dirty.all();
     }
 
-    /// Resolve loading with a title from a real engine (future use).
-    /// For the current transitional model, `commit_navigation` is the primary path.
-    pub fn resolve_loading(&mut self, engine_title: String) {
+    /// Commit a successful fetch with real page content.
+    pub fn resolve_loading(&mut self, engine_title: String, nodes: Vec<PageNode>) {
         let url = match self.active_tab() {
             Some(t) if t.page_state.is_loading() => t.url.clone(),
             _ => return,
@@ -610,7 +592,8 @@ impl BrowserState {
         if let Some(tab) = self.active_tab_mut() {
             tab.title      = title.clone();
             tab.page_state = PageState::Loaded;
-            tab.commit(&url, &title, None);
+            tab.scroll_y   = 0;
+            tab.commit(&url, &title, None, nodes);
         }
         self.dirty.all();
     }
@@ -627,31 +610,41 @@ impl BrowserState {
     pub fn go_back(&mut self) -> Option<String> {
         let tab = self.active_tab_mut()?;
         if !tab.can_go_back() { return None; }
+        // Save current scroll position to history before moving.
+        if let Some(cur) = tab.history.get_mut(tab.history_index) {
+            cur.scroll_y = tab.scroll_y;
+        }
         tab.history_index -= 1;
         let entry = tab.history[tab.history_index].clone();
-        tab.url         = entry.url.clone();
-        tab.display_url = entry.display_url.clone();
-        tab.title       = entry.title.clone();
-        // Restore committed page state directly — no re-navigation, no timer.
-        tab.page_state  = match &entry.error_msg {
+        tab.url            = entry.url.clone();
+        tab.display_url    = entry.display_url.clone();
+        tab.title          = entry.title.clone();
+        tab.scroll_y       = entry.scroll_y;
+        tab.content_height = entry.content_height;
+        tab.page_state     = match &entry.error_msg {
             Some(err) => PageState::Error(err.clone()),
             None      => PageState::Loaded,
         };
         self.address_bar_input = entry.url.clone();
         self.update_bookmark_flag();
         self.dirty.all();
-        None  // State restored from history; caller need not trigger engine.
+        None
     }
 
     pub fn go_forward(&mut self) -> Option<String> {
         let tab = self.active_tab_mut()?;
         if !tab.can_go_forward() { return None; }
+        if let Some(cur) = tab.history.get_mut(tab.history_index) {
+            cur.scroll_y = tab.scroll_y;
+        }
         tab.history_index += 1;
         let entry = tab.history[tab.history_index].clone();
-        tab.url         = entry.url.clone();
-        tab.display_url = entry.display_url.clone();
-        tab.title       = entry.title.clone();
-        tab.page_state  = match &entry.error_msg {
+        tab.url            = entry.url.clone();
+        tab.display_url    = entry.display_url.clone();
+        tab.title          = entry.title.clone();
+        tab.scroll_y       = entry.scroll_y;
+        tab.content_height = entry.content_height;
+        tab.page_state     = match &entry.error_msg {
             Some(err) => PageState::Error(err.clone()),
             None      => PageState::Loaded,
         };
@@ -671,9 +664,40 @@ impl BrowserState {
             tab.page_state       = PageState::Loading;
             tab.load_start_frame = frame;
             tab.nav_result       = result;
+            tab.scroll_y         = 0;
+            tab.content_height   = 0;
         }
         self.dirty.all();
         Some(url)
+    }
+
+    // ── Scroll ────────────────────────────────────────────────────────────────
+
+    /// Scroll the active tab's content by `delta` pixels.
+    /// Positive delta scrolls down (toward end of page); negative scrolls up.
+    /// No-ops unless the active tab is in Loaded state.
+    pub fn scroll_by(&mut self, delta: i32) {
+        let Some(tab) = self.active_tab_mut() else { return };
+        if !matches!(tab.page_state, PageState::Loaded) { return; }
+        let viewport_h = FB_HEIGHT.saturating_sub(TOP_BAR_HEIGHT);
+        let max = tab.content_height.saturating_sub(viewport_h);
+        let new_scroll = (tab.scroll_y as i64 + delta as i64)
+            .clamp(0, max as i64) as u32;
+        if new_scroll != tab.scroll_y {
+            tab.scroll_y = new_scroll;
+            self.dirty.content = true;
+        }
+    }
+
+    /// Store the computed content height for the active tab and its current
+    /// history entry so scroll clamping is correct after back/forward.
+    pub fn set_content_height(&mut self, h: u32) {
+        if let Some(tab) = self.active_tab_mut() {
+            tab.content_height = h;
+            if let Some(entry) = tab.history.get_mut(tab.history_index) {
+                entry.content_height = h;
+            }
+        }
     }
 
     // ── Address bar ───────────────────────────────────────────────────────────
@@ -681,8 +705,6 @@ impl BrowserState {
     pub fn sync_address_bar(&mut self) {
         let url = self.active_tab().map(|t| t.url.clone()).unwrap_or_default();
         self.address_bar_input = url;
-        // sync_address_bar is called internally from activate/close; callers set
-        // the appropriate dirty flags themselves.
     }
 
     pub fn focus_address_bar(&mut self) {

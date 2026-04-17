@@ -4,14 +4,19 @@ mod draw;
 mod font;
 mod input;
 mod layout;
+mod page;
 mod theme;
 mod ui_state;
 
 use crate::font::FontManager;
 use crate::layout::*;
+use crate::page::{PageNode, parse_html};
 use rashamon_net::HttpClient;
 use rashamon_renderer::{Framebuffer, RenderEngine};
-use ui_state::{BrowserState, DirtyFlags, PageState, derive_title};
+use ui_state::{BrowserState, DirtyFlags, PageState, TabId, derive_title};
+
+use std::collections::HashMap;
+use std::sync::mpsc;
 
 // Loading timing (at 60 fps)
 const LOAD_MIN_FRAMES:     u64 = 60;   // 1 s minimum visible loading state
@@ -31,6 +36,44 @@ fn resolve_url(raw: &str) -> String {
     if raw.contains("://")                     { return raw.to_string(); }
     if !raw.contains(' ') && raw.contains('.') { return format!("https://{raw}"); }
     format!("https://duckduckgo.com/?q={}", raw.replace(' ', "+"))
+}
+
+// ── Fetch / parse pipeline ────────────────────────────────────────────────────
+
+/// Result sent back from the fetch thread to the main loop.
+enum FetchOutcome {
+    Success { title: Option<String>, nodes: Vec<PageNode> },
+    Failure(String),
+}
+
+/// One in-flight background fetch (one per navigation).
+struct PendingFetch {
+    tab_id:   TabId,
+    receiver: mpsc::Receiver<FetchOutcome>,
+}
+
+/// Fetch, parse, and return the page outcome — runs on a background thread.
+fn do_fetch(url: String) -> FetchOutcome {
+    let mut client = HttpClient::new();
+    match client.fetch_text(&url) {
+        Err(reason) => FetchOutcome::Failure(reason),
+        Ok(html)    => {
+            let parsed = parse_html(&html);
+            FetchOutcome::Success {
+                title: parsed.title,
+                nodes: parsed.nodes,
+            }
+        }
+    }
+}
+
+/// Spawn a background fetch thread for the active tab's current URL.
+/// Replaces any previously-pending fetch (the old thread will send to a
+/// dropped receiver and clean itself up silently).
+fn spawn_fetch(tab_id: TabId, url: String) -> PendingFetch {
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || { let _ = tx.send(do_fetch(url)); });
+    PendingFetch { tab_id, receiver: rx }
 }
 
 // ── Main ──────────────────────────────────────────────────────────────────────
@@ -66,10 +109,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut display = display::Display::new(&video, win_w, win_h, FB_WIDTH, FB_HEIGHT)?;
     let mut input   = input::InputHandler::new(event_pump)?;
 
+    // Per-tab rendered page content — populated on successful fetch.
+    let mut page_content: HashMap<TabId, Vec<PageNode>> = HashMap::new();
+    // Background fetch in flight.
+    let mut pending_fetch:    Option<PendingFetch>          = None;
+    // Fetch result received but waiting for LOAD_MIN_FRAMES visual delay.
+    let mut buffered_outcome: Option<(TabId, FetchOutcome)> = None;
+
     if let Some(arg_url) = std::env::args().nth(1) {
         let url = resolve_url(&arg_url);
         if let Some(url) = state.begin_navigate(&url) {
             engine.navigate(&url).ok();
+            pending_fetch = Some(spawn_fetch(state.active_tab_id, url));
         }
     }
 
@@ -106,8 +157,73 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
 
-        // ── Loading state machine ─────────────────────────────────────────────
+        // ── Spawn fetch for any navigation that just started ──────────────────
+        // After the event loop so all state mutations this frame are settled.
+        if let Some(tab) = state.active_tab() {
+            if tab.page_state.is_loading() {
+                let already_fetching = pending_fetch.as_ref()
+                    .map_or(false, |pf| pf.tab_id == tab.id);
+                let already_buffered = buffered_outcome.as_ref()
+                    .map_or(false, |(id, _)| *id == tab.id);
+                if !already_fetching && !already_buffered {
+                    let tab_id = tab.id;
+                    let url    = tab.url.clone();
+                    pending_fetch = Some(spawn_fetch(tab_id, url));
+                }
+            }
+        }
+
+        // ── Poll background fetch ─────────────────────────────────────────────
+        if let Some(ref pf) = pending_fetch {
+            match pf.receiver.try_recv() {
+                Ok(outcome) => {
+                    let tab_id = pf.tab_id;
+                    pending_fetch = None;
+                    // Buffer until LOAD_MIN_FRAMES visual delay has elapsed.
+                    buffered_outcome = Some((tab_id, outcome));
+                }
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    // Thread exited without sending — treat as failure.
+                    let tab_id = pf.tab_id;
+                    pending_fetch = None;
+                    if state.active_tab().map_or(false,
+                        |t| t.id == tab_id && t.page_state.is_loading())
+                    {
+                        state.fail_loading("Connection lost");
+                    }
+                }
+                Err(mpsc::TryRecvError::Empty) => {} // still in flight
+            }
+        }
+
+        // ── Apply buffered fetch result (after min visual loading time) ────────
+        if let Some((tab_id, _)) = &buffered_outcome {
+            let tab_id = *tab_id;
+            let ready = state.active_tab()
+                .filter(|t| t.id == tab_id && t.page_state.is_loading())
+                .map_or(false, |t| {
+                    state.frame_count.saturating_sub(t.load_start_frame)
+                        >= LOAD_MIN_FRAMES
+                });
+            if ready {
+                let (_, outcome) = buffered_outcome.take().unwrap();
+                match outcome {
+                    FetchOutcome::Success { title, nodes } => {
+                        page_content.insert(tab_id, nodes);
+                        state.resolve_loading(title.unwrap_or_default());
+                    }
+                    FetchOutcome::Failure(reason) => {
+                        state.fail_loading(&reason);
+                    }
+                }
+            }
+        }
+
+        // ── Loading timeout (hard fallback) ───────────────────────────────────
         tick_loading(&mut state, &mut engine);
+
+        // ── Stale content cleanup (tabs that were closed) ─────────────────────
+        page_content.retain(|id, _| state.tabs.iter().any(|t| t.id == *id));
 
         // ── Continuous-animation dirty ────────────────────────────────────────
 
@@ -132,20 +248,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let dirty = state.dirty;
             state.dirty.clear();
 
-            // Content area: clear + engine render + page-state overlay.
-            // Engine render is skipped for non-Loaded states (they self-clear).
-            if dirty.content {
-                let page = state.active_tab().map(|t| &t.page_state);
-                if matches!(page, Some(PageState::Loaded) | None) {
-                    // Engine renders the web page; fill first so blank tabs
-                    // don't show stale content.
-                    fb.fill_rect(0, TOP_BAR_HEIGHT, FB_WIDTH,
-                        FB_HEIGHT - TOP_BAR_HEIGHT, state.theme.bg);
-                    engine.render(&mut fb)?;
-                }
-            }
-
-            render_ui(&mut fb, &state, &font, dirty);
+            render_ui(&mut fb, &state, &font, dirty, &page_content);
             display.present(&fb)?;
         }
 
@@ -156,24 +259,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 // ── Loading state machine ─────────────────────────────────────────────────────
 
-fn tick_loading(state: &mut BrowserState, engine: &mut RenderEngine) {
+/// Hard-timeout watchdog. Normal loading is driven by fetch results;
+/// this only fires if no fetch result arrived within LOAD_TIMEOUT_FRAMES.
+fn tick_loading(state: &mut BrowserState, _engine: &mut RenderEngine) {
     let Some(tab) = state.active_tab() else { return };
     if !tab.page_state.is_loading() { return; }
 
     let elapsed = state.frame_count.saturating_sub(tab.load_start_frame);
-
     if elapsed >= LOAD_TIMEOUT_FRAMES {
-        // Hard timeout — belt-and-suspenders for future async engine stalls.
         state.fail_loading("Request timed out");
-        return;
-    }
-    if elapsed >= LOAD_MIN_FRAMES {
-        // Commit via pre-classified NavResult — this is now the source of truth.
-        state.commit_navigation();
-        // If a real engine has a title ready, let it override the derived one.
-        if let Some(title) = engine.title() {
-            if !title.is_empty() { state.resolve_loading(title); }
-        }
     }
 }
 
@@ -377,10 +471,11 @@ fn click_content(state: &mut BrowserState, engine: &mut RenderEngine, x: u32, y:
 /// Repaint only the regions marked dirty. Each region self-clears before
 /// drawing so there is no stale overdraw from the previous frame.
 fn render_ui(
-    fb:    &mut Framebuffer,
-    state: &BrowserState,
-    font:  &FontManager,
-    dirty: DirtyFlags,
+    fb:           &mut Framebuffer,
+    state:        &BrowserState,
+    font:         &FontManager,
+    dirty:        DirtyFlags,
+    page_content: &HashMap<TabId, Vec<PageNode>>,
 ) {
     let theme      = state.theme;
     let tw         = state.tab_width;
@@ -392,7 +487,13 @@ fn render_ui(
             Some(PageState::NewTab)   => draw_new_tab(fb, state, font),
             Some(PageState::Loading)  => draw_loading(fb, state, font),
             Some(PageState::Error(_)) => draw_error(fb, state, font),
-            Some(PageState::Loaded) => draw_loaded(fb, state, font),
+            Some(PageState::Loaded) => {
+                let nodes = state.active_tab()
+                    .and_then(|t| page_content.get(&t.id))
+                    .map(|v| v.as_slice())
+                    .unwrap_or(&[]);
+                draw_loaded(fb, state, font, nodes);
+            }
             None => {}
         }
     }
@@ -730,87 +831,173 @@ fn draw_loading(fb: &mut Framebuffer, state: &BrowserState, font: &FontManager) 
 
 // ── Loaded page ───────────────────────────────────────────────────────────────
 
-fn draw_loaded(fb: &mut Framebuffer, state: &BrowserState, font: &FontManager) {
+/// Dispatch to real page renderer when content is available,
+/// or fall back to the metadata card for tabs with no fetched content yet.
+fn draw_loaded(
+    fb:    &mut Framebuffer,
+    state: &BrowserState,
+    font:  &FontManager,
+    nodes: &[PageNode],
+) {
+    if !nodes.is_empty() {
+        draw_page_content(fb, state, font, nodes);
+    } else {
+        draw_loaded_card(fb, state, font);
+    }
+}
+
+/// Minimal text-first page renderer.
+/// Lays out PageNodes top-to-bottom with word-wrapped text and clipping.
+fn draw_page_content(
+    fb:    &mut Framebuffer,
+    state: &BrowserState,
+    font:  &FontManager,
+    nodes: &[PageNode],
+) {
+    let theme = state.theme;
+
+    // Page background
+    fb.fill_rect(0, TOP_BAR_HEIGHT, FB_WIDTH, FB_HEIGHT - TOP_BAR_HEIGHT, theme.bg);
+    // Separator between chrome and content
+    fb.fill_rect(0, TOP_BAR_HEIGHT, FB_WIDTH, 1, theme.border);
+
+    const MARGIN:   u32 = 120;   // left edge of text
+    const MAX_W:    u32 = 880;   // max text column width
+    const PAD_TOP:  u32 = 28;
+
+    let mut y = TOP_BAR_HEIGHT + PAD_TOP;
+    let clip_y = FB_HEIGHT.saturating_sub(24);
+
+    for node in nodes {
+        if y >= clip_y { break; }
+
+        match node {
+            PageNode::Heading { level, text } => {
+                let (size, color, before, after): (f32, _, u32, u32) = match level {
+                    1 => (28.0, theme.fg,           18, 10),
+                    2 => (22.0, theme.fg,           14, 8),
+                    _ => (17.0, theme.fg,           10, 6),
+                };
+                y += before;
+                if y >= clip_y { break; }
+                for line in wrap_text(text, font, size, MAX_W) {
+                    draw::draw_text(fb, font, MARGIN, y, &line, size, color, MAX_W);
+                    y += size as u32 + 4;
+                    if y >= clip_y { break; }
+                }
+                y += after;
+            }
+
+            PageNode::Paragraph(text) => {
+                if text.trim().is_empty() { continue; }
+                y += 4;
+                for line in wrap_text(text, font, 14.0, MAX_W) {
+                    if y >= clip_y { break; }
+                    draw::draw_text(fb, font, MARGIN, y, &line, 14.0, theme.fg_secondary, MAX_W);
+                    y += 22;
+                }
+                y += 10;
+            }
+
+            PageNode::ListItem(text) => {
+                let with_bullet = format!("  \u{2022}  {text}");
+                for line in wrap_text(&with_bullet, font, 13.0, MAX_W) {
+                    if y >= clip_y { break; }
+                    draw::draw_text(fb, font, MARGIN, y, &line, 13.0, theme.fg_secondary, MAX_W);
+                    y += 20;
+                }
+                y += 3;
+            }
+
+            PageNode::Pre(text) => {
+                y += 8;
+                let lines: Vec<&str> = text.lines().collect();
+                let block_h = ((lines.len() as u32) * 18 + 16).min(clip_y.saturating_sub(y));
+                fb.fill_rect(MARGIN.saturating_sub(8), y.saturating_sub(4),
+                    MAX_W + 16, block_h, theme.surface);
+                for line in &lines {
+                    if y >= clip_y { break; }
+                    draw::draw_text(fb, font, MARGIN, y, line, 12.0, theme.fg, MAX_W + 8);
+                    y += 18;
+                }
+                y += 14;
+            }
+
+            PageNode::HRule => {
+                y += 8;
+                fb.fill_rect(MARGIN, y, MAX_W, 1, theme.border);
+                y += 16;
+            }
+        }
+    }
+}
+
+/// Word-wrap `text` into lines of at most `max_w` pixels at `size`.
+/// Measures each word individually for O(words) total font calls.
+fn wrap_text(text: &str, font: &FontManager, size: f32, max_w: u32) -> Vec<String> {
+    let space_w = font.text_width(" ", size);
+    let mut lines   = Vec::new();
+    let mut line    = String::new();
+    let mut line_w  = 0u32;
+
+    for word in text.split_whitespace() {
+        let ww = font.text_width(word, size);
+        let gap = if line.is_empty() { 0 } else { space_w };
+        if !line.is_empty() && line_w + gap + ww > max_w {
+            lines.push(std::mem::take(&mut line));
+            line_w = 0;
+        }
+        if !line.is_empty() { line.push(' '); }
+        line.push_str(word);
+        line_w += gap + ww;
+    }
+    if !line.is_empty() { lines.push(line); }
+    lines
+}
+
+/// Fallback card shown when a page is Loaded but content hasn't arrived yet
+/// (e.g. navigated back to a committed entry without a re-fetch).
+fn draw_loaded_card(fb: &mut Framebuffer, state: &BrowserState, font: &FontManager) {
     let theme = state.theme;
     let cx    = FB_WIDTH / 2;
     let cy    = TOP_BAR_HEIGHT + (FB_HEIGHT - TOP_BAR_HEIGHT) / 2;
 
-    // Background already filled by main loop engine.render pass.
+    fb.fill_rect(0, TOP_BAR_HEIGHT, FB_WIDTH, FB_HEIGHT - TOP_BAR_HEIGHT, theme.bg);
+
     let Some(tab) = state.active_tab() else { return };
 
-    // ── Content card ──────────────────────────────────────────────────────────
-    const CARD_W: u32 = 780;
-    const CARD_H: u32 = 320;
+    const CARD_W: u32 = 680;
+    const CARD_H: u32 = 220;
     let card_x = cx.saturating_sub(CARD_W / 2);
     let card_y = cy.saturating_sub(CARD_H / 2);
 
-    draw::draw_rounded_rect(fb, card_x, card_y, CARD_W, CARD_H, 16, theme.surface);
-    // Subtle border
+    draw::draw_rounded_rect(fb, card_x, card_y, CARD_W, CARD_H, 14, theme.surface);
     draw::draw_rounded_rect_outline(fb, card_x as i32, card_y as i32,
-        CARD_W as i32, CARD_H as i32, 16, theme.border);
+        CARD_W as i32, CARD_H as i32, 14, theme.border);
 
-    // ── "Page loaded" status badge ────────────────────────────────────────────
-    const BADGE_W: u32 = 118;
-    const BADGE_H: u32 = 24;
-    let badge_x = cx.saturating_sub(BADGE_W / 2);
-    let badge_y = card_y + 26;
-    draw::draw_rounded_rect(fb, badge_x, badge_y, BADGE_W, BADGE_H, 12, theme.accent);
-    let badge_lbl = "Page loaded";
-    let blw = font.text_width(badge_lbl, 11.0);
+    let title_w = font.text_width(tab.tab_title(), 22.0).min(CARD_W - 48);
     draw::draw_text(fb, font,
-        badge_x + (BADGE_W.saturating_sub(blw)) / 2,
-        badge_y + (BADGE_H.saturating_sub(11)) / 2,
-        badge_lbl, 11.0, theme.accent_fg, BADGE_W - 8);
+        cx.saturating_sub(title_w / 2), card_y + 40,
+        tab.tab_title(), 22.0, theme.fg, CARD_W - 48);
 
-    // ── Page title ────────────────────────────────────────────────────────────
-    let title   = tab.tab_title();
-    let title_w = font.text_width(title, 26.0).min(CARD_W - 64);
-    draw::draw_text(fb, font,
-        cx.saturating_sub(title_w / 2), card_y + 68,
-        title, 26.0, theme.fg, CARD_W - 64);
-
-    // ── Hostname (accent colour) ───────────────────────────────────────────────
     let host   = derive_title(&tab.url);
-    let host_w = font.text_width(host, 15.0).min(CARD_W - 64);
+    let host_w = font.text_width(host, 14.0).min(CARD_W - 48);
     draw::draw_text(fb, font,
-        cx.saturating_sub(host_w / 2), card_y + 106,
-        host, 15.0, theme.accent, CARD_W - 64);
+        cx.saturating_sub(host_w / 2), card_y + 74,
+        host, 14.0, theme.accent, CARD_W - 48);
 
-    // ── Divider ───────────────────────────────────────────────────────────────
-    fb.fill_rect(card_x + 56, card_y + 140, CARD_W - 112, 1, theme.border);
-
-    // ── Full URL ──────────────────────────────────────────────────────────────
     if !tab.url.is_empty() {
-        let uw = font.text_width(&tab.url, 12.0).min(CARD_W - 64);
+        let uw = font.text_width(&tab.url, 11.0).min(CARD_W - 48);
         draw::draw_text(fb, font,
-            cx.saturating_sub(uw / 2), card_y + 156,
-            &tab.url, 12.0, theme.fg_secondary, CARD_W - 64);
+            cx.saturating_sub(uw / 2), card_y + 104,
+            &tab.url, 11.0, theme.fg_secondary, CARD_W - 48);
     }
 
-    // ── Security indicator ────────────────────────────────────────────────────
-    let (sec_text, sec_col) = if tab.url.starts_with("https://") {
-        ("Secure connection (HTTPS)", theme.security_ok)
-    } else if tab.url.starts_with("http://") {
-        ("Not secure (HTTP)", theme.security_err)
-    } else {
-        ("Local page", theme.fg_secondary)
-    };
-    let sec_w  = font.text_width(sec_text, 12.0);
-    let dot_cx = cx.saturating_sub((sec_w + 16) / 2);
-    fb.fill_rect(dot_cx,     card_y + 196, 8, 8, sec_col);
-    draw::draw_text(fb, font, dot_cx + 14, card_y + 193,
-        sec_text, 12.0, sec_col, CARD_W - 64);
-
-    // ── Navigation hint ───────────────────────────────────────────────────────
-    let hint = if tab.can_go_back() {
-        "Back \u{2190}  \u{2022}  Ctrl+T new tab  \u{2022}  address bar to navigate"
-    } else {
-        "Ctrl+T new tab  \u{2022}  address bar to navigate  \u{2022}  Ctrl+R reload"
-    };
-    let nhw = font.text_width(hint, 11.0).min(CARD_W - 64);
+    let hint = "Ctrl+R to reload  \u{2022}  address bar to navigate";
+    let hw   = font.text_width(hint, 11.0);
     draw::draw_text(fb, font,
-        cx.saturating_sub(nhw / 2), card_y + CARD_H - 30,
-        hint, 11.0, theme.fg_secondary, CARD_W - 64);
+        cx.saturating_sub(hw / 2), card_y + CARD_H - 28,
+        hint, 11.0, theme.fg_secondary, CARD_W - 48);
 }
 
 // ── Error page ────────────────────────────────────────────────────────────────

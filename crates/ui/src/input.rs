@@ -40,9 +40,14 @@ impl InputHandler {
     /// Returns None only when the event queue is truly empty.
     pub fn poll_event(&mut self) -> Result<Option<Event>, io::Error> {
         loop {
-            let raw = match self.event_pump.poll_event() {
-                None => return Ok(None), // queue empty
-                Some(e) => e,
+            // sdl2 0.35.2 panics on unknown/extended keycodes (e.g. 0x435).
+            // catch_unwind lets us discard those events without crashing.
+            let raw = match std::panic::catch_unwind(
+                std::panic::AssertUnwindSafe(|| self.event_pump.poll_event())
+            ) {
+                Ok(None)    => return Ok(None), // queue empty
+                Ok(Some(e)) => e,
+                Err(_)      => continue,        // unknown keycode — skip event
             };
 
             // Keep ctrl state fresh on every SDL event.

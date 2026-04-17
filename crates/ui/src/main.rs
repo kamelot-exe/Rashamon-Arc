@@ -167,9 +167,11 @@ fn tick_loading(state: &mut BrowserState, engine: &mut RenderEngine) {
         return;
     }
     if elapsed >= LOAD_MIN_FRAMES {
-        if let Some(title) = engine.title() {
-            state.resolve_loading(title);
-        }
+        // engine.title() returns Some only when a real HTML engine has parsed
+        // a <title> tag. Fall back to the URL-derived title so navigation always
+        // resolves after LOAD_MIN_FRAMES rather than hanging until timeout.
+        let title = engine.title().unwrap_or_default();
+        state.resolve_loading(title);
     }
 }
 
@@ -388,9 +390,8 @@ fn render_ui(
             Some(PageState::NewTab)   => draw_new_tab(fb, state, font),
             Some(PageState::Loading)  => draw_loading(fb, state, font),
             Some(PageState::Error(_)) => draw_error(fb, state, font),
-            Some(PageState::Loaded) | None => {
-                // Web content already rendered by engine.render in main loop.
-            }
+            Some(PageState::Loaded) => draw_loaded(fb, state, font),
+            None => {}
         }
     }
 
@@ -723,6 +724,91 @@ fn draw_loading(fb: &mut Framebuffer, state: &BrowserState, font: &FontManager) 
         state.active_tab().map_or(0, |t| t.load_start_frame));
     let progress = ((elapsed as f32 / LOAD_MIN_FRAMES as f32) * FB_WIDTH as f32) as u32;
     fb.fill_rect(0, TOP_BAR_HEIGHT + 1, progress.min(FB_WIDTH - 4), 2, theme.accent);
+}
+
+// ── Loaded page ───────────────────────────────────────────────────────────────
+
+fn draw_loaded(fb: &mut Framebuffer, state: &BrowserState, font: &FontManager) {
+    let theme = state.theme;
+    let cx    = FB_WIDTH / 2;
+    let cy    = TOP_BAR_HEIGHT + (FB_HEIGHT - TOP_BAR_HEIGHT) / 2;
+
+    // Background already filled by main loop engine.render pass.
+    let Some(tab) = state.active_tab() else { return };
+
+    // ── Content card ──────────────────────────────────────────────────────────
+    const CARD_W: u32 = 780;
+    const CARD_H: u32 = 320;
+    let card_x = cx.saturating_sub(CARD_W / 2);
+    let card_y = cy.saturating_sub(CARD_H / 2);
+
+    draw::draw_rounded_rect(fb, card_x, card_y, CARD_W, CARD_H, 16, theme.surface);
+    // Subtle border
+    draw::draw_rounded_rect_outline(fb, card_x as i32, card_y as i32,
+        CARD_W as i32, CARD_H as i32, 16, theme.border);
+
+    // ── "Page loaded" status badge ────────────────────────────────────────────
+    const BADGE_W: u32 = 118;
+    const BADGE_H: u32 = 24;
+    let badge_x = cx.saturating_sub(BADGE_W / 2);
+    let badge_y = card_y + 26;
+    draw::draw_rounded_rect(fb, badge_x, badge_y, BADGE_W, BADGE_H, 12, theme.accent);
+    let badge_lbl = "Page loaded";
+    let blw = font.text_width(badge_lbl, 11.0);
+    draw::draw_text(fb, font,
+        badge_x + (BADGE_W.saturating_sub(blw)) / 2,
+        badge_y + (BADGE_H.saturating_sub(11)) / 2,
+        badge_lbl, 11.0, theme.accent_fg, BADGE_W - 8);
+
+    // ── Page title ────────────────────────────────────────────────────────────
+    let title   = tab.tab_title();
+    let title_w = font.text_width(title, 26.0).min(CARD_W - 64);
+    draw::draw_text(fb, font,
+        cx.saturating_sub(title_w / 2), card_y + 68,
+        title, 26.0, theme.fg, CARD_W - 64);
+
+    // ── Hostname (accent colour) ───────────────────────────────────────────────
+    let host   = derive_title(&tab.url);
+    let host_w = font.text_width(host, 15.0).min(CARD_W - 64);
+    draw::draw_text(fb, font,
+        cx.saturating_sub(host_w / 2), card_y + 106,
+        host, 15.0, theme.accent, CARD_W - 64);
+
+    // ── Divider ───────────────────────────────────────────────────────────────
+    fb.fill_rect(card_x + 56, card_y + 140, CARD_W - 112, 1, theme.border);
+
+    // ── Full URL ──────────────────────────────────────────────────────────────
+    if !tab.url.is_empty() {
+        let uw = font.text_width(&tab.url, 12.0).min(CARD_W - 64);
+        draw::draw_text(fb, font,
+            cx.saturating_sub(uw / 2), card_y + 156,
+            &tab.url, 12.0, theme.fg_secondary, CARD_W - 64);
+    }
+
+    // ── Security indicator ────────────────────────────────────────────────────
+    let (sec_text, sec_col) = if tab.url.starts_with("https://") {
+        ("Secure connection (HTTPS)", theme.security_ok)
+    } else if tab.url.starts_with("http://") {
+        ("Not secure (HTTP)", theme.security_err)
+    } else {
+        ("Local page", theme.fg_secondary)
+    };
+    let sec_w  = font.text_width(sec_text, 12.0);
+    let dot_cx = cx.saturating_sub((sec_w + 16) / 2);
+    fb.fill_rect(dot_cx,     card_y + 196, 8, 8, sec_col);
+    draw::draw_text(fb, font, dot_cx + 14, card_y + 193,
+        sec_text, 12.0, sec_col, CARD_W - 64);
+
+    // ── Navigation hint ───────────────────────────────────────────────────────
+    let hint = if tab.can_go_back() {
+        "Back \u{2190}  \u{2022}  Ctrl+T new tab  \u{2022}  address bar to navigate"
+    } else {
+        "Ctrl+T new tab  \u{2022}  address bar to navigate  \u{2022}  Ctrl+R reload"
+    };
+    let nhw = font.text_width(hint, 11.0).min(CARD_W - 64);
+    draw::draw_text(fb, font,
+        cx.saturating_sub(nhw / 2), card_y + CARD_H - 30,
+        hint, 11.0, theme.fg_secondary, CARD_W - 64);
 }
 
 // ── Error page ────────────────────────────────────────────────────────────────

@@ -4,6 +4,7 @@ mod draw;
 mod font;
 mod input;
 mod layout;
+mod omnibox;
 mod page;
 mod theme;
 mod ui_state;
@@ -41,14 +42,38 @@ fn scale(v: i32, factor: f32, max: u32) -> u32 {
     ((v.max(0) as f32 * factor) as u32).min(max - 1)
 }
 
-/// Resolve raw address-bar text to a navigable URL.
-/// Non-URL text is sent to DuckDuckGo.
-fn resolve_url(raw: &str) -> String {
-    let raw = raw.trim();
-    if raw.is_empty()                          { return String::new(); }
-    if raw.contains("://")                     { return raw.to_string(); }
-    if !raw.contains(' ') && raw.contains('.') { return format!("https://{raw}"); }
-    format!("https://duckduckgo.com/?q={}", raw.replace(' ', "+"))
+/// Run the omnibox pipeline and trigger navigation or an overlay as needed.
+fn omnibox_navigate(
+    raw:    &str,
+    state:  &mut BrowserState,
+    engine: &mut RenderEngine,
+) {
+    use omnibox::{resolve, MatchEntry, OmniboxResult, InternalRoute, DEFAULT_PROVIDER};
+
+    let bm_iter = state.bookmarks.iter()
+        .map(|b| MatchEntry { url: &b.url, title: &b.title });
+    let hist_iter = state.global_history.iter().rev()
+        .map(|e| MatchEntry { url: &e.url, title: &e.title });
+
+    match resolve(raw, bm_iter, hist_iter, &DEFAULT_PROVIDER) {
+        OmniboxResult::Navigate(url) => {
+            if let Some(url) = state.begin_navigate(&url) {
+                engine.navigate(&url).ok();
+            }
+        }
+        OmniboxResult::OpenOverlay(InternalRoute::History)   => {
+            state.toggle_overlay(OverlayKind::History);
+        }
+        OmniboxResult::OpenOverlay(InternalRoute::Bookmarks) => {
+            state.toggle_overlay(OverlayKind::Bookmarks);
+        }
+        OmniboxResult::OpenOverlay(InternalRoute::Blank) => {
+            state.open_new_tab();
+        }
+        OmniboxResult::Nothing => {
+            state.cancel_address_bar_edit();
+        }
+    }
 }
 
 // ── Fetch / parse pipeline ────────────────────────────────────────────────────
@@ -140,10 +165,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut buffered_outcome: Option<(TabId, FetchOutcome)> = None;
 
     if let Some(arg_url) = std::env::args().nth(1) {
-        let url = resolve_url(&arg_url);
-        if let Some(url) = state.begin_navigate(&url) {
-            engine.navigate(&url).ok();
-            pending_fetch = Some(spawn_fetch(state.active_tab_id, url));
+        use omnibox::{classify_input, InputKind};
+        let nav_url = match classify_input(&arg_url) {
+            InputKind::Url(u)    => Some(u),
+            InputKind::Search(q) => Some(omnibox::DEFAULT_PROVIDER.build_url(&q)),
+            _                    => None,
+        };
+        if let Some(url) = nav_url {
+            if let Some(url) = state.begin_navigate(&url) {
+                engine.navigate(&url).ok();
+                pending_fetch = Some(spawn_fetch(state.active_tab_id, url));
+            }
         }
     }
 
@@ -370,13 +402,9 @@ fn on_key(
 
         input::Key::Enter if state.address_bar_focused => {
             let raw = state.address_bar_input.trim().to_string();
+            state.cancel_address_bar_edit();
             if !raw.is_empty() {
-                let url = resolve_url(&raw);
-                if let Some(url) = state.begin_navigate(&url) {
-                    engine.navigate(&url).ok();
-                }
-            } else {
-                state.cancel_address_bar_edit();
+                omnibox_navigate(&raw, state, engine);
             }
         }
 

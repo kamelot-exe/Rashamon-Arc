@@ -6,6 +6,7 @@ mod input;
 mod layout;
 mod omnibox;
 mod page;
+mod persist;
 mod theme;
 mod ui_state;
 
@@ -73,6 +74,76 @@ fn omnibox_navigate(
         OmniboxResult::Nothing => {
             state.cancel_address_bar_edit();
         }
+    }
+}
+
+// ── Persistence helpers ───────────────────────────────────────────────────────
+
+#[derive(Default)]
+struct SaveDirty {
+    bookmarks: bool,
+    history:   bool,
+    prefs:     bool,
+}
+
+impl SaveDirty {
+    fn any(&self) -> bool { self.bookmarks || self.history || self.prefs }
+}
+
+/// Load persisted data into browser state on startup.
+fn load_user_data(state: &mut BrowserState) {
+    use crate::theme::ColorPalette;
+
+    // Theme preference — applied first so the initial render uses the right theme.
+    if let Some(theme_str) = persist::load_theme() {
+        if let Some(palette) = ColorPalette::from_str(&theme_str) {
+            state.apply_palette(palette);
+        }
+    }
+
+    // Bookmarks — replace the built-in defaults if user has saved bookmarks.
+    let stored_bm = persist::load_bookmarks();
+    if !stored_bm.is_empty() {
+        state.bookmarks = stored_bm.into_iter()
+            .map(|b| ui_state::QuickLink::new(b.title, b.url))
+            .collect();
+    }
+
+    // History — loaded oldest-first, same as storage order.
+    let stored_hist = persist::load_history();
+    for e in stored_hist {
+        state.global_history.push(ui_state::GlobalHistoryEntry {
+            url:   e.url,
+            title: e.title,
+            when:  0, // wall-clock unknown; ordering preserved by position
+        });
+    }
+}
+
+/// Flush any dirty saves in background threads (fire-and-forget).
+fn flush_saves(state: &BrowserState, dirty: &mut SaveDirty) {
+    use crate::theme::ColorPalette;
+
+    if dirty.bookmarks {
+        let bm: Vec<persist::StoredBookmark> = state.bookmarks.iter()
+            .map(|b| persist::StoredBookmark { title: b.title.clone(), url: b.url.clone() })
+            .collect();
+        std::thread::spawn(move || persist::save_bookmarks(&bm));
+        dirty.bookmarks = false;
+    }
+
+    if dirty.history {
+        let hist: Vec<persist::StoredHistory> = state.global_history.iter()
+            .map(|e| persist::StoredHistory { url: e.url.clone(), title: e.title.clone() })
+            .collect();
+        std::thread::spawn(move || persist::save_history(&hist));
+        dirty.history = false;
+    }
+
+    if dirty.prefs {
+        let name = state.palette.as_str().to_string();
+        std::thread::spawn(move || persist::save_theme(&name));
+        dirty.prefs = false;
     }
 }
 
@@ -158,11 +229,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut engine  = RenderEngine::new()?;
     let _http       = HttpClient::new();
     let mut state   = BrowserState::new();
+    load_user_data(&mut state);
     let mut display = display::Display::new(&video, win_w, win_h, FB_WIDTH, FB_HEIGHT)?;
     let mut input   = input::InputHandler::new(event_pump)?;
 
     let mut pending_fetch:    Option<PendingFetch>          = None;
     let mut buffered_outcome: Option<(TabId, FetchOutcome)> = None;
+    let mut save_dirty = SaveDirty::default();
 
     if let Some(arg_url) = std::env::args().nth(1) {
         use omnibox::{classify_input, InputKind};
@@ -192,7 +265,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 input::Event::Quit => { running = false; break; }
 
                 input::Event::KeyPress(k) =>
-                    on_key(&mut state, &mut engine, &mut running, k, &input)?,
+                    on_key(&mut state, &mut engine, &mut running, k, &input, &mut save_dirty)?,
 
                 input::Event::MouseMove { x, y } => {
                     let fx = scale(x, scale_x, FB_WIDTH);
@@ -203,7 +276,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 input::Event::MouseDown { x, y, button } if button == 1 => {
                     let fx = scale(x, scale_x, FB_WIDTH);
                     let fy = scale(y, scale_y, FB_HEIGHT);
-                    on_click(&mut state, &mut engine, fx, fy);
+                    on_click(&mut state, &mut engine, fx, fy, &mut save_dirty);
                 }
 
                 input::Event::MouseWheel { delta } => {
@@ -265,6 +338,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         let h = measure_content_height(&nodes, &font);
                         state.resolve_loading(title.unwrap_or_default(), nodes);
                         state.set_content_height(h);
+                        save_dirty.history = true;
                     }
                     FetchOutcome::Failure(reason) => { state.fail_loading(&reason); }
                 }
@@ -309,6 +383,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             display.present(&fb)?;
         }
 
+        // ── Persist (fire-and-forget after render) ────────────────────────────
+        if save_dirty.any() {
+            flush_saves(&state, &mut save_dirty);
+        }
+
         std::thread::sleep(std::time::Duration::from_millis(16));
     }
     Ok(())
@@ -327,11 +406,12 @@ fn tick_loading(state: &mut BrowserState, _engine: &mut RenderEngine) {
 // ── Keyboard ──────────────────────────────────────────────────────────────────
 
 fn on_key(
-    state:   &mut BrowserState,
-    engine:  &mut RenderEngine,
-    running: &mut bool,
-    key:     input::Key,
-    input:   &input::InputHandler,
+    state:      &mut BrowserState,
+    engine:     &mut RenderEngine,
+    running:    &mut bool,
+    key:        input::Key,
+    input:      &input::InputHandler,
+    save_dirty: &mut SaveDirty,
 ) -> Result<(), Box<dyn std::error::Error>> {
 
     // ── Overlay-active keys (intercept before normal flow) ────────────────────
@@ -365,7 +445,10 @@ fn on_key(
             }
         }
 
-        input::Key::Char('p') if input.is_ctrl_pressed() => state.cycle_theme(),
+        input::Key::Char('p') if input.is_ctrl_pressed() => {
+            state.cycle_theme();
+            save_dirty.prefs = true;
+        }
 
         input::Key::Char('t') if input.is_ctrl_pressed() => state.open_new_tab(),
 
@@ -428,11 +511,13 @@ fn on_key(
 
 // ── Mouse ─────────────────────────────────────────────────────────────────────
 
-fn on_click(state: &mut BrowserState, engine: &mut RenderEngine, x: u32, y: u32) {
+fn on_click(state: &mut BrowserState, engine: &mut RenderEngine, x: u32, y: u32,
+            save_dirty: &mut SaveDirty)
+{
     if y < TAB_BAR_HEIGHT {
         click_tab_bar(state, engine, x);
     } else if y < TOP_BAR_HEIGHT {
-        click_chrome_bar(state, engine, x, y);
+        click_chrome_bar(state, engine, x, y, save_dirty);
     } else if state.overlay != OverlayKind::None {
         click_overlay(state, engine);
     } else {
@@ -467,7 +552,9 @@ fn click_tab_bar(state: &mut BrowserState, engine: &mut RenderEngine, x: u32) {
     }
 }
 
-fn click_chrome_bar(state: &mut BrowserState, engine: &mut RenderEngine, x: u32, y: u32) {
+fn click_chrome_bar(state: &mut BrowserState, engine: &mut RenderEngine, x: u32, y: u32,
+                    save_dirty: &mut SaveDirty)
+{
     let btn_r: u32 = 16;
     if x >= 12 && x < 12 + btn_r * 2 {
         state.press_nav_btn(1);
@@ -490,6 +577,7 @@ fn click_chrome_bar(state: &mut BrowserState, engine: &mut RenderEngine, x: u32,
         && y >= bar_y && y < bar_y + ADDR_BAR_H
     {
         state.toggle_bookmark();
+        save_dirty.bookmarks = true;
         return;
     }
     if x >= bar_x && x < bar_x + ADDR_BAR_W && y >= bar_y && y < bar_y + ADDR_BAR_H {

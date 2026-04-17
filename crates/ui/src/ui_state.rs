@@ -863,8 +863,12 @@ impl BrowserState {
 
     pub fn cycle_theme(&mut self) {
         let next     = self.palette.cycle();
-        self.palette = next;
-        self.theme   = get_theme(next);
+        self.apply_palette(next);
+    }
+
+    pub fn apply_palette(&mut self, palette: ColorPalette) {
+        self.palette       = palette;
+        self.theme         = get_theme(palette);
         self.theme_version += 1;
         self.dirty.all();
     }

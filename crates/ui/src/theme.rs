@@ -12,9 +12,26 @@ pub enum ColorPalette {
 impl ColorPalette {
     pub fn cycle(&self) -> Self {
         match self {
-            Self::KamelotDark => Self::GraphiteMinimal,
+            Self::KamelotDark     => Self::GraphiteMinimal,
             Self::GraphiteMinimal => Self::LightClean,
-            Self::LightClean => Self::KamelotDark,
+            Self::LightClean      => Self::KamelotDark,
+        }
+    }
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::KamelotDark     => "kamelot-dark",
+            Self::GraphiteMinimal => "graphite-minimal",
+            Self::LightClean      => "light-clean",
+        }
+    }
+
+    pub fn from_str(s: &str) -> Option<Self> {
+        match s {
+            "kamelot-dark"     => Some(Self::KamelotDark),
+            "graphite-minimal" => Some(Self::GraphiteMinimal),
+            "light-clean"      => Some(Self::LightClean),
+            _ => None,
         }
     }
 }

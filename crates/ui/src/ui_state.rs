@@ -118,25 +118,30 @@ pub struct GlobalHistoryEntry {
 
 #[derive(Debug, Clone)]
 pub struct NavigationEntry {
-    pub url:            String,
-    pub display_url:    String,
-    pub title:          String,
-    pub error_msg:      Option<String>,
-    pub nodes:          Vec<PageNode>,
-    pub scroll_y:       u32,
-    pub content_height: u32,
+    pub url:              String,
+    pub display_url:      String,
+    pub title:            String,
+    pub error_msg:        Option<String>,
+    pub nodes:            Vec<PageNode>,
+    pub scroll_y:         u32,
+    pub content_height:   u32,
+    pub meta_description: Option<String>,
+    pub noscript:         Option<String>,
 }
 
 impl NavigationEntry {
-    fn new(url: &str, title: &str, error_msg: Option<String>, nodes: Vec<PageNode>) -> Self {
+    fn new(url: &str, title: &str, error_msg: Option<String>, nodes: Vec<PageNode>,
+           meta_description: Option<String>, noscript: Option<String>) -> Self {
         Self {
             url:            url.to_string(),
             display_url:    url.to_string(),
             title:          title.to_string(),
             error_msg,
             nodes,
-            scroll_y:       0,
-            content_height: 0,
+            scroll_y:         0,
+            content_height:   0,
+            meta_description,
+            noscript,
         }
     }
 }
@@ -208,22 +213,25 @@ impl TabState {
             .unwrap_or(&[])
     }
 
-    fn commit(&mut self, url: &str, title: &str, error_msg: Option<String>, nodes: Vec<PageNode>) {
+    fn commit(&mut self, url: &str, title: &str, error_msg: Option<String>, nodes: Vec<PageNode>,
+              meta_description: Option<String>, noscript: Option<String>) {
         if self.history_index + 1 < self.history.len() {
             self.history.truncate(self.history_index + 1);
         }
         if error_msg.is_none() {
             if let Some(cur) = self.history.get_mut(self.history_index) {
                 if cur.url == url {
-                    cur.title     = title.to_string();
-                    cur.error_msg = None;
+                    cur.title            = title.to_string();
+                    cur.error_msg        = None;
+                    cur.meta_description = meta_description;
+                    cur.noscript         = noscript;
                     if !nodes.is_empty() { cur.nodes = nodes; }
                     self.last_committed_url = url.to_string();
                     return;
                 }
             }
         }
-        self.history.push(NavigationEntry::new(url, title, error_msg, nodes));
+        self.history.push(NavigationEntry::new(url, title, error_msg, nodes, meta_description, noscript));
         self.history_index      = self.history.len() - 1;
         self.last_committed_url = url.to_string();
     }
@@ -634,7 +642,7 @@ impl BrowserState {
                     tab.title      = title.clone();
                     tab.page_state = PageState::Loaded;
                     tab.scroll_y   = 0;
-                    tab.commit(&url, &title, None, vec![]);
+                    tab.commit(&url, &title, None, vec![], None, None);
                 }
             }
             NavResult::WillFail(reason) => {
@@ -648,7 +656,8 @@ impl BrowserState {
 
     /// Commit a successful fetch with real page content.
     /// Records in global history unless this is a private tab.
-    pub fn resolve_loading(&mut self, engine_title: String, nodes: Vec<PageNode>) {
+    pub fn resolve_loading(&mut self, engine_title: String, nodes: Vec<PageNode>,
+                           meta_description: Option<String>, noscript: Option<String>) {
         let url = match self.active_tab() {
             Some(t) if t.page_state.is_loading() => t.url.clone(),
             _ => return,
@@ -662,7 +671,7 @@ impl BrowserState {
             tab.title      = title.clone();
             tab.page_state = PageState::Loaded;
             tab.scroll_y   = 0;
-            tab.commit(&url, &title, None, nodes);
+            tab.commit(&url, &title, None, nodes, meta_description, noscript);
         }
         self.record_visit(&url, &title);
         self.dirty.all();

@@ -26,16 +26,34 @@ pub enum PageNode {
 /// Parsed representation of a fetched HTML page.
 #[derive(Debug, Clone, Default)]
 pub struct ParsedPage {
-    pub title: Option<String>,
-    pub nodes: Vec<PageNode>,
+    pub title:            Option<String>,
+    pub nodes:            Vec<PageNode>,
+    /// <meta name="description"> or og:description, if found.
+    pub meta_description: Option<String>,
+    /// Plain text extracted from the first <noscript> block, if any.
+    pub noscript:         Option<String>,
 }
 
 // ── Entry point ───────────────────────────────────────────────────────────────
 
 pub fn parse_html(html: &str) -> ParsedPage {
-    let title = extract_title(html).or_else(|| extract_og_title(html));
-    let nodes = extract_nodes(html);
-    ParsedPage { title, nodes }
+    let title            = extract_title(html).or_else(|| extract_og_title(html));
+    let meta_description = extract_meta_description(html);
+    let noscript         = extract_noscript(html);
+    let nodes            = extract_nodes(html);
+    ParsedPage { title, nodes, meta_description, noscript }
+}
+
+/// True when the parsed content is too sparse to be meaningful — JS-heavy pages.
+pub fn is_low_content(nodes: &[PageNode]) -> bool {
+    if nodes.is_empty() { return true; }
+    let total: usize = nodes.iter().map(|n| match n {
+        PageNode::Heading { text, .. }                      => text.len(),
+        PageNode::Paragraph(t) | PageNode::ListItem(t)
+        | PageNode::Pre(t)                                  => t.len(),
+        PageNode::HRule                                     => 0,
+    }).sum();
+    total < 200 && nodes.len() < 5
 }
 
 // ── Title extraction ──────────────────────────────────────────────────────────
@@ -68,6 +86,63 @@ fn extract_og_title(html: &str) -> Option<String> {
         if pos >= html.len() { break; }
     }
     None
+}
+
+fn extract_meta_description(html: &str) -> Option<String> {
+    let lower = html.to_ascii_lowercase();
+    let mut pos = 0;
+    while let Some(rel) = lower[pos..].find("<meta") {
+        let abs     = pos + rel;
+        let tag_end = lower[abs..].find('>').map(|e| abs + e).unwrap_or(html.len());
+        let tag_l   = &lower[abs..tag_end.min(html.len())];
+        let tag_r   = &html [abs..tag_end.min(html.len())];
+        if tag_l.contains("name=\"description\"") || tag_l.contains("property=\"og:description\"") {
+            if let Some(v) = attr_value(tag_r, "content") {
+                if !v.is_empty() { return Some(v); }
+            }
+        }
+        pos = tag_end + 1;
+        if pos >= html.len() { break; }
+    }
+    None
+}
+
+fn extract_noscript(html: &str) -> Option<String> {
+    let lower    = html.to_ascii_lowercase();
+    let start    = lower.find("<noscript")?;
+    let open_end = lower[start..].find('>')? + start + 1;
+    let close    = lower[open_end..].find("</noscript")?;
+    let raw      = &html[open_end..open_end + close];
+    let text     = strip_tags(raw);
+    let text     = collapse_ws_str(&text);
+    let text     = text.trim().to_string();
+    if text.len() >= 20 { Some(text) } else { None }
+}
+
+fn strip_tags(s: &str) -> String {
+    let mut out    = String::with_capacity(s.len());
+    let mut in_tag = false;
+    for c in s.chars() {
+        match c {
+            '<' => { in_tag = true; }
+            '>' => { in_tag = false; out.push(' '); }
+            _   => { if !in_tag { out.push(c); } }
+        }
+    }
+    out
+}
+
+fn collapse_ws_str(s: &str) -> String {
+    let mut out   = String::with_capacity(s.len());
+    let mut space = true;
+    for c in s.chars() {
+        if c.is_whitespace() {
+            if !space { out.push(' '); space = true; }
+        } else {
+            out.push(c); space = false;
+        }
+    }
+    out
 }
 
 /// Extract a named attribute value from a raw (non-lowercased) tag fragment.

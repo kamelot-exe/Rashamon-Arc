@@ -12,7 +12,7 @@ mod ui_state;
 
 use crate::font::FontManager;
 use crate::layout::*;
-use crate::page::{PageNode, parse_html};
+use crate::page::{PageNode, parse_html, is_low_content};
 use rashamon_net::HttpClient;
 use rashamon_renderer::{Framebuffer, RenderEngine};
 use rashamon_renderer::framebuffer::Pixel;
@@ -150,7 +150,12 @@ fn flush_saves(state: &BrowserState, dirty: &mut SaveDirty) {
 // ── Fetch / parse pipeline ────────────────────────────────────────────────────
 
 enum FetchOutcome {
-    Success { title: Option<String>, nodes: Vec<PageNode> },
+    Success {
+        title:            Option<String>,
+        nodes:            Vec<PageNode>,
+        meta_description: Option<String>,
+        noscript:         Option<String>,
+    },
     Failure(String),
 }
 
@@ -165,7 +170,12 @@ fn do_fetch(url: String) -> FetchOutcome {
         Err(reason) => FetchOutcome::Failure(reason),
         Ok(html)    => {
             let parsed = parse_html(&html);
-            FetchOutcome::Success { title: parsed.title, nodes: parsed.nodes }
+            FetchOutcome::Success {
+                title:            parsed.title,
+                nodes:            parsed.nodes,
+                meta_description: parsed.meta_description,
+                noscript:         parsed.noscript,
+            }
         }
     }
 }
@@ -334,9 +344,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             if ready {
                 let (_, outcome) = buffered_outcome.take().unwrap();
                 match outcome {
-                    FetchOutcome::Success { title, nodes } => {
+                    FetchOutcome::Success { title, nodes, meta_description, noscript } => {
                         let h = measure_content_height(&nodes, &font);
-                        state.resolve_loading(title.unwrap_or_default(), nodes);
+                        state.resolve_loading(title.unwrap_or_default(), nodes, meta_description, noscript);
                         state.set_content_height(h);
                         save_dirty.history = true;
                     }
@@ -1129,10 +1139,23 @@ fn draw_loading(fb: &mut Framebuffer, state: &BrowserState, font: &FontManager) 
 fn draw_loaded(fb: &mut Framebuffer, state: &BrowserState, font: &FontManager,
                nodes: &[PageNode], scroll_y: u32)
 {
-    if !nodes.is_empty() {
+    if !nodes.is_empty() && !is_low_content(nodes) {
         draw_page_content(fb, state, font, nodes, scroll_y);
+    } else if nodes.is_empty() {
+        // Try fallback if we have meta or noscript text
+        let entry = state.active_tab()
+            .and_then(|t| t.history.get(t.history_index));
+        let has_meta = entry.map_or(false, |e| {
+            e.meta_description.is_some() || e.noscript.is_some()
+        });
+        if has_meta {
+            draw_js_fallback(fb, state, font);
+        } else {
+            draw_loaded_card(fb, state, font);
+        }
     } else {
-        draw_loaded_card(fb, state, font);
+        // Low content — show what we have + fallback supplement
+        draw_js_fallback(fb, state, font);
     }
 }
 
@@ -1276,6 +1299,98 @@ fn draw_loaded_card(fb: &mut Framebuffer, state: &BrowserState, font: &FontManag
     let hint = "Ctrl+R to reload  \u{2022}  address bar to navigate";
     let hw   = font.text_width(hint, 11.0);
     draw::draw_text(fb, font, cx.saturating_sub(hw / 2), card_y + CARD_H - 28, hint, 11.0, theme.fg_secondary, CARD_W - 48);
+}
+
+fn draw_js_fallback(fb: &mut Framebuffer, state: &BrowserState, font: &FontManager) {
+    let theme = state.theme;
+    let cx    = FB_WIDTH / 2;
+    fb.fill_rect(0, TOP_BAR_HEIGHT, FB_WIDTH, FB_HEIGHT - TOP_BAR_HEIGHT, theme.bg);
+    fb.fill_rect(0, TOP_BAR_HEIGHT, FB_WIDTH, 1, theme.border);
+
+    let Some(tab) = state.active_tab() else { return };
+    let entry = tab.history.get(tab.history_index);
+
+    // Title / hostname
+    let title = tab.tab_title();
+    let title_w = font.text_width(title, 24.0).min(MAX_W);
+    let mut y = TOP_BAR_HEIGHT + PAD_TOP + 16;
+    draw::draw_text(fb, font, MARGIN, y, title, 24.0, theme.fg, MAX_W);
+    y += 36;
+
+    // Host line
+    let host = derive_title(&tab.url);
+    draw::draw_text(fb, font, MARGIN, y, host, 13.0, theme.accent, MAX_W);
+    y += 26;
+
+    // Divider
+    fb.fill_rect(MARGIN, y, MAX_W, 1, theme.border);
+    y += 20;
+
+    // JS notice badge
+    let badge = "This page requires JavaScript — showing available text content";
+    let badge_w = font.text_width(badge, 12.0).min(MAX_W);
+    let _ = badge_w;
+    let badge_bg_x = MARGIN.saturating_sub(8);
+    let badge_bg_w = MAX_W + 16;
+    fb.fill_rect(badge_bg_x, y.saturating_sub(4), badge_bg_w, 24, theme.surface);
+    fb.fill_rect(MARGIN.saturating_sub(8), y.saturating_sub(4), 3, 24, theme.fg_secondary);
+    draw::draw_text(fb, font, MARGIN, y, badge, 12.0, theme.fg_secondary, MAX_W);
+    y += 36;
+
+    // noscript content (highest priority — site-authored fallback text)
+    if let Some(ns) = entry.and_then(|e| e.noscript.as_deref()) {
+        let lbl = "Page message:";
+        draw::draw_text(fb, font, MARGIN, y, lbl, 11.0, theme.fg_secondary, MAX_W);
+        y += 18;
+        fb.fill_rect(MARGIN.saturating_sub(8), y.saturating_sub(2), 3, 2, theme.accent);
+        for line in wrap_text(ns, font, 14.0, MAX_W) {
+            if y > FB_HEIGHT - 80 { break; }
+            draw::draw_text(fb, font, MARGIN, y, &line, 14.0, theme.fg, MAX_W);
+            y += 22;
+        }
+        y += 8;
+    }
+
+    // meta description
+    if let Some(desc) = entry.and_then(|e| e.meta_description.as_deref()) {
+        let lbl = "Description:";
+        draw::draw_text(fb, font, MARGIN, y, lbl, 11.0, theme.fg_secondary, MAX_W);
+        y += 18;
+        for line in wrap_text(desc, font, 14.0, MAX_W) {
+            if y > FB_HEIGHT - 80 { break; }
+            draw::draw_text(fb, font, MARGIN, y, &line, 14.0, theme.fg_secondary, MAX_W);
+            y += 22;
+        }
+        y += 8;
+    }
+
+    // Any partial nodes we did extract
+    if let Some(entry) = entry {
+        if !entry.nodes.is_empty() {
+            let lbl = "Extracted content:";
+            draw::draw_text(fb, font, MARGIN, y, lbl, 11.0, theme.fg_secondary, MAX_W);
+            y += 18;
+            for node in &entry.nodes {
+                if y > FB_HEIGHT - 80 { break; }
+                let text = match node {
+                    PageNode::Heading { text, .. } => text.as_str(),
+                    PageNode::Paragraph(t) | PageNode::ListItem(t) | PageNode::Pre(t) => t.as_str(),
+                    PageNode::HRule => continue,
+                };
+                for line in wrap_text(text, font, 13.0, MAX_W) {
+                    if y > FB_HEIGHT - 80 { break; }
+                    draw::draw_text(fb, font, MARGIN, y, &line, 13.0, theme.fg, MAX_W);
+                    y += 20;
+                }
+            }
+        }
+    }
+
+    // Hint
+    let hint = "Ctrl+R  reload  \u{2022}  Rashamon Arc renders text — JavaScript sites show limited content";
+    let _ = title_w;
+    let hw = font.text_width(hint, 11.0).min(MAX_W + 100);
+    draw::draw_text(fb, font, cx.saturating_sub(hw / 2), FB_HEIGHT - 50, hint, 11.0, theme.fg_secondary, MAX_W + 100);
 }
 
 // ── Error page ────────────────────────────────────────────────────────────────

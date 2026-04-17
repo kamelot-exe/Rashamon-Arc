@@ -38,7 +38,6 @@ impl PageState {
 
 // ── NavResult ─────────────────────────────────────────────────────────────────
 
-/// Outcome classified at navigation-submit time, before any loading begins.
 #[derive(Debug, Clone, PartialEq)]
 pub enum NavResult {
     WillLoad,
@@ -76,6 +75,16 @@ impl DirtyFlags {
     #[inline] pub fn clear(&mut self) { *self = Self::default(); }
 }
 
+// ── OverlayKind ───────────────────────────────────────────────────────────────
+
+/// Which full-page content overlay is currently shown.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OverlayKind {
+    None,
+    History,
+    Bookmarks,
+}
+
 // ── HoveredRegion ─────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -94,6 +103,17 @@ pub enum HoveredRegion {
     ContentArea,
 }
 
+// ── GlobalHistoryEntry ────────────────────────────────────────────────────────
+
+/// One entry in the global (cross-tab) visit history.
+#[derive(Debug, Clone)]
+pub struct GlobalHistoryEntry {
+    pub url:   String,
+    pub title: String,
+    /// frame_count at visit time — used for recency ordering.
+    pub when:  u64,
+}
+
 // ── NavigationEntry ───────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone)]
@@ -102,11 +122,8 @@ pub struct NavigationEntry {
     pub display_url:    String,
     pub title:          String,
     pub error_msg:      Option<String>,
-    /// Rendered content captured at commit time for instant back/forward restoration.
     pub nodes:          Vec<PageNode>,
-    /// Scroll position saved when navigating away from this entry.
     pub scroll_y:       u32,
-    /// Cached content height for scroll clamping after restoration.
     pub content_height: u32,
 }
 
@@ -147,28 +164,30 @@ pub struct TabState {
     pub page_state:         PageState,
     pub is_pinned:          bool,
     pub is_bookmarked:      bool,
+    pub is_private:         bool,
     pub history:            Vec<NavigationEntry>,
     pub history_index:      usize,
     pub last_committed_url: String,
     pub load_start_frame:   u64,
     pub nav_result:         NavResult,
-    /// Current vertical scroll offset in pixels for the visible content.
     pub scroll_y:           u32,
-    /// Total rendered content height — used for scroll clamping.
-    /// Zero means "not yet measured"; measured lazily before first render.
     pub content_height:     u32,
 }
 
 impl TabState {
-    pub fn new_tab() -> Self {
+    pub fn new_tab() -> Self { Self::make(false) }
+    pub fn new_private() -> Self { Self::make(true) }
+
+    fn make(private: bool) -> Self {
         Self {
             id:                 TabId::next(),
-            title:              "New Tab".to_string(),
+            title:              String::new(),
             url:                String::new(),
             display_url:        String::new(),
             page_state:         PageState::NewTab,
             is_pinned:          false,
             is_bookmarked:      false,
+            is_private:         private,
             history:            Vec::new(),
             history_index:      0,
             last_committed_url: String::new(),
@@ -193,7 +212,6 @@ impl TabState {
         if self.history_index + 1 < self.history.len() {
             self.history.truncate(self.history_index + 1);
         }
-        // Reload: same URL — update title + nodes in-place instead of pushing duplicate.
         if error_msg.is_none() {
             if let Some(cur) = self.history.get_mut(self.history_index) {
                 if cur.url == url {
@@ -212,7 +230,7 @@ impl TabState {
 
     pub fn tab_title(&self) -> &str {
         match &self.page_state {
-            PageState::NewTab   => "New Tab",
+            PageState::NewTab   => if self.is_private { "Private" } else { "New Tab" },
             PageState::Loading  => if self.title.is_empty() { "Loading…" } else { &self.title },
             PageState::Loaded   => if self.title.is_empty() { &self.url }   else { &self.title },
             PageState::Error(_) => if self.title.is_empty() { "Error" }     else { &self.title },
@@ -258,6 +276,16 @@ pub struct BrowserState {
 
     pub bookmarks: Vec<QuickLink>,
 
+    /// Cross-tab global visit history (excludes private tab visits).
+    pub global_history: Vec<GlobalHistoryEntry>,
+
+    /// Which content overlay (history / bookmarks) is currently shown.
+    pub overlay:        OverlayKind,
+    /// Index of first visible item in the overlay list.
+    pub overlay_scroll: usize,
+    /// Index of the currently highlighted overlay item (mouse or keyboard).
+    pub overlay_hover:  Option<usize>,
+
     pub nav_btn_pressed:       u8,
     pub nav_btn_pressed_frame: u64,
 
@@ -292,6 +320,10 @@ impl BrowserState {
                 QuickLink::new("Servo",       "https://servo.org"),
                 QuickLink::new("Crates.io",   "https://crates.io"),
             ],
+            global_history:  Vec::new(),
+            overlay:         OverlayKind::None,
+            overlay_scroll:  0,
+            overlay_hover:   None,
             nav_btn_pressed:       0,
             nav_btn_pressed_frame: 0,
             tab_width:      0,
@@ -381,6 +413,11 @@ impl BrowserState {
             return HoveredRegion::None;
         }
 
+        // When an overlay is active the content area is a list — handled separately.
+        if self.overlay != OverlayKind::None {
+            return HoveredRegion::ContentArea;
+        }
+
         match self.active_tab().map(|t| &t.page_state) {
             Some(PageState::Error(_)) => {
                 let (bx, by) = retry_btn_pos();
@@ -438,12 +475,32 @@ impl BrowserState {
     pub fn set_mouse_pos(&mut self, x: u32, y: u32) {
         self.mouse_x = x;
         self.mouse_y = y;
+
+        // Update standard hover region.
         let region = self.compute_hover_region(x, y);
         if region != self.hovered_region {
             Self::dirty_for_hover(region,              &mut self.dirty);
             Self::dirty_for_hover(self.hovered_region, &mut self.dirty);
             self.hovered_region = region;
         }
+
+        // Update overlay hover when the overlay panel is visible.
+        if self.overlay != OverlayKind::None {
+            let new_hover = Self::overlay_item_at(x, y, self.overlay_scroll);
+            if new_hover != self.overlay_hover {
+                self.overlay_hover = new_hover;
+                self.dirty.content = true;
+            }
+        }
+    }
+
+    /// Compute which overlay list item (absolute index) is under (x, y).
+    fn overlay_item_at(x: u32, y: u32, scroll: usize) -> Option<usize> {
+        if y < OVERLAY_LIST_TOP { return None; }
+        let right_edge = FB_WIDTH.saturating_sub(OVERLAY_INDENT.saturating_sub(12));
+        if x < OVERLAY_INDENT.saturating_sub(12) || x > right_edge { return None; }
+        let row = (y - OVERLAY_LIST_TOP) / OVERLAY_ITEM_H;
+        Some(row as usize + scroll)
     }
 
     // ── Address bar ───────────────────────────────────────────────────────────
@@ -463,6 +520,14 @@ impl BrowserState {
 
     pub fn open_new_tab(&mut self) {
         let tab = TabState::new_tab();
+        let id  = tab.id;
+        self.tabs.push(tab);
+        self.activate_tab(id);
+    }
+
+    /// Open a new private / incognito tab.
+    pub fn open_private_tab(&mut self) {
+        let tab = TabState::new_private();
         let id  = tab.id;
         self.tabs.push(tab);
         self.activate_tab(id);
@@ -495,6 +560,7 @@ impl BrowserState {
         if self.tabs.iter().any(|t| t.id == id) {
             self.active_tab_id       = id;
             self.address_bar_focused = false;
+            self.close_overlay();
             self.sync_address_bar();
             self.update_layout();
             self.update_bookmark_flag();
@@ -514,6 +580,8 @@ impl BrowserState {
             NavResult::WillFail(s) => Some(s.clone()),
             NavResult::WillLoad    => None,
         };
+
+        self.close_overlay();
 
         if let Some(reason) = fail_reason {
             if let Some(tab) = self.active_tab_mut() {
@@ -579,6 +647,7 @@ impl BrowserState {
     }
 
     /// Commit a successful fetch with real page content.
+    /// Records in global history unless this is a private tab.
     pub fn resolve_loading(&mut self, engine_title: String, nodes: Vec<PageNode>) {
         let url = match self.active_tab() {
             Some(t) if t.page_state.is_loading() => t.url.clone(),
@@ -595,6 +664,7 @@ impl BrowserState {
             tab.scroll_y   = 0;
             tab.commit(&url, &title, None, nodes);
         }
+        self.record_visit(&url, &title);
         self.dirty.all();
     }
 
@@ -610,7 +680,6 @@ impl BrowserState {
     pub fn go_back(&mut self) -> Option<String> {
         let tab = self.active_tab_mut()?;
         if !tab.can_go_back() { return None; }
-        // Save current scroll position to history before moving.
         if let Some(cur) = tab.history.get_mut(tab.history_index) {
             cur.scroll_y = tab.scroll_y;
         }
@@ -673,9 +742,6 @@ impl BrowserState {
 
     // ── Scroll ────────────────────────────────────────────────────────────────
 
-    /// Scroll the active tab's content by `delta` pixels.
-    /// Positive delta scrolls down (toward end of page); negative scrolls up.
-    /// No-ops unless the active tab is in Loaded state.
     pub fn scroll_by(&mut self, delta: i32) {
         let Some(tab) = self.active_tab_mut() else { return };
         if !matches!(tab.page_state, PageState::Loaded) { return; }
@@ -689,8 +755,6 @@ impl BrowserState {
         }
     }
 
-    /// Store the computed content height for the active tab and its current
-    /// history entry so scroll clamping is correct after back/forward.
     pub fn set_content_height(&mut self, h: u32) {
         if let Some(tab) = self.active_tab_mut() {
             tab.content_height = h;
@@ -698,6 +762,82 @@ impl BrowserState {
                 entry.content_height = h;
             }
         }
+    }
+
+    // ── Global history ────────────────────────────────────────────────────────
+
+    /// Add a successful visit to global history.
+    /// No-ops for private tabs.
+    pub fn record_visit(&mut self, url: &str, title: &str) {
+        if self.active_tab().map_or(false, |t| t.is_private) { return; }
+        // De-duplicate: remove any previous entry for the same URL.
+        self.global_history.retain(|e| e.url != url);
+        self.global_history.push(GlobalHistoryEntry {
+            url:   url.to_string(),
+            title: title.to_string(),
+            when:  self.frame_count,
+        });
+        // Cap at 500 entries.
+        if self.global_history.len() > 500 {
+            self.global_history.remove(0);
+        }
+    }
+
+    // ── Overlay (history / bookmarks panel) ───────────────────────────────────
+
+    pub fn toggle_overlay(&mut self, kind: OverlayKind) {
+        if self.overlay == kind {
+            self.overlay        = OverlayKind::None;
+            self.overlay_hover  = None;
+        } else {
+            self.overlay        = kind;
+            self.overlay_scroll = 0;
+            self.overlay_hover  = None;
+            self.address_bar_focused = false;
+        }
+        self.dirty.content = true;
+    }
+
+    pub fn close_overlay(&mut self) {
+        if self.overlay != OverlayKind::None {
+            self.overlay       = OverlayKind::None;
+            self.overlay_hover = None;
+            self.dirty.content = true;
+        }
+    }
+
+    pub fn overlay_scroll_by(&mut self, delta: i32) {
+        if self.overlay == OverlayKind::None { return; }
+        let count = self.overlay_item_count();
+        let max   = count.saturating_sub(OVERLAY_VISIBLE);
+        let new   = (self.overlay_scroll as i64 + delta as i64)
+            .clamp(0, max as i64) as usize;
+        if new != self.overlay_scroll {
+            self.overlay_scroll = new;
+            self.overlay_hover  = None;
+            self.dirty.content  = true;
+        }
+    }
+
+    fn overlay_item_count(&self) -> usize {
+        match self.overlay {
+            OverlayKind::None      => 0,
+            OverlayKind::History   => self.global_history.len(),
+            OverlayKind::Bookmarks => self.bookmarks.len(),
+        }
+    }
+
+    /// Navigate to the currently hovered overlay item, close the overlay,
+    /// and return the URL (caller calls begin_navigate with it).
+    pub fn activate_overlay_item(&mut self) -> Option<String> {
+        let idx = self.overlay_hover?;
+        let url = match self.overlay {
+            OverlayKind::History   => self.global_history.iter().rev().nth(idx)?.url.clone(),
+            OverlayKind::Bookmarks => self.bookmarks.get(idx)?.url.clone(),
+            OverlayKind::None      => return None,
+        };
+        self.close_overlay();
+        Some(url)
     }
 
     // ── Address bar ───────────────────────────────────────────────────────────
@@ -708,6 +848,7 @@ impl BrowserState {
     }
 
     pub fn focus_address_bar(&mut self) {
+        self.close_overlay();
         self.address_bar_focused = true;
         self.dirty_address_bar();
     }

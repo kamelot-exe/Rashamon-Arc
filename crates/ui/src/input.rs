@@ -30,13 +30,14 @@ pub enum Key {
 }
 
 pub struct InputHandler {
-    event_pump: EventPump,
-    ctrl_pressed: bool,
+    event_pump:    EventPump,
+    ctrl_pressed:  bool,
+    shift_pressed: bool,
 }
 
 impl InputHandler {
     pub fn new(event_pump: EventPump) -> Result<Self, io::Error> {
-        Ok(Self { event_pump, ctrl_pressed: false })
+        Ok(Self { event_pump, ctrl_pressed: false, shift_pressed: false })
     }
 
     /// Poll one *recognised* event, draining and discarding unrecognised SDL
@@ -54,10 +55,12 @@ impl InputHandler {
                 Err(_)      => continue,        // unknown keycode — skip event
             };
 
-            // Keep ctrl state fresh on every SDL event.
+            // Keep modifier state fresh on every SDL event.
             let ks = self.event_pump.keyboard_state();
-            self.ctrl_pressed = ks.is_scancode_pressed(Scancode::LCtrl)
+            self.ctrl_pressed  = ks.is_scancode_pressed(Scancode::LCtrl)
                 || ks.is_scancode_pressed(Scancode::RCtrl);
+            self.shift_pressed = ks.is_scancode_pressed(Scancode::LShift)
+                || ks.is_scancode_pressed(Scancode::RShift);
 
             let recognised = match raw {
                 SdlEvent::Quit { .. } => Some(Event::Quit),
@@ -80,6 +83,11 @@ impl InputHandler {
                         Scancode::W if self.ctrl_pressed => Some(Key::Char('w')),
                         Scancode::R if self.ctrl_pressed => Some(Key::Char('r')),
                         Scancode::P if self.ctrl_pressed => Some(Key::Char('p')),
+                        Scancode::H if self.ctrl_pressed => Some(Key::Char('h')),
+                        Scancode::B if self.ctrl_pressed => Some(Key::Char('b')),
+                        Scancode::I if self.ctrl_pressed => Some(Key::Char('i')),
+                        Scancode::L if self.ctrl_pressed => Some(Key::Char('l')),
+                        Scancode::N if self.ctrl_pressed => Some(Key::Char('n')),
                         _ => None,
                     };
                     key.map(Event::KeyPress)
@@ -112,5 +120,6 @@ impl InputHandler {
         }
     }
 
-    pub fn is_ctrl_pressed(&self) -> bool { self.ctrl_pressed }
+    pub fn is_ctrl_pressed(&self)  -> bool { self.ctrl_pressed  }
+    pub fn is_shift_pressed(&self) -> bool { self.shift_pressed }
 }

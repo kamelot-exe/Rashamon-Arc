@@ -31,6 +31,14 @@ pub fn tab_width(n: usize) -> u32 {
         .max(TAB_MIN_W)
 }
 
+// ── Overlay panel (history / bookmarks) ──────────────────────────────────────
+pub const OVERLAY_INDENT:   u32 = 80;
+pub const OVERLAY_ITEM_H:   u32 = 56;
+/// y-coordinate of the first overlay list item (screen coords).
+pub const OVERLAY_LIST_TOP: u32 = TOP_BAR_HEIGHT + 68;
+/// How many overlay items fit in the viewport.
+pub const OVERLAY_VISIBLE:  usize = 16;
+
 #[inline]
 pub fn retry_btn_pos() -> (u32, u32) {
     let cx = FB_WIDTH / 2;

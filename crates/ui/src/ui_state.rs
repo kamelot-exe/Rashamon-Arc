@@ -35,6 +35,39 @@ impl PageState {
     }
 }
 
+// ── NavResult ─────────────────────────────────────────────────────────────────
+
+/// Outcome classified at navigation-submit time, before any loading begins.
+///
+/// `WillLoad`     — URL is structurally valid; tab enters Loading then Loaded.
+/// `WillFail(why)` — URL is unsupported/malformed; tab goes straight to Error.
+///
+/// Storing the result on the tab means `commit_navigation` reads a predetermined
+/// verdict rather than racing a timer to guess whether the page is reachable.
+#[derive(Debug, Clone, PartialEq)]
+pub enum NavResult {
+    WillLoad,
+    WillFail(String),
+}
+
+/// Classify a fully-resolved URL at submit time.
+/// Called by `begin_navigate` and `reload` before any state change.
+fn classify_url(url: &str) -> NavResult {
+    if url.is_empty() {
+        return NavResult::WillFail("No address entered".into());
+    }
+    if url.starts_with("https://") || url.starts_with("http://") {
+        return NavResult::WillLoad;
+    }
+    if url.starts_with("file://") {
+        return NavResult::WillFail("Local file access is not yet supported".into());
+    }
+    if url.starts_with("chrome://") || url.starts_with("about:") || url.starts_with("data:") {
+        return NavResult::WillFail("Browser-internal addresses are not supported".into());
+    }
+    NavResult::WillFail("Unsupported address format".into())
+}
+
 // ── DirtyFlags ────────────────────────────────────────────────────────────────
 
 /// Per-region repaint flags.
@@ -81,14 +114,18 @@ pub struct NavigationEntry {
     pub url:         String,
     pub display_url: String,
     pub title:       String,
+    /// `None` → page committed successfully.
+    /// `Some(reason)` → navigation failed; restoring this entry shows an Error page.
+    pub error_msg:   Option<String>,
 }
 
 impl NavigationEntry {
-    fn from_url(url: &str) -> Self {
+    fn new(url: &str, title: &str, error_msg: Option<String>) -> Self {
         Self {
             url:         url.to_string(),
             display_url: url.to_string(),
-            title:       derive_title(url).to_string(),
+            title:       title.to_string(),
+            error_msg,
         }
     }
 }
@@ -121,6 +158,8 @@ pub struct TabState {
     pub history_index:      usize,
     pub last_committed_url: String,
     pub load_start_frame:   u64,
+    /// Pre-classified navigation outcome — set at submit time, read at commit time.
+    pub nav_result:         NavResult,
 }
 
 impl TabState {
@@ -137,21 +176,30 @@ impl TabState {
             history_index:      0,
             last_committed_url: String::new(),
             load_start_frame:   0,
+            nav_result:         NavResult::WillLoad,
         }
     }
 
     pub fn can_go_back(&self)    -> bool { self.history_index > 0 }
     pub fn can_go_forward(&self) -> bool { self.history_index + 1 < self.history.len() }
 
-    fn commit(&mut self, url: &str, title: &str) {
+    fn commit(&mut self, url: &str, title: &str, error_msg: Option<String>) {
         if self.history_index + 1 < self.history.len() {
             self.history.truncate(self.history_index + 1);
         }
-        self.history.push(NavigationEntry {
-            url:         url.to_string(),
-            display_url: url.to_string(),
-            title:       title.to_string(),
-        });
+        // Reload: the URL matches the current history entry — update in-place
+        // rather than pushing a duplicate entry that would break back/forward.
+        if error_msg.is_none() {
+            if let Some(cur) = self.history.get_mut(self.history_index) {
+                if cur.url == url {
+                    cur.title     = title.to_string();
+                    cur.error_msg = None;
+                    self.last_committed_url = url.to_string();
+                    return;
+                }
+            }
+        }
+        self.history.push(NavigationEntry::new(url, title, error_msg));
         self.history_index      = self.history.len() - 1;
         self.last_committed_url = url.to_string();
     }
@@ -470,14 +518,40 @@ impl BrowserState {
 
     pub fn begin_navigate(&mut self, url: &str) -> Option<String> {
         if url.is_empty() { return None; }
-        let frame = self.frame_count;
-        let url   = url.to_string();
+        let result = classify_url(url);
+        let frame  = self.frame_count;
+        let url    = url.to_string();
+
+        // Extract error reason before moving `result` into the tab.
+        let fail_reason = match &result {
+            NavResult::WillFail(s) => Some(s.clone()),
+            NavResult::WillLoad    => None,
+        };
+
+        if let Some(reason) = fail_reason {
+            // Invalid / unsupported URL — skip Loading, go straight to Error.
+            if let Some(tab) = self.active_tab_mut() {
+                tab.url         = url.clone();
+                tab.display_url = url.clone();
+                tab.title       = derive_title(&url).to_string();
+                tab.page_state  = PageState::Error(reason);
+                tab.nav_result  = result;
+            }
+            self.address_bar_input   = url;
+            self.address_bar_focused = false;
+            self.update_bookmark_flag();
+            self.dirty.all();
+            return None;
+        }
+
+        // Structurally valid URL — enter Loading.
         if let Some(tab) = self.active_tab_mut() {
             tab.url              = url.clone();
             tab.display_url      = url.clone();
             tab.title            = derive_title(&url).to_string();
             tab.page_state       = PageState::Loading;
             tab.load_start_frame = frame;
+            tab.nav_result       = result;
         }
         self.address_bar_input   = url.clone();
         self.address_bar_focused = false;
@@ -486,6 +560,43 @@ impl BrowserState {
         Some(url)
     }
 
+    /// Commit the in-progress navigation for the active tab.
+    /// Called from `tick_loading` after the minimum UX delay has elapsed.
+    /// Reads the pre-classified `NavResult` — no timer-driven guessing.
+    pub fn commit_navigation(&mut self) {
+        let (url, result) = match self.active_tab() {
+            Some(t) if t.page_state.is_loading() => (t.url.clone(), t.nav_result.clone()),
+            _ => return,
+        };
+        match result {
+            NavResult::WillLoad => {
+                let title = self.active_tab()
+                    .map(|t| if t.title.is_empty() {
+                        derive_title(&url).to_string()
+                    } else {
+                        t.title.clone()
+                    })
+                    .unwrap_or_else(|| derive_title(&url).to_string());
+                if let Some(tab) = self.active_tab_mut() {
+                    tab.title      = title.clone();
+                    tab.page_state = PageState::Loaded;
+                    tab.commit(&url, &title, None);
+                }
+            }
+            NavResult::WillFail(reason) => {
+                // Defensive: WillFail shouldn't reach Loading normally, but
+                // reload() on a bad URL can produce this.
+                if let Some(tab) = self.active_tab_mut() {
+                    tab.page_state = PageState::Error(reason);
+                    // Failed navigations are not committed to history.
+                }
+            }
+        }
+        self.dirty.all();
+    }
+
+    /// Resolve loading with a title from a real engine (future use).
+    /// For the current transitional model, `commit_navigation` is the primary path.
     pub fn resolve_loading(&mut self, engine_title: String) {
         let url = match self.active_tab() {
             Some(t) if t.page_state.is_loading() => t.url.clone(),
@@ -499,9 +610,8 @@ impl BrowserState {
         if let Some(tab) = self.active_tab_mut() {
             tab.title      = title.clone();
             tab.page_state = PageState::Loaded;
-            tab.commit(&url, &title);
+            tab.commit(&url, &title, None);
         }
-        // Tab title changed, icon changed, page content changed.
         self.dirty.all();
     }
 
@@ -515,47 +625,52 @@ impl BrowserState {
     }
 
     pub fn go_back(&mut self) -> Option<String> {
-        let frame = self.frame_count;
-        let tab   = self.active_tab_mut()?;
+        let tab = self.active_tab_mut()?;
         if !tab.can_go_back() { return None; }
         tab.history_index -= 1;
         let entry = tab.history[tab.history_index].clone();
-        tab.url              = entry.url.clone();
-        tab.display_url      = entry.display_url.clone();
-        tab.title            = entry.title.clone();
-        tab.page_state       = PageState::Loading;
-        tab.load_start_frame = frame;
+        tab.url         = entry.url.clone();
+        tab.display_url = entry.display_url.clone();
+        tab.title       = entry.title.clone();
+        // Restore committed page state directly — no re-navigation, no timer.
+        tab.page_state  = match &entry.error_msg {
+            Some(err) => PageState::Error(err.clone()),
+            None      => PageState::Loaded,
+        };
         self.address_bar_input = entry.url.clone();
         self.update_bookmark_flag();
         self.dirty.all();
-        Some(entry.url)
+        None  // State restored from history; caller need not trigger engine.
     }
 
     pub fn go_forward(&mut self) -> Option<String> {
-        let frame = self.frame_count;
-        let tab   = self.active_tab_mut()?;
+        let tab = self.active_tab_mut()?;
         if !tab.can_go_forward() { return None; }
         tab.history_index += 1;
         let entry = tab.history[tab.history_index].clone();
-        tab.url              = entry.url.clone();
-        tab.display_url      = entry.display_url.clone();
-        tab.title            = entry.title.clone();
-        tab.page_state       = PageState::Loading;
-        tab.load_start_frame = frame;
+        tab.url         = entry.url.clone();
+        tab.display_url = entry.display_url.clone();
+        tab.title       = entry.title.clone();
+        tab.page_state  = match &entry.error_msg {
+            Some(err) => PageState::Error(err.clone()),
+            None      => PageState::Loaded,
+        };
         self.address_bar_input = entry.url.clone();
         self.update_bookmark_flag();
         self.dirty.all();
-        Some(entry.url)
+        None
     }
 
     pub fn reload(&mut self) -> Option<String> {
-        let frame = self.frame_count;
-        let url   = self.active_tab()
+        let frame  = self.frame_count;
+        let url    = self.active_tab()
             .filter(|t| !t.url.is_empty())
             .map(|t| t.url.clone())?;
+        let result = classify_url(&url);
         if let Some(tab) = self.active_tab_mut() {
             tab.page_state       = PageState::Loading;
             tab.load_start_frame = frame;
+            tab.nav_result       = result;
         }
         self.dirty.all();
         Some(url)

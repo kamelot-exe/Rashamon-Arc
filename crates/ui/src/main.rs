@@ -163,15 +163,17 @@ fn tick_loading(state: &mut BrowserState, engine: &mut RenderEngine) {
     let elapsed = state.frame_count.saturating_sub(tab.load_start_frame);
 
     if elapsed >= LOAD_TIMEOUT_FRAMES {
-        state.fail_loading("Page unavailable");
+        // Hard timeout — belt-and-suspenders for future async engine stalls.
+        state.fail_loading("Request timed out");
         return;
     }
     if elapsed >= LOAD_MIN_FRAMES {
-        // engine.title() returns Some only when a real HTML engine has parsed
-        // a <title> tag. Fall back to the URL-derived title so navigation always
-        // resolves after LOAD_MIN_FRAMES rather than hanging until timeout.
-        let title = engine.title().unwrap_or_default();
-        state.resolve_loading(title);
+        // Commit via pre-classified NavResult — this is now the source of truth.
+        state.commit_navigation();
+        // If a real engine has a title ready, let it override the derived one.
+        if let Some(title) = engine.title() {
+            if !title.is_empty() { state.resolve_loading(title); }
+        }
     }
 }
 

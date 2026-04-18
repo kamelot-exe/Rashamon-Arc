@@ -236,7 +236,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let font_data  = include_bytes!("../assets/DejaVuSansMono.ttf");
     let font       = FontManager::new(font_data)?;
     let mut fb      = Framebuffer::new(FB_WIDTH, FB_HEIGHT);
-    let mut engine  = RenderEngine::new()?;
+    let content_h   = FB_HEIGHT.saturating_sub(TOP_BAR_HEIGHT);
+    let mut engine  = RenderEngine::new(FB_WIDTH, content_h)?;
     let _http       = HttpClient::new();
     let mut state   = BrowserState::new();
     load_user_data(&mut state);
@@ -257,7 +258,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         if let Some(url) = nav_url {
             if let Some(url) = state.begin_navigate(&url) {
                 engine.navigate(&url).ok();
-                pending_fetch = Some(spawn_fetch(state.active_tab_id, url));
+                // Text-fetch fallback only when no real engine is active
+                if !engine.is_real_engine() {
+                    pending_fetch = Some(spawn_fetch(state.active_tab_id, url));
+                }
             }
         }
     }
@@ -303,15 +307,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
 
-        // ── Spawn fetch ───────────────────────────────────────────────────────
-        if let Some(tab) = state.active_tab() {
-            if tab.page_state.is_loading() {
-                let already = pending_fetch.as_ref().map_or(false, |pf| pf.tab_id == tab.id)
-                    || buffered_outcome.as_ref().map_or(false, |(id, _)| *id == tab.id);
-                if !already {
-                    let tab_id = tab.id;
-                    let url    = tab.url.clone();
-                    pending_fetch = Some(spawn_fetch(tab_id, url));
+        // ── Spawn fetch (text renderer fallback — skipped when real engine active) ──
+        if !engine.is_real_engine() {
+            if let Some(tab) = state.active_tab() {
+                if tab.page_state.is_loading() {
+                    let already = pending_fetch.as_ref().map_or(false, |pf| pf.tab_id == tab.id)
+                        || buffered_outcome.as_ref().map_or(false, |(id, _)| *id == tab.id);
+                    if !already {
+                        let tab_id = tab.id;
+                        let url    = tab.url.clone();
+                        pending_fetch = Some(spawn_fetch(tab_id, url));
+                    }
                 }
             }
         }
@@ -400,6 +406,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
                 EngineEvent::LoadComplete => {
                     state.resolve_engine_loading();
+                    state.dirty.content = true;
                     save_dirty.history = true;
                 }
                 EngineEvent::LoadFailed(reason) => { state.fail_loading(&reason); }
@@ -420,9 +427,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 && state.overlay == OverlayKind::None
                 && state.active_tab().map_or(false, |t| matches!(t.page_state, PageState::Loaded))
             {
-                engine.render_into(&mut fb, 0, TOP_BAR_HEIGHT, FB_WIDTH, FB_HEIGHT - TOP_BAR_HEIGHT)
-                    .unwrap_or(EngineFrame::NotReady)
-                    == EngineFrame::Ready
+                match engine.render_into(&mut fb, 0, TOP_BAR_HEIGHT, FB_WIDTH, FB_HEIGHT - TOP_BAR_HEIGHT) {
+                    Ok(EngineFrame::Ready) => true,
+                    Ok(_)  => false,
+                    Err(e) => { eprintln!("[render] engine.render_into error: {e}"); false }
+                }
             } else {
                 false
             };
@@ -443,10 +452,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 // ── Loading state machine ─────────────────────────────────────────────────────
 
-fn tick_loading(state: &mut BrowserState, _engine: &mut RenderEngine) {
+fn tick_loading(state: &mut BrowserState, engine: &mut RenderEngine) {
     let Some(tab) = state.active_tab() else { return };
     if !tab.page_state.is_loading() { return; }
-    if state.frame_count.saturating_sub(tab.load_start_frame) >= LOAD_TIMEOUT_FRAMES {
+    // Real engines (WebKit) need more time for JS-heavy pages.
+    let timeout = if engine.is_real_engine() { LOAD_TIMEOUT_FRAMES * 5 } else { LOAD_TIMEOUT_FRAMES };
+    if state.frame_count.saturating_sub(tab.load_start_frame) >= timeout {
         state.fail_loading("Request timed out");
     }
 }

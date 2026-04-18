@@ -1,13 +1,18 @@
 //! Rashamon Renderer — browser rendering engine integration.
 //!
-//! Default build: stub mode (text renderer fallback active in the shell).
-//! `--features servo`: real Servo embedding via WebRender + GL readback.
+//! Default: WebKitGTK (feature = "webkit") — real web rendering.
+//! Fallback: stub / text renderer when webkit feature is disabled.
 
 mod engine;
 mod engine_trait;
 pub mod framebuffer;
+#[cfg(feature = "servo")]
 mod servo_embedder;
+#[cfg(not(feature = "servo"))]
 mod servo_host;
+
+#[cfg(feature = "webkit")]
+mod webkit_engine;
 
 pub use engine::RenderEngine;
 pub use engine_trait::{ContentEngine, EngineEvent, EngineFrame};

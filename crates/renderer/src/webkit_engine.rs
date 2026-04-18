@@ -21,6 +21,7 @@ use std::time::Duration;
 
 enum Cmd {
     Navigate(String),
+    ScrollTo(i32),   // absolute page-Y in pixels
     Shutdown,
 }
 
@@ -35,6 +36,7 @@ enum Reply {
     },
     TitleChanged(String),
     UrlChanged(String),
+    ContentHeight(u32),
     LoadFailed(String),
 }
 
@@ -49,12 +51,13 @@ struct CachedFrame {
 // ── Engine ────────────────────────────────────────────────────────────────────
 
 pub struct WebKitEngine {
-    cmd_tx:   mpsc::SyncSender<Cmd>,
-    reply_rx: mpsc::Receiver<Reply>,
-    cache:    Option<CachedFrame>,
-    title:    Option<String>,
-    url:      Option<String>,
-    events:   Vec<EngineEvent>,
+    cmd_tx:    mpsc::SyncSender<Cmd>,
+    reply_rx:  mpsc::Receiver<Reply>,
+    cache:     Option<CachedFrame>,
+    title:     Option<String>,
+    url:       Option<String>,
+    events:    Vec<EngineEvent>,
+    scroll_y:  i32,
 }
 
 impl WebKitEngine {
@@ -70,10 +73,11 @@ impl WebKitEngine {
         Ok(Self {
             cmd_tx,
             reply_rx,
-            cache:  None,
-            title:  None,
-            url:    None,
-            events: Vec::new(),
+            cache:    None,
+            title:    None,
+            url:      None,
+            events:   Vec::new(),
+            scroll_y: 0,
         })
     }
 }
@@ -85,8 +89,9 @@ impl Drop for WebKitEngine {
 impl ContentEngine for WebKitEngine {
     fn navigate(&mut self, url: &str) -> Result<(), Box<dyn std::error::Error>> {
         eprintln!("[webkit] navigate → {url}");
-        self.cache  = None;
-        self.url    = Some(url.to_string());
+        self.cache    = None;
+        self.url      = Some(url.to_string());
+        self.scroll_y = 0;
         self.events.push(EngineEvent::LoadStarted);
         self.cmd_tx.send(Cmd::Navigate(url.to_string()))
             .map_err(|e| format!("webkit channel closed: {e}"))?;
@@ -101,9 +106,9 @@ impl ContentEngine for WebKitEngine {
         Ok(())
     }
 
-    fn scroll(&mut self, _delta_y: i32) {
-        // Snapshot approach: scroll is handled by BrowserState's node-scroll code.
-        // Future: send Cmd::Scroll → retake snapshot at new offset.
+    fn scroll(&mut self, delta_y: i32) {
+        self.scroll_y = (self.scroll_y + delta_y).max(0);
+        let _ = self.cmd_tx.try_send(Cmd::ScrollTo(self.scroll_y));
     }
 
     fn render_into(
@@ -155,6 +160,9 @@ impl ContentEngine for WebKitEngine {
                     self.url = Some(u.clone());
                     self.events.push(EngineEvent::UrlChanged(u));
                 }
+                Ok(Reply::ContentHeight(h)) => {
+                    self.events.push(EngineEvent::ContentHeightChanged(h));
+                }
                 Ok(Reply::LoadFailed(r)) => {
                     eprintln!("[webkit] Load failed: {r}");
                     self.events.push(EngineEvent::LoadFailed(r));
@@ -169,6 +177,89 @@ impl ContentEngine for WebKitEngine {
     fn current_url(&self) -> Option<String> { self.url.clone() }
 }
 
+// ── Snapshot helper (called from load-changed and after scroll) ───────────────
+
+#[cfg(feature = "webkit")]
+fn take_snapshot(
+    wv:    &webkit2gtk::WebView,
+    w:     u32,
+    h:     u32,
+    title: String,
+    url:   String,
+    tx:    mpsc::SyncSender<Reply>,
+) {
+    use webkit2gtk::{SnapshotOptions, SnapshotRegion, WebViewExt};
+    use cairo;
+
+    wv.snapshot(
+        SnapshotRegion::Visible,
+        SnapshotOptions::empty(),
+        None::<&gio::Cancellable>,
+        move |result| {
+            match result {
+                Err(e) => {
+                    eprintln!("[webkit] snapshot error: {e}");
+                    let _ = tx.try_send(Reply::LoadFailed(e.to_string()));
+                }
+                Ok(src_surface) => {
+                    let mut img = match cairo::ImageSurface::create(
+                        cairo::Format::ARgb32, w as i32, h as i32,
+                    ) {
+                        Ok(s) => s,
+                        Err(e) => {
+                            let _ = tx.try_send(Reply::LoadFailed(format!("cairo create: {e:?}")));
+                            return;
+                        }
+                    };
+                    {
+                        let ctx = match cairo::Context::new(&img) {
+                            Ok(c) => c,
+                            Err(e) => {
+                                let _ = tx.try_send(Reply::LoadFailed(format!("cairo ctx: {e:?}")));
+                                return;
+                            }
+                        };
+                        let _ = ctx.set_source_surface(&src_surface, 0.0, 0.0);
+                        let _ = ctx.paint();
+                    }
+
+                    let sw     = img.width()  as u32;
+                    let sh     = img.height() as u32;
+                    let stride = img.stride() as u32;
+                    eprintln!("[webkit] ImageSurface: {sw}×{sh} stride={stride}");
+
+                    let pixels: Vec<u8> = match img.data() {
+                        Err(e) => {
+                            let _ = tx.try_send(Reply::LoadFailed(format!("cairo borrow: {e:?}")));
+                            return;
+                        }
+                        Ok(data) => {
+                            let mut p = Vec::with_capacity((sw * sh * 4) as usize);
+                            for row in 0..sh {
+                                for col in 0..sw {
+                                    let s = (row * stride + col * 4) as usize;
+                                    if s + 3 < data.len() {
+                                        p.push(data[s]);
+                                        p.push(data[s + 1]);
+                                        p.push(data[s + 2]);
+                                        p.push(data[s + 3]);
+                                    } else {
+                                        p.extend_from_slice(&[0, 0, 0, 255]);
+                                    }
+                                }
+                            }
+                            p
+                        }
+                    };
+
+                    eprintln!("[webkit] sending frame: {} bytes", pixels.len());
+                    let _ = tx.try_send(Reply::FrameReady { pixels, width: sw, height: sh, title, url });
+                }
+            }
+        },
+    );
+}
+
 // ── GTK / WebKit thread ───────────────────────────────────────────────────────
 
 fn webkit_thread(
@@ -180,10 +271,8 @@ fn webkit_thread(
     use gtk::prelude::{ContainerExt, GtkWindowExt, WidgetExt};
     use webkit2gtk::{
         HardwareAccelerationPolicy, LoadEvent, Settings, SettingsExt,
-        SnapshotOptions, SnapshotRegion, WebView, WebViewExt,
+        WebView, WebViewExt,
     };
-    // cairo is the rendering crate — needed for ImageSurface pixel readback.
-    use cairo;
 
     if let Err(e) = gtk::init() {
         eprintln!("[webkit] GTK init failed: {e}");
@@ -193,7 +282,6 @@ fn webkit_thread(
 
     let main_loop = glib::MainLoop::new(None, false);
 
-    // Disable hardware accel so offscreen rendering always works
     let settings = Settings::new();
     settings.set_enable_webgl(false);
     settings.set_hardware_acceleration_policy(HardwareAccelerationPolicy::Never);
@@ -201,7 +289,6 @@ fn webkit_thread(
     let webview = WebView::new();
     webview.set_settings(&settings);
 
-    // OffscreenWindow renders to a pixmap — no display window appears
     let window = gtk::OffscreenWindow::new();
     window.set_default_size(w as i32, h as i32);
     window.add(&webview);
@@ -217,89 +304,10 @@ fn webkit_thread(
             let url   = wv.uri().map(|s| s.to_string()).unwrap_or_default();
             eprintln!("[webkit] load-finished: {url:?}  title={title:?}");
 
-            let tx = tx.clone();
-            wv.snapshot(
-                SnapshotRegion::Visible,
-                SnapshotOptions::empty(),
-                None::<&gio::Cancellable>,
-                move |result| {
-                    match result {
-                        Err(e) => {
-                            eprintln!("[webkit] snapshot error: {e}");
-                            let _ = tx.try_send(Reply::LoadFailed(e.to_string()));
-                        }
-                        Ok(src_surface) => {
-                            // snapshot() returns a generic cairo::Surface.
-                            // Copy it into an ImageSurface we own so we can read pixels.
-                            let mut img = match cairo::ImageSurface::create(
-                                cairo::Format::ARgb32, w as i32, h as i32,
-                            ) {
-                                Ok(s) => s,
-                                Err(e) => {
-                                    eprintln!("[webkit] ImageSurface::create error: {e:?}");
-                                    let _ = tx.try_send(Reply::LoadFailed(
-                                        format!("cairo create: {e:?}"),
-                                    ));
-                                    return;
-                                }
-                            };
+            // Default tall content height so scroll is not clamped immediately.
+            let _ = tx.try_send(Reply::ContentHeight(8000));
 
-                            // Paint the snapshot onto our ImageSurface.
-                            {
-                                let ctx = match cairo::Context::new(&img) {
-                                    Ok(c) => c,
-                                    Err(e) => {
-                                        let _ = tx.try_send(Reply::LoadFailed(
-                                            format!("cairo ctx: {e:?}"),
-                                        ));
-                                        return;
-                                    }
-                                };
-                                let _ = ctx.set_source_surface(&src_surface, 0.0, 0.0);
-                                let _ = ctx.paint();
-                            } // ctx dropped → flush
-
-                            let sw     = img.width()  as u32;
-                            let sh     = img.height() as u32;
-                            let stride = img.stride() as u32;
-                            eprintln!("[webkit] ImageSurface: {sw}×{sh} stride={stride}");
-
-                            // Extract BGRA bytes (Cairo ARGB32 little-endian = [B,G,R,A]).
-                            let pixels: Vec<u8> = match img.data() {
-                                Err(e) => {
-                                    eprintln!("[webkit] cairo data borrow: {e:?}");
-                                    let _ = tx.try_send(Reply::LoadFailed(
-                                        format!("cairo borrow: {e:?}"),
-                                    ));
-                                    return;
-                                }
-                                Ok(data) => {
-                                    let mut p = Vec::with_capacity((sw * sh * 4) as usize);
-                                    for row in 0..sh {
-                                        for col in 0..sw {
-                                            let s = (row * stride + col * 4) as usize;
-                                            if s + 3 < data.len() {
-                                                p.push(data[s]);
-                                                p.push(data[s + 1]);
-                                                p.push(data[s + 2]);
-                                                p.push(data[s + 3]);
-                                            } else {
-                                                p.extend_from_slice(&[0, 0, 0, 255]);
-                                            }
-                                        }
-                                    }
-                                    p
-                                }
-                            };
-
-                            eprintln!("[webkit] sending frame: {} bytes", pixels.len());
-                            let _ = tx.try_send(Reply::FrameReady {
-                                pixels, width: sw, height: sh, title, url,
-                            });
-                        }
-                    }
-                },
-            );
+            take_snapshot(wv, w, h, title, url, tx.clone());
         });
     }
 
@@ -327,11 +335,26 @@ fn webkit_thread(
     {
         let wv = webview.clone();
         let ml = main_loop.clone();
+        let tx = reply_tx.clone();
         glib::timeout_add_local(Duration::from_millis(8), move || {
             match cmd_rx.try_recv() {
                 Ok(Cmd::Navigate(url)) => {
                     eprintln!("[webkit] load_uri: {url}");
                     wv.load_uri(&url);
+                }
+                Ok(Cmd::ScrollTo(y)) => {
+                    eprintln!("[webkit] scroll_to: {y}");
+                    let script = format!("window.scrollTo(0, {y})");
+                    wv.run_javascript(&script, None::<&gio::Cancellable>, |_| {});
+                    // Re-snapshot after scroll settles (~150 ms)
+                    let wv2 = wv.clone();
+                    let tx2 = tx.clone();
+                    glib::timeout_add_local(Duration::from_millis(150), move || {
+                        let title = wv2.title().map(|s| s.to_string()).unwrap_or_default();
+                        let url   = wv2.uri().map(|s| s.to_string()).unwrap_or_default();
+                        take_snapshot(&wv2, w, h, title, url, tx2.clone());
+                        glib::ControlFlow::Break
+                    });
                 }
                 Ok(Cmd::Shutdown) | Err(mpsc::TryRecvError::Disconnected) => {
                     ml.quit();

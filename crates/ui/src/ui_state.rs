@@ -706,6 +706,7 @@ impl BrowserState {
     }
 
     pub fn go_back(&mut self) -> Option<String> {
+        let frame = self.frame_count;
         let tab = self.active_tab_mut()?;
         if !tab.can_go_back() { return None; }
         if let Some(cur) = tab.history.get_mut(tab.history_index) {
@@ -713,22 +714,22 @@ impl BrowserState {
         }
         tab.history_index -= 1;
         let entry = tab.history[tab.history_index].clone();
-        tab.url            = entry.url.clone();
-        tab.display_url    = entry.display_url.clone();
-        tab.title          = entry.title.clone();
-        tab.scroll_y       = entry.scroll_y;
-        tab.content_height = entry.content_height;
-        tab.page_state     = match &entry.error_msg {
-            Some(err) => PageState::Error(err.clone()),
-            None      => PageState::Loaded,
-        };
+        tab.url              = entry.url.clone();
+        tab.display_url      = entry.display_url.clone();
+        tab.title            = entry.title.clone();
+        tab.scroll_y         = 0;
+        tab.content_height   = 0;
+        tab.page_state       = PageState::Loading;
+        tab.load_start_frame = frame;
+        tab.nav_result       = NavResult::WillLoad;
         self.address_bar_input = entry.url.clone();
         self.update_bookmark_flag();
         self.dirty.all();
-        None
+        Some(entry.url)
     }
 
     pub fn go_forward(&mut self) -> Option<String> {
+        let frame = self.frame_count;
         let tab = self.active_tab_mut()?;
         if !tab.can_go_forward() { return None; }
         if let Some(cur) = tab.history.get_mut(tab.history_index) {
@@ -736,19 +737,18 @@ impl BrowserState {
         }
         tab.history_index += 1;
         let entry = tab.history[tab.history_index].clone();
-        tab.url            = entry.url.clone();
-        tab.display_url    = entry.display_url.clone();
-        tab.title          = entry.title.clone();
-        tab.scroll_y       = entry.scroll_y;
-        tab.content_height = entry.content_height;
-        tab.page_state     = match &entry.error_msg {
-            Some(err) => PageState::Error(err.clone()),
-            None      => PageState::Loaded,
-        };
+        tab.url              = entry.url.clone();
+        tab.display_url      = entry.display_url.clone();
+        tab.title            = entry.title.clone();
+        tab.scroll_y         = 0;
+        tab.content_height   = 0;
+        tab.page_state       = PageState::Loading;
+        tab.load_start_frame = frame;
+        tab.nav_result       = NavResult::WillLoad;
         self.address_bar_input = entry.url.clone();
         self.update_bookmark_flag();
         self.dirty.all();
-        None
+        Some(entry.url)
     }
 
     pub fn reload(&mut self) -> Option<String> {

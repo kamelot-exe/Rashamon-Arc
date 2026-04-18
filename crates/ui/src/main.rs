@@ -554,13 +554,23 @@ fn on_key(
         input::Key::Char(c)   if state.address_bar_focused => state.type_char(c),
 
         // Scroll keys — only when not editing the address bar.
-        input::Key::Up   if !state.address_bar_focused => state.scroll_by(-SCROLL_LINE),
-        input::Key::Down if !state.address_bar_focused => state.scroll_by( SCROLL_LINE),
+        input::Key::Up   if !state.address_bar_focused => {
+            state.scroll_by(-SCROLL_LINE);
+            engine.scroll(-SCROLL_LINE);
+        }
+        input::Key::Down if !state.address_bar_focused => {
+            state.scroll_by(SCROLL_LINE);
+            engine.scroll(SCROLL_LINE);
+        }
         input::Key::PageUp   if !state.address_bar_focused => {
-            state.scroll_by(-((FB_HEIGHT - TOP_BAR_HEIGHT) as i32));
+            let px = -((FB_HEIGHT - TOP_BAR_HEIGHT) as i32);
+            state.scroll_by(px);
+            engine.scroll(px);
         }
         input::Key::PageDown if !state.address_bar_focused => {
-            state.scroll_by((FB_HEIGHT - TOP_BAR_HEIGHT) as i32);
+            let px = (FB_HEIGHT - TOP_BAR_HEIGHT) as i32;
+            state.scroll_by(px);
+            engine.scroll(px);
         }
 
         _ => {}

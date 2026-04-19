@@ -397,7 +397,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
 
-        // ── Engine events — sync title/url/load state from Servo ─────────────
+        // ── Engine events — sync title/url/load state from WebKit/Servo ──────
         for ev in engine.poll_events() {
             match ev {
                 EngineEvent::TitleChanged(t) => {
@@ -405,13 +405,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     state.dirty.chrome = true;
                 }
                 EngineEvent::UrlChanged(u) => {
-                    if let Some(tab) = state.active_tab_mut() { tab.url = u; }
+                    // WebKit reports the real URL (after redirects).
+                    if let Some(tab) = state.active_tab_mut() { tab.url = u.clone(); }
+                    if !state.address_bar_focused {
+                        state.address_bar_input = u;
+                    }
                     state.dirty.chrome = true;
                 }
                 EngineEvent::LoadComplete => {
                     state.resolve_engine_loading();
+                    // Sync address bar to the final URL reported by the engine.
+                    if !state.address_bar_focused { state.sync_address_bar(); }
                     state.dirty.content = true;
-                    save_dirty.history = true;
+                    save_dirty.history  = true;
                 }
                 EngineEvent::LoadFailed(reason) => { state.fail_loading(&reason); }
                 EngineEvent::ContentHeightChanged(h) => { state.set_content_height(h); }
@@ -606,13 +612,30 @@ fn click_tab_bar(state: &mut BrowserState, engine: &mut RenderEngine, x: u32) {
         if x >= lx && x < rx {
             let id = state.tabs[i].id;
             if x >= lx + tw.saturating_sub(18) {
+                // Close button: close tab, re-navigate engine to new active tab.
                 state.close_tab(id);
-                if let Some(url) = state.active_tab().map(|t| t.url.clone()).filter(|u| !u.is_empty()) {
+                if engine.is_real_engine() {
+                    if let Some(url) = state.active_tab().map(|t| t.url.clone()).filter(|u| !u.is_empty()) {
+                        if let Some(url) = state.begin_navigate(&url) {
+                            engine.navigate(&url).ok();
+                        }
+                    }
+                } else if let Some(url) = state.active_tab().map(|t| t.url.clone()).filter(|u| !u.is_empty()) {
                     engine.navigate(&url).ok();
                 }
             } else if id != state.active_tab_id {
+                // Switch to another tab: activate, then re-navigate the single WebView.
                 state.activate_tab(id);
-                if let Some(url) = state.active_tab().map(|t| t.url.clone()).filter(|u| !u.is_empty()) {
+                if engine.is_real_engine() {
+                    if let Some(url) = state.active_tab().map(|t| t.url.clone()).filter(|u| !u.is_empty()) {
+                        // Go through begin_navigate so the state machine (Loading →
+                        // Loaded) runs correctly and resolve_engine_loading commits the
+                        // page into history.
+                        if let Some(url) = state.begin_navigate(&url) {
+                            engine.navigate(&url).ok();
+                        }
+                    }
+                } else if let Some(url) = state.active_tab().map(|t| t.url.clone()).filter(|u| !u.is_empty()) {
                     engine.navigate(&url).ok();
                 }
             }

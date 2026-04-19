@@ -215,9 +215,9 @@ impl TabState {
 
     fn commit(&mut self, url: &str, title: &str, error_msg: Option<String>, nodes: Vec<PageNode>,
               meta_description: Option<String>, noscript: Option<String>) {
-        if self.history_index + 1 < self.history.len() {
-            self.history.truncate(self.history_index + 1);
-        }
+        // Check URL match BEFORE truncating — back/forward navigation arrives here
+        // with the same URL already in history; just update metadata, don't disturb
+        // the forward stack.
         if error_msg.is_none() {
             if let Some(cur) = self.history.get_mut(self.history_index) {
                 if cur.url == url {
@@ -230,6 +230,10 @@ impl TabState {
                     return;
                 }
             }
+        }
+        // Fresh navigation: truncate forward stack, then push.
+        if self.history_index + 1 < self.history.len() {
+            self.history.truncate(self.history_index + 1);
         }
         self.history.push(NavigationEntry::new(url, title, error_msg, nodes, meta_description, noscript));
         self.history_index      = self.history.len() - 1;
@@ -677,8 +681,8 @@ impl BrowserState {
         self.dirty.all();
     }
 
-    /// Called when the rendering engine (Servo) signals load complete.
-    /// Unlike `resolve_loading`, there are no nodes — the engine owns the pixels.
+    /// Called when the rendering engine (WebKit/Servo) signals load complete.
+    /// The engine owns the pixels; we have no text nodes to store.
     pub fn resolve_engine_loading(&mut self) {
         let url = match self.active_tab() {
             Some(t) if t.page_state.is_loading() => t.url.clone(),
@@ -691,6 +695,9 @@ impl BrowserState {
             tab.title      = title.clone();
             tab.page_state = PageState::Loaded;
             tab.scroll_y   = 0;
+            // Commit into per-tab history so back/forward buttons activate.
+            // Passing empty nodes — engine owns the pixels, not the text renderer.
+            tab.commit(&url, &title, None, vec![], None, None);
         }
         self.record_visit(&url, &title);
         self.dirty.all();

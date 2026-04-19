@@ -106,6 +106,9 @@ impl RenderEngine {
     pub fn go_forward(&mut self) -> Result<(), Box<dyn std::error::Error>> { self.inner.go_forward() }
     pub fn reload(&mut self)     -> Result<(), Box<dyn std::error::Error>> { self.inner.reload() }
 
+    pub fn can_go_back(&self)    -> bool { self.inner.can_go_back() }
+    pub fn can_go_forward(&self) -> bool { self.inner.can_go_forward() }
+
     pub fn scroll(&mut self, delta_y: i32) { self.inner.scroll(delta_y); }
 
     // ── Frame ─────────────────────────────────────────────────────────────────

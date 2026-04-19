@@ -188,6 +188,10 @@ pub struct TabState {
     /// (begin_navigate, go_back, go_forward, reload).  Engine events are
     /// compared against this before being applied to the tab.
     pub nav_id:             u64,
+    /// Native WebKit back/forward availability — updated via NavStateChanged events.
+    /// When true, the engine drives history; shell history is a secondary fallback.
+    pub webkit_can_back:    bool,
+    pub webkit_can_forward: bool,
 }
 
 impl TabState {
@@ -212,11 +216,18 @@ impl TabState {
             scroll_y:           0,
             content_height:     0,
             nav_id:             0,
+            webkit_can_back:    false,
+            webkit_can_forward: false,
         }
     }
 
     pub fn can_go_back(&self)    -> bool { self.history_index > 0 }
     pub fn can_go_forward(&self) -> bool { self.history_index + 1 < self.history.len() }
+
+    /// True when there is any back history — WebKit native first, shell fallback.
+    pub fn nav_can_go_back(&self)    -> bool { self.webkit_can_back    || self.can_go_back() }
+    /// True when there is any forward history — WebKit native first, shell fallback.
+    pub fn nav_can_go_forward(&self) -> bool { self.webkit_can_forward || self.can_go_forward() }
 
     /// Rendered nodes for the currently committed history entry.
     pub fn current_nodes(&self) -> &[PageNode] {

@@ -453,6 +453,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 EngineEvent::ContentHeightChanged(h) => {
                     state.set_content_height_for(target_raw, h);
                 }
+                EngineEvent::NavStateChanged { can_back, can_forward } => {
+                    if let Some(tab) = state.tabs.iter_mut()
+                        .find(|t| t.id.raw() == target_raw)
+                    {
+                        tab.webkit_can_back    = can_back;
+                        tab.webkit_can_forward = can_forward;
+                    }
+                    if is_active { state.dirty.chrome = true; }
+                }
                 EngineEvent::LoadStarted => {}
             }
         }
@@ -708,7 +717,10 @@ fn click_chrome_bar(state: &mut BrowserState, engine: &mut RenderEngine, x: u32,
     let btn_r: u32 = 16;
     if x >= 12 && x < 12 + btn_r * 2 {
         state.press_nav_btn(1);
-        if let Some(url) = state.go_back() {
+        if engine.is_real_engine() && engine.can_go_back() {
+            // Native WebKit back: no reload, JS/scroll state preserved.
+            engine.go_back().ok();
+        } else if let Some(url) = state.go_back() {
             let nav_id = state.active_tab().map_or(0, |t| t.nav_id);
             engine.navigate(&url, nav_id).ok();
         }
@@ -716,7 +728,10 @@ fn click_chrome_bar(state: &mut BrowserState, engine: &mut RenderEngine, x: u32,
     }
     if x >= 54 && x < 54 + btn_r * 2 {
         state.press_nav_btn(2);
-        if let Some(url) = state.go_forward() {
+        if engine.is_real_engine() && engine.can_go_forward() {
+            // Native WebKit forward: no reload, JS/scroll state preserved.
+            engine.go_forward().ok();
+        } else if let Some(url) = state.go_forward() {
             let nav_id = state.active_tab().map_or(0, |t| t.nav_id);
             engine.navigate(&url, nav_id).ok();
         }
@@ -938,8 +953,8 @@ fn draw_tab_row(fb: &mut Framebuffer, state: &BrowserState, font: &FontManager) 
 
 fn draw_chrome_row(fb: &mut Framebuffer, state: &BrowserState, font: &FontManager) {
     let cy          = TAB_BAR_HEIGHT + CHROME_BAR_HEIGHT / 2;
-    let can_back    = state.active_tab().map_or(false, |t| t.can_go_back());
-    let can_forward = state.active_tab().map_or(false, |t| t.can_go_forward());
+    let can_back    = state.active_tab().map_or(false, |t| t.nav_can_go_back());
+    let can_forward = state.active_tab().map_or(false, |t| t.nav_can_go_forward());
     draw_nav_btn(fb, state, 28,  cy, NavBtn::Back,    can_back);
     draw_nav_btn(fb, state, 70,  cy, NavBtn::Forward, can_forward);
     draw_nav_btn(fb, state, 112, cy, NavBtn::Reload,  true);

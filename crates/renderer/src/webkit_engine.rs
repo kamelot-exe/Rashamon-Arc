@@ -46,6 +46,9 @@ enum Cmd {
     Navigate   { tab_id: u64, url: String, nav_id: u64 },
     /// Scroll by delta pixels and re-snapshot the specified tab.
     ScrollBy   { tab_id: u64, delta: i32 },
+    /// Native WebKit back/forward — no URL re-load.
+    GoBack     { tab_id: u64 },
+    GoForward  { tab_id: u64 },
     Shutdown,
 }
 
@@ -62,6 +65,8 @@ enum Reply {
     TitleChanged  { tab_id: u64, nav_id: u64, title:  String },
     ContentHeight { tab_id: u64, nav_id: u64, h:      u32    },
     LoadFailed    { tab_id: u64, nav_id: u64, reason: String },
+    /// WebKit reports whether the tab's history stack has back/forward entries.
+    NavState      { tab_id: u64, can_back: bool, can_forward: bool },
 }
 
 // ── Per-tab engine state ──────────────────────────────────────────────────────
@@ -74,6 +79,8 @@ struct PerTabState {
     title:            Option<String>,
     url:              Option<String>,
     expected_nav_id:  u64,
+    can_back:         bool,
+    can_forward:      bool,
 }
 
 // ── WebKitEngine (Send) ───────────────────────────────────────────────────────
@@ -182,11 +189,31 @@ impl ContentEngine for WebKitEngine {
             .unwrap_or(0)
     }
 
-    // Back/forward/reload: the shell already resolved the target URL via
-    // ui_state and calls navigate() directly.  These are no-ops.
-    fn go_back(&mut self)    -> Result<(), Box<dyn std::error::Error>> { Ok(()) }
-    fn go_forward(&mut self) -> Result<(), Box<dyn std::error::Error>> { Ok(()) }
-    fn reload(&mut self)     -> Result<(), Box<dyn std::error::Error>> {
+    fn go_back(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        let tab_id = self.active_tab_id;
+        let _ = self.cmd_tx.try_send(Cmd::GoBack { tab_id });
+        Ok(())
+    }
+
+    fn go_forward(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        let tab_id = self.active_tab_id;
+        let _ = self.cmd_tx.try_send(Cmd::GoForward { tab_id });
+        Ok(())
+    }
+
+    fn can_go_back(&self) -> bool {
+        self.tab_states.get(&self.active_tab_id)
+            .map(|s| s.can_back)
+            .unwrap_or(false)
+    }
+
+    fn can_go_forward(&self) -> bool {
+        self.tab_states.get(&self.active_tab_id)
+            .map(|s| s.can_forward)
+            .unwrap_or(false)
+    }
+
+    fn reload(&mut self) -> Result<(), Box<dyn std::error::Error>> {
         if let Some(url) = self.tab_states.get(&self.active_tab_id)
             .and_then(|s| s.url.clone())
         {
@@ -280,6 +307,13 @@ impl ContentEngine for WebKitEngine {
                     eprintln!("[webkit] LoadFailed tab={tab_id}: {reason}");
                     self.pending_events.push((tab_id, EngineEvent::LoadFailed(reason)));
                 }
+                Ok(Reply::NavState { tab_id, can_back, can_forward }) => {
+                    let state = self.tab_states.entry(tab_id).or_insert_with(PerTabState::default);
+                    state.can_back    = can_back;
+                    state.can_forward = can_forward;
+                    self.pending_events.push((tab_id,
+                        EngineEvent::NavStateChanged { can_back, can_forward }));
+                }
                 Err(mpsc::TryRecvError::Empty | mpsc::TryRecvError::Disconnected) => break,
             }
         }
@@ -324,10 +358,16 @@ impl WebKitDriver {
 
                 Ok(Cmd::SwitchTab { tab_id }) => {
                     if let Some(entry) = self.tabs.get(&tab_id) {
-                        let nav_id = entry.nav_id_cell.get();
-                        let title  = wv_title(&entry.webview);
-                        let url    = wv_url(&entry.webview);
+                        use webkit2gtk::WebViewExt;
+                        let nav_id     = entry.nav_id_cell.get();
+                        let title      = wv_title(&entry.webview);
+                        let url        = wv_url(&entry.webview);
+                        let can_back   = entry.webview.can_go_back();
+                        let can_fwd    = entry.webview.can_go_forward();
                         eprintln!("[webkit-driver] SwitchTab {tab_id} → snapshot nav={nav_id}");
+                        let _ = self.reply_tx.try_send(Reply::NavState {
+                            tab_id, can_back, can_forward: can_fwd,
+                        });
                         take_snapshot(
                             &entry.webview, self.w, self.h,
                             tab_id, nav_id, title, url,
@@ -369,6 +409,50 @@ impl WebKitDriver {
                             );
                             glib::ControlFlow::Break
                         });
+                    }
+                }
+
+                Ok(Cmd::GoBack { tab_id }) => {
+                    if let Some(entry) = self.tabs.get(&tab_id) {
+                        use webkit2gtk::WebViewExt;
+                        if entry.webview.can_go_back() {
+                            // nav_id 0 means "native navigation, no shell nav_id"
+                            entry.nav_id_cell.set(0);
+                            entry.webview.go_back();
+                            // load-changed will fire and snapshot when done.
+                            // Safety-net: snapshot after a delay in case it was
+                            // a same-page (fragment) navigation.
+                            let wv     = entry.webview.clone();
+                            let tx     = self.reply_tx.clone();
+                            let nc     = Rc::clone(&entry.nav_id_cell);
+                            let (w, h) = (self.w, self.h);
+                            glib::timeout_add_local(Duration::from_millis(400), move || {
+                                let nav_id = nc.get();
+                                take_snapshot(&wv, w, h, tab_id, nav_id,
+                                    wv_title(&wv), wv_url(&wv), tx.clone());
+                                glib::ControlFlow::Break
+                            });
+                        }
+                    }
+                }
+
+                Ok(Cmd::GoForward { tab_id }) => {
+                    if let Some(entry) = self.tabs.get(&tab_id) {
+                        use webkit2gtk::WebViewExt;
+                        if entry.webview.can_go_forward() {
+                            entry.nav_id_cell.set(0);
+                            entry.webview.go_forward();
+                            let wv     = entry.webview.clone();
+                            let tx     = self.reply_tx.clone();
+                            let nc     = Rc::clone(&entry.nav_id_cell);
+                            let (w, h) = (self.w, self.h);
+                            glib::timeout_add_local(Duration::from_millis(400), move || {
+                                let nav_id = nc.get();
+                                take_snapshot(&wv, w, h, tab_id, nav_id,
+                                    wv_title(&wv), wv_url(&wv), tx.clone());
+                                glib::ControlFlow::Break
+                            });
+                        }
                     }
                 }
 
@@ -424,12 +508,14 @@ fn make_tab_entry(
         let nc  = Rc::clone(&nav_id_cell);
         webview.connect_load_changed(move |wv, event| {
             if event == LoadEvent::Finished {
-                let nav_id = nc.get();
-                // Emit a generous virtual height so the shell scroll tracker
-                // never clamps before WebKit does.  WebKit's scrollBy itself
-                // stops at the real document bottom, so this value only needs
-                // to be larger than any real page height.
+                use webkit2gtk::WebViewExt as _;
+                let nav_id    = nc.get();
+                let can_back  = wv.can_go_back();
+                let can_fwd   = wv.can_go_forward();
                 let _ = tx.try_send(Reply::ContentHeight { tab_id, nav_id, h: 200_000 });
+                let _ = tx.try_send(Reply::NavState {
+                    tab_id, can_back, can_forward: can_fwd,
+                });
                 take_snapshot(
                     wv, w, h, tab_id, nav_id,
                     wv_title(wv), wv_url(wv), tx.clone(),

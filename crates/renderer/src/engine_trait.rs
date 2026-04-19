@@ -16,6 +16,8 @@ pub enum EngineEvent {
     LoadFailed(String),
     /// Full scrollable height of the loaded page in pixels.
     ContentHeightChanged(u32),
+    /// WebKit reports whether native back/forward history is available.
+    NavStateChanged { can_back: bool, can_forward: bool },
 }
 
 /// Whether the engine wrote real pixels into the framebuffer.
@@ -53,6 +55,11 @@ pub trait ContentEngine: Send {
     fn go_back(&mut self)    -> Result<(), Box<dyn std::error::Error>>;
     fn go_forward(&mut self) -> Result<(), Box<dyn std::error::Error>>;
     fn reload(&mut self)     -> Result<(), Box<dyn std::error::Error>>;
+
+    /// Whether the active tab's WebView has native back/forward history.
+    /// Returns false on stub engines — shell history is used instead.
+    fn can_go_back(&self)    -> bool { false }
+    fn can_go_forward(&self) -> bool { false }
 
     /// Scroll the active tab's viewport by `delta_y` pixels (positive = down).
     fn scroll(&mut self, delta_y: i32);

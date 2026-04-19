@@ -1,33 +1,32 @@
 //! WebKitGTK content engine — real web rendering via WebKit 2.50+.
 //!
-//! Architecture:
-//!   Main thread  ←  mpsc channels  →  GTK thread
-//!   (SDL2 loop)                       (glib MainLoop + WebView)
+//! Architecture (main-thread GTK):
+//!   WebKitEngine::create() returns (WebKitEngine, WebKitDriver).
+//!   WebKitEngine  — Send, holds mpsc channels, implements ContentEngine.
+//!   WebKitDriver  — !Send, holds live GTK objects, must be pump()ed from main thread.
 //!
-//! navigate() → sends Cmd::Navigate to GTK thread.
-//! GTK thread loads the page, waits for load-finished, takes a snapshot.
-//! Snapshot pixels (Cairo ARGB32 = BGRA in memory) are sent back via channel.
-//! poll_events() drains the channel → emits EngineEvents.
-//! render_into() blits the cached pixel buffer into the framebuffer region.
+//!   navigate() → enqueues Cmd::Navigate.
+//!   WebKitDriver::pump() drains cmd channel, calls load_uri on WebView.
+//!   GTK load-finished signal → take_snapshot → sends Reply::FrameReady.
+//!   WebKitEngine::poll_events() drains reply_rx → EngineEvents.
+//!   render_into() blits cached BGRA pixels into framebuffer.
 
 use crate::engine_trait::{ContentEngine, EngineEvent, EngineFrame};
 use crate::framebuffer::{Framebuffer, Pixel};
 
 use std::sync::mpsc;
-use std::thread;
 use std::time::Duration;
 
 // ── IPC types ─────────────────────────────────────────────────────────────────
 
 enum Cmd {
     Navigate(String),
-    ScrollTo(i32),   // absolute page-Y in pixels
+    ScrollTo(i32),
     Shutdown,
 }
 
 enum Reply {
     FrameReady {
-        /// Raw BGRA pixels: Cairo ARGB32, little-endian → [B,G,R,A] in memory.
         pixels: Vec<u8>,
         width:  u32,
         height: u32,
@@ -48,29 +47,93 @@ struct CachedFrame {
     height: u32,
 }
 
-// ── Engine ────────────────────────────────────────────────────────────────────
+// ── Engine (Send) ─────────────────────────────────────────────────────────────
 
 pub struct WebKitEngine {
-    cmd_tx:    mpsc::SyncSender<Cmd>,
-    reply_rx:  mpsc::Receiver<Reply>,
-    cache:     Option<CachedFrame>,
-    title:     Option<String>,
-    url:       Option<String>,
-    events:    Vec<EngineEvent>,
-    scroll_y:  i32,
+    cmd_tx:   mpsc::SyncSender<Cmd>,
+    reply_rx: mpsc::Receiver<Reply>,
+    cache:    Option<CachedFrame>,
+    title:    Option<String>,
+    url:      Option<String>,
+    events:   Vec<EngineEvent>,
+    scroll_y: i32,
+}
+
+// ── Driver (!Send — main thread only) ────────────────────────────────────────
+
+pub struct WebKitDriver {
+    cmd_rx:   mpsc::Receiver<Cmd>,
+    reply_tx: mpsc::SyncSender<Reply>,
+    webview:  webkit2gtk::WebView,
+    _window:  gtk::OffscreenWindow,
+    w: u32,
+    h: u32,
 }
 
 impl WebKitEngine {
-    pub fn new(content_w: u32, content_h: u32) -> Result<Self, Box<dyn std::error::Error>> {
+    /// Create engine + driver. **Must be called from the main thread.**
+    /// The caller is responsible for calling `WebKitDriver::pump()` every frame.
+    pub fn create(content_w: u32, content_h: u32)
+        -> Result<(Self, WebKitDriver), Box<dyn std::error::Error>>
+    {
+        use gtk::prelude::{ContainerExt, GtkWindowExt, WidgetExt};
+        use webkit2gtk::{
+            HardwareAccelerationPolicy, LoadEvent, Settings, SettingsExt,
+            WebView, WebViewExt,
+        };
+
+        gtk::init().map_err(|e| format!("GTK init failed: {e}"))?;
+
         let (cmd_tx, cmd_rx)     = mpsc::sync_channel::<Cmd>(8);
         let (reply_tx, reply_rx) = mpsc::sync_channel::<Reply>(8);
 
-        thread::Builder::new()
-            .name("webkit-gtk".into())
-            .spawn(move || webkit_thread(cmd_rx, reply_tx, content_w, content_h))?;
+        let settings = Settings::new();
+        settings.set_enable_webgl(false);
+        settings.set_hardware_acceleration_policy(HardwareAccelerationPolicy::Never);
 
-        eprintln!("[webkit] Engine spawned ({}×{})", content_w, content_h);
-        Ok(Self {
+        let webview = WebView::new();
+        webview.set_settings(&settings);
+        webview.set_size_request(content_w as i32, content_h as i32);
+
+        let window = gtk::OffscreenWindow::new();
+        window.set_default_size(content_w as i32, content_h as i32);
+        window.add(&webview);
+        window.show_all();
+
+        // ── Signals ───────────────────────────────────────────────────────────
+        {
+            let tx = reply_tx.clone();
+            let w = content_w;
+            let h = content_h;
+            webview.connect_load_changed(move |wv, event| {
+                if event != LoadEvent::Finished { return; }
+                let title = wv.title().map(|s| s.to_string()).unwrap_or_default();
+                let url   = wv.uri().map(|s| s.to_string()).unwrap_or_default();
+                eprintln!("[webkit] load-finished: {url:?}  title={title:?}");
+                let _ = tx.try_send(Reply::ContentHeight(8000));
+                take_snapshot(wv, w, h, title, url, tx.clone());
+            });
+        }
+        {
+            let tx = reply_tx.clone();
+            webview.connect_load_failed(move |_wv, _event, uri, error| {
+                eprintln!("[webkit] load-failed: {uri} — {error}");
+                let _ = tx.try_send(Reply::LoadFailed(error.to_string()));
+                false
+            });
+        }
+        {
+            let tx = reply_tx.clone();
+            webview.connect_title_notify(move |wv| {
+                if let Some(t) = wv.title() {
+                    let _ = tx.try_send(Reply::TitleChanged(t.to_string()));
+                }
+            });
+        }
+
+        eprintln!("[webkit] Engine created ({}×{})", content_w, content_h);
+
+        let engine = WebKitEngine {
             cmd_tx,
             reply_rx,
             cache:    None,
@@ -78,7 +141,18 @@ impl WebKitEngine {
             url:      None,
             events:   Vec::new(),
             scroll_y: 0,
-        })
+        };
+
+        let driver = WebKitDriver {
+            cmd_rx,
+            reply_tx,
+            webview,
+            _window: window,
+            w: content_w,
+            h: content_h,
+        };
+
+        Ok((engine, driver))
     }
 }
 
@@ -177,7 +251,49 @@ impl ContentEngine for WebKitEngine {
     fn current_url(&self) -> Option<String> { self.url.clone() }
 }
 
-// ── Snapshot helper (called from load-changed and after scroll) ───────────────
+// ── Driver ────────────────────────────────────────────────────────────────────
+
+impl WebKitDriver {
+    /// Pump pending GTK events and dispatch queued commands to WebView.
+    /// **Must be called from the main thread every frame.**
+    pub fn pump(&mut self) {
+        use webkit2gtk::WebViewExt;
+
+        // Drain all pending GLib/GTK events without blocking.
+        while gtk::events_pending() {
+            gtk::main_iteration_do(false);
+        }
+
+        // Dispatch commands queued by WebKitEngine.
+        loop {
+            match self.cmd_rx.try_recv() {
+                Ok(Cmd::Navigate(url)) => {
+                    eprintln!("[webkit] load_uri: {url}");
+                    self.webview.load_uri(&url);
+                }
+                Ok(Cmd::ScrollTo(y)) => {
+                    eprintln!("[webkit] scroll_to: {y}");
+                    let script = format!("window.scrollTo(0, {y})");
+                    self.webview.run_javascript(&script, None::<&gio::Cancellable>, |_| {});
+                    let wv  = self.webview.clone();
+                    let tx  = self.reply_tx.clone();
+                    let w   = self.w;
+                    let h   = self.h;
+                    glib::timeout_add_local(Duration::from_millis(150), move || {
+                        let title = wv.title().map(|s| s.to_string()).unwrap_or_default();
+                        let url   = wv.uri().map(|s| s.to_string()).unwrap_or_default();
+                        take_snapshot(&wv, w, h, title, url, tx.clone());
+                        glib::ControlFlow::Break
+                    });
+                }
+                Ok(Cmd::Shutdown) | Err(mpsc::TryRecvError::Disconnected) => break,
+                Err(mpsc::TryRecvError::Empty) => break,
+            }
+        }
+    }
+}
+
+// ── Snapshot helper ───────────────────────────────────────────────────────────
 
 #[cfg(feature = "webkit")]
 fn take_snapshot(
@@ -258,115 +374,4 @@ fn take_snapshot(
             }
         },
     );
-}
-
-// ── GTK / WebKit thread ───────────────────────────────────────────────────────
-
-fn webkit_thread(
-    cmd_rx:   mpsc::Receiver<Cmd>,
-    reply_tx: mpsc::SyncSender<Reply>,
-    w: u32,
-    h: u32,
-) {
-    use gtk::prelude::{ContainerExt, GtkWindowExt, WidgetExt};
-    use webkit2gtk::{
-        HardwareAccelerationPolicy, LoadEvent, Settings, SettingsExt,
-        WebView, WebViewExt,
-    };
-
-    if let Err(e) = gtk::init() {
-        eprintln!("[webkit] GTK init failed: {e}");
-        return;
-    }
-    eprintln!("[webkit] GTK thread running, WebView {}×{}", w, h);
-
-    let main_loop = glib::MainLoop::new(None, false);
-
-    let settings = Settings::new();
-    settings.set_enable_webgl(false);
-    settings.set_hardware_acceleration_policy(HardwareAccelerationPolicy::Never);
-
-    let webview = WebView::new();
-    webview.set_settings(&settings);
-
-    let window = gtk::OffscreenWindow::new();
-    window.set_default_size(w as i32, h as i32);
-    window.add(&webview);
-    window.show_all();
-
-    // ── load-changed: snapshot on finish ─────────────────────────────────────
-    {
-        let tx = reply_tx.clone();
-        webview.connect_load_changed(move |wv, event| {
-            if event != LoadEvent::Finished { return; }
-
-            let title = wv.title().map(|s| s.to_string()).unwrap_or_default();
-            let url   = wv.uri().map(|s| s.to_string()).unwrap_or_default();
-            eprintln!("[webkit] load-finished: {url:?}  title={title:?}");
-
-            // Default tall content height so scroll is not clamped immediately.
-            let _ = tx.try_send(Reply::ContentHeight(8000));
-
-            take_snapshot(wv, w, h, title, url, tx.clone());
-        });
-    }
-
-    // ── load-failed ───────────────────────────────────────────────────────────
-    {
-        let tx = reply_tx.clone();
-        webview.connect_load_failed(move |_wv, _event, uri, error| {
-            eprintln!("[webkit] load-failed: {uri} — {error}");
-            let _ = tx.try_send(Reply::LoadFailed(error.to_string()));
-            false
-        });
-    }
-
-    // ── title changed ─────────────────────────────────────────────────────────
-    {
-        let tx = reply_tx.clone();
-        webview.connect_title_notify(move |wv| {
-            if let Some(t) = wv.title() {
-                let _ = tx.try_send(Reply::TitleChanged(t.to_string()));
-            }
-        });
-    }
-
-    // ── Command polling (glib timeout, 8 ms) ──────────────────────────────────
-    {
-        let wv = webview.clone();
-        let ml = main_loop.clone();
-        let tx = reply_tx.clone();
-        glib::timeout_add_local(Duration::from_millis(8), move || {
-            match cmd_rx.try_recv() {
-                Ok(Cmd::Navigate(url)) => {
-                    eprintln!("[webkit] load_uri: {url}");
-                    wv.load_uri(&url);
-                }
-                Ok(Cmd::ScrollTo(y)) => {
-                    eprintln!("[webkit] scroll_to: {y}");
-                    let script = format!("window.scrollTo(0, {y})");
-                    wv.run_javascript(&script, None::<&gio::Cancellable>, |_| {});
-                    // Re-snapshot after scroll settles (~150 ms)
-                    let wv2 = wv.clone();
-                    let tx2 = tx.clone();
-                    glib::timeout_add_local(Duration::from_millis(150), move || {
-                        let title = wv2.title().map(|s| s.to_string()).unwrap_or_default();
-                        let url   = wv2.uri().map(|s| s.to_string()).unwrap_or_default();
-                        take_snapshot(&wv2, w, h, title, url, tx2.clone());
-                        glib::ControlFlow::Break
-                    });
-                }
-                Ok(Cmd::Shutdown) | Err(mpsc::TryRecvError::Disconnected) => {
-                    ml.quit();
-                    return glib::ControlFlow::Break;
-                }
-                Err(mpsc::TryRecvError::Empty) => {}
-            }
-            glib::ControlFlow::Continue
-        });
-    }
-
-    eprintln!("[webkit] entering glib main loop");
-    main_loop.run();
-    eprintln!("[webkit] glib main loop exited");
 }

@@ -273,6 +273,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         state.frame_count += 1;
         state.tick_nav_btn();
 
+        // Pump GTK/GLib events so WebKitGTK can process network responses,
+        // fire load-changed signals, and complete snapshots. No-op on stub.
+        engine.pump_gtk();
+
         // ── Events ────────────────────────────────────────────────────────────
         while let Some(ev) = input.poll_event()? {
             match ev {

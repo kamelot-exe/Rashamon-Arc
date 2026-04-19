@@ -101,7 +101,7 @@ impl Drop for ServoHost {
 }
 
 impl ContentEngine for ServoHost {
-    fn navigate(&mut self, url: &str) -> Result<(), Box<dyn std::error::Error>> {
+    fn navigate(&mut self, url: &str, _nav_id: u64) -> Result<(), Box<dyn std::error::Error>> {
         eprintln!("[servo] navigate → {url}");
         self.cache = None;
         self.url   = Some(url.to_string());

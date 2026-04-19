@@ -56,7 +56,7 @@ fn derive_title(url: &str) -> String {
 }
 
 impl ContentEngine for ServoHost {
-    fn navigate(&mut self, url: &str) -> Result<(), Box<dyn std::error::Error>> {
+    fn navigate(&mut self, url: &str, _nav_id: u64) -> Result<(), Box<dyn std::error::Error>> {
         eprintln!("[renderer] navigate -> {url}");
         self.push_url(url);
         self.events.push(EngineEvent::LoadStarted);

@@ -5,38 +5,43 @@
 //!   WebKitEngine  — Send, holds mpsc channels, implements ContentEngine.
 //!   WebKitDriver  — !Send, holds live GTK objects, must be pump()ed from main thread.
 //!
-//!   navigate() → enqueues Cmd::Navigate.
-//!   WebKitDriver::pump() drains cmd channel, calls load_uri on WebView.
-//!   GTK load-finished signal → take_snapshot → sends Reply::FrameReady.
-//!   WebKitEngine::poll_events() drains reply_rx → EngineEvents.
-//!   render_into() blits cached BGRA pixels into framebuffer.
+//! Navigation session identity:
+//!   Every navigate(url, nav_id) call stamps a nav_id on the engine side.
+//!   The driver shares an Rc<Cell<u64>> with all GTK signal closures.
+//!   When navigate() is processed, the cell is updated to the new nav_id so
+//!   every subsequent reply (FrameReady, TitleChanged, LoadFailed …) carries
+//!   the correct session token.
+//!   poll_events() drops any reply whose nav_id ≠ expected_nav_id, preventing
+//!   late replies from a superseded navigation from leaking into the shell.
 
 use crate::engine_trait::{ContentEngine, EngineEvent, EngineFrame};
 use crate::framebuffer::{Framebuffer, Pixel};
 
+use std::cell::Cell;
+use std::rc::Rc;
 use std::sync::mpsc;
 use std::time::Duration;
 
 // ── IPC types ─────────────────────────────────────────────────────────────────
 
 enum Cmd {
-    Navigate(String),
-    ScrollTo(i32),
+    Navigate(String, u64),  // (url, nav_id)
+    ScrollTo(i32),          // absolute page-Y in pixels
     Shutdown,
 }
 
 enum Reply {
     FrameReady {
+        nav_id: u64,
         pixels: Vec<u8>,
         width:  u32,
         height: u32,
         title:  String,
         url:    String,
     },
-    TitleChanged(String),
-    UrlChanged(String),
-    ContentHeight(u32),
-    LoadFailed(String),
+    TitleChanged(u64, String),
+    ContentHeight(u64, u32),
+    LoadFailed(u64, String),
 }
 
 // ── Cached frame ──────────────────────────────────────────────────────────────
@@ -50,29 +55,33 @@ struct CachedFrame {
 // ── Engine (Send) ─────────────────────────────────────────────────────────────
 
 pub struct WebKitEngine {
-    cmd_tx:   mpsc::SyncSender<Cmd>,
-    reply_rx: mpsc::Receiver<Reply>,
-    cache:    Option<CachedFrame>,
-    title:    Option<String>,
-    url:      Option<String>,
-    events:   Vec<EngineEvent>,
-    scroll_y: i32,
+    cmd_tx:          mpsc::SyncSender<Cmd>,
+    reply_rx:        mpsc::Receiver<Reply>,
+    cache:           Option<CachedFrame>,
+    title:           Option<String>,
+    url:             Option<String>,
+    events:          Vec<EngineEvent>,
+    scroll_y:        i32,
+    expected_nav_id: u64,
 }
 
 // ── Driver (!Send — main thread only) ────────────────────────────────────────
 
 pub struct WebKitDriver {
-    cmd_rx:   mpsc::Receiver<Cmd>,
-    reply_tx: mpsc::SyncSender<Reply>,
-    webview:  webkit2gtk::WebView,
-    _window:  gtk::OffscreenWindow,
-    w: u32,
-    h: u32,
+    cmd_rx:      mpsc::Receiver<Cmd>,
+    reply_tx:    mpsc::SyncSender<Reply>,
+    webview:     webkit2gtk::WebView,
+    _window:     gtk::OffscreenWindow,
+    w:           u32,
+    h:           u32,
+    /// Shared with GTK signal closures: always holds the nav_id of the most
+    /// recently dispatched Navigate command.  Signal callbacks read this when
+    /// they fire so every reply carries the correct session token.
+    nav_id_cell: Rc<Cell<u64>>,
 }
 
 impl WebKitEngine {
     /// Create engine + driver. **Must be called from the main thread.**
-    /// The caller is responsible for calling `WebKitDriver::pump()` every frame.
     pub fn create(content_w: u32, content_h: u32)
         -> Result<(Self, WebKitDriver), Box<dyn std::error::Error>>
     {
@@ -100,33 +109,61 @@ impl WebKitEngine {
         window.add(&webview);
         window.show_all();
 
-        // ── Signals ───────────────────────────────────────────────────────────
+        // nav_id_cell is shared between the driver and all signal closures.
+        let nav_id_cell: Rc<Cell<u64>> = Rc::new(Cell::new(0));
+
+        // ── load-changed: snapshot on finish, height hint on commit ──────────
         {
-            let tx = reply_tx.clone();
+            let tx        = reply_tx.clone();
+            let nav_cell  = Rc::clone(&nav_id_cell);
             let w = content_w;
             let h = content_h;
             webview.connect_load_changed(move |wv, event| {
-                if event != LoadEvent::Finished { return; }
-                let title = wv.title().map(|s| s.to_string()).unwrap_or_default();
-                let url   = wv.uri().map(|s| s.to_string()).unwrap_or_default();
-                eprintln!("[webkit] load-finished: {url:?}  title={title:?}");
-                let _ = tx.try_send(Reply::ContentHeight(8000));
-                take_snapshot(wv, w, h, title, url, tx.clone());
+                let nav_id = nav_cell.get();
+                match event {
+                    LoadEvent::Finished => {
+                        let title = wv.title().map(|s| s.to_string()).unwrap_or_default();
+                        let url   = wv.uri().map(|s| s.to_string()).unwrap_or_default();
+                        eprintln!("[webkit] load-finished nav={nav_id}: {url:?}");
+                        let _ = tx.try_send(Reply::ContentHeight(nav_id, 8000));
+                        take_snapshot(wv, w, h, nav_id, title, url, tx.clone());
+                    }
+                    _ => {}
+                }
             });
         }
+
+        // ── load-failed ───────────────────────────────────────────────────────
         {
-            let tx = reply_tx.clone();
+            let tx       = reply_tx.clone();
+            let nav_cell = Rc::clone(&nav_id_cell);
             webview.connect_load_failed(move |_wv, _event, uri, error| {
-                eprintln!("[webkit] load-failed: {uri} — {error}");
-                let _ = tx.try_send(Reply::LoadFailed(error.to_string()));
+                let nav_id = nav_cell.get();
+                let msg    = error.to_string();
+                eprintln!("[webkit] load-failed nav={nav_id}: {uri} — {msg}");
+                // WebKit fires this for internal load cancellations (caused by
+                // calling load_uri() while a previous load is in-flight).
+                // Suppress these so they don't incorrectly mark the new
+                // navigation as failed.
+                let is_cancel = msg.contains("ancelled")
+                    || msg.contains("policy change")
+                    || msg.contains("interrupted")
+                    || msg.contains("nterrupted");
+                if !is_cancel {
+                    let _ = tx.try_send(Reply::LoadFailed(nav_id, msg));
+                }
                 false
             });
         }
+
+        // ── title changed ─────────────────────────────────────────────────────
         {
-            let tx = reply_tx.clone();
+            let tx       = reply_tx.clone();
+            let nav_cell = Rc::clone(&nav_id_cell);
             webview.connect_title_notify(move |wv| {
                 if let Some(t) = wv.title() {
-                    let _ = tx.try_send(Reply::TitleChanged(t.to_string()));
+                    let nav_id = nav_cell.get();
+                    let _ = tx.try_send(Reply::TitleChanged(nav_id, t.to_string()));
                 }
             });
         }
@@ -136,20 +173,22 @@ impl WebKitEngine {
         let engine = WebKitEngine {
             cmd_tx,
             reply_rx,
-            cache:    None,
-            title:    None,
-            url:      None,
-            events:   Vec::new(),
-            scroll_y: 0,
+            cache:           None,
+            title:           None,
+            url:             None,
+            events:          Vec::new(),
+            scroll_y:        0,
+            expected_nav_id: 0,
         };
 
         let driver = WebKitDriver {
             cmd_rx,
             reply_tx,
             webview,
-            _window: window,
-            w: content_w,
-            h: content_h,
+            _window:     window,
+            w:           content_w,
+            h:           content_h,
+            nav_id_cell,
         };
 
         Ok((engine, driver))
@@ -161,22 +200,27 @@ impl Drop for WebKitEngine {
 }
 
 impl ContentEngine for WebKitEngine {
-    fn navigate(&mut self, url: &str) -> Result<(), Box<dyn std::error::Error>> {
-        eprintln!("[webkit] navigate → {url}");
+    fn navigate(&mut self, url: &str, nav_id: u64) -> Result<(), Box<dyn std::error::Error>> {
+        eprintln!("[webkit] navigate nav={nav_id} → {url}");
+        self.expected_nav_id = nav_id;
         self.cache    = None;
         self.url      = Some(url.to_string());
         self.scroll_y = 0;
         self.events.push(EngineEvent::LoadStarted);
-        self.cmd_tx.send(Cmd::Navigate(url.to_string()))
+        self.cmd_tx.send(Cmd::Navigate(url.to_string(), nav_id))
             .map_err(|e| format!("webkit channel closed: {e}"))?;
         Ok(())
     }
+
+    fn current_nav_id(&self) -> u64 { self.expected_nav_id }
 
     fn go_back(&mut self)    -> Result<(), Box<dyn std::error::Error>> { Ok(()) }
     fn go_forward(&mut self) -> Result<(), Box<dyn std::error::Error>> { Ok(()) }
 
     fn reload(&mut self) -> Result<(), Box<dyn std::error::Error>> {
-        if let Some(url) = self.url.clone() { self.navigate(&url)?; }
+        if let Some(url) = self.url.clone() {
+            self.navigate(&url, self.expected_nav_id)?;
+        }
         Ok(())
     }
 
@@ -197,7 +241,7 @@ impl ContentEngine for WebKitEngine {
         let rows  = h.min(src_h);
         let cols  = w.min(src_w);
 
-        // Cairo ARGB32 on little-endian: memory order per pixel = [B, G, R, A]
+        // Cairo ARGB32 on little-endian: memory layout = [B, G, R, A] per pixel.
         for row in 0..rows {
             for col in 0..cols {
                 let s = ((row * src_w) + col) as usize * 4;
@@ -216,7 +260,11 @@ impl ContentEngine for WebKitEngine {
     fn poll_events(&mut self) -> Vec<EngineEvent> {
         loop {
             match self.reply_rx.try_recv() {
-                Ok(Reply::FrameReady { pixels, width, height, title, url }) => {
+                Ok(Reply::FrameReady { nav_id, pixels, width, height, title, url }) => {
+                    if nav_id != self.expected_nav_id {
+                        eprintln!("[webkit] drop stale FrameReady nav={nav_id} (expected {})", self.expected_nav_id);
+                        continue;
+                    }
                     eprintln!("[webkit] Frame ready: {}×{} ({} bytes)", width, height, pixels.len());
                     self.cache = Some(CachedFrame { pixels, width, height });
                     self.title = Some(title.clone());
@@ -226,18 +274,20 @@ impl ContentEngine for WebKitEngine {
                     self.events.push(EngineEvent::LoadComplete);
                     self.events.push(EngineEvent::ContentHeightChanged(height));
                 }
-                Ok(Reply::TitleChanged(t)) => {
+                Ok(Reply::TitleChanged(nav_id, t)) => {
+                    if nav_id != self.expected_nav_id { continue; }
                     self.title = Some(t.clone());
                     self.events.push(EngineEvent::TitleChanged(t));
                 }
-                Ok(Reply::UrlChanged(u)) => {
-                    self.url = Some(u.clone());
-                    self.events.push(EngineEvent::UrlChanged(u));
-                }
-                Ok(Reply::ContentHeight(h)) => {
+                Ok(Reply::ContentHeight(nav_id, h)) => {
+                    if nav_id != self.expected_nav_id { continue; }
                     self.events.push(EngineEvent::ContentHeightChanged(h));
                 }
-                Ok(Reply::LoadFailed(r)) => {
+                Ok(Reply::LoadFailed(nav_id, r)) => {
+                    if nav_id != self.expected_nav_id {
+                        eprintln!("[webkit] drop stale LoadFailed nav={nav_id}");
+                        continue;
+                    }
                     eprintln!("[webkit] Load failed: {r}");
                     self.events.push(EngineEvent::LoadFailed(r));
                 }
@@ -254,7 +304,7 @@ impl ContentEngine for WebKitEngine {
 // ── Driver ────────────────────────────────────────────────────────────────────
 
 impl WebKitDriver {
-    /// Pump pending GTK events and dispatch queued commands to WebView.
+    /// Process pending GLib events and dispatch queued commands to WebView.
     /// **Must be called from the main thread every frame.**
     pub fn pump(&mut self) {
         use webkit2gtk::WebViewExt;
@@ -267,22 +317,27 @@ impl WebKitDriver {
         // Dispatch commands queued by WebKitEngine.
         loop {
             match self.cmd_rx.try_recv() {
-                Ok(Cmd::Navigate(url)) => {
-                    eprintln!("[webkit] load_uri: {url}");
+                Ok(Cmd::Navigate(url, nav_id)) => {
+                    eprintln!("[webkit-driver] load_uri nav={nav_id}: {url}");
+                    // Update the shared cell BEFORE calling load_uri so that
+                    // any synchronously-fired GTK signals see the new nav_id.
+                    self.nav_id_cell.set(nav_id);
                     self.webview.load_uri(&url);
                 }
                 Ok(Cmd::ScrollTo(y)) => {
-                    eprintln!("[webkit] scroll_to: {y}");
+                    eprintln!("[webkit-driver] scroll_to: {y}");
                     let script = format!("window.scrollTo(0, {y})");
                     self.webview.run_javascript(&script, None::<&gio::Cancellable>, |_| {});
-                    let wv  = self.webview.clone();
-                    let tx  = self.reply_tx.clone();
-                    let w   = self.w;
-                    let h   = self.h;
+                    let wv         = self.webview.clone();
+                    let tx         = self.reply_tx.clone();
+                    let w          = self.w;
+                    let h          = self.h;
+                    let nav_cell   = Rc::clone(&self.nav_id_cell);
                     glib::timeout_add_local(Duration::from_millis(150), move || {
-                        let title = wv.title().map(|s| s.to_string()).unwrap_or_default();
-                        let url   = wv.uri().map(|s| s.to_string()).unwrap_or_default();
-                        take_snapshot(&wv, w, h, title, url, tx.clone());
+                        let nav_id = nav_cell.get();
+                        let title  = wv.title().map(|s| s.to_string()).unwrap_or_default();
+                        let url    = wv.uri().map(|s| s.to_string()).unwrap_or_default();
+                        take_snapshot(&wv, w, h, nav_id, title, url, tx.clone());
                         glib::ControlFlow::Break
                     });
                 }
@@ -297,12 +352,13 @@ impl WebKitDriver {
 
 #[cfg(feature = "webkit")]
 fn take_snapshot(
-    wv:    &webkit2gtk::WebView,
-    w:     u32,
-    h:     u32,
-    title: String,
-    url:   String,
-    tx:    mpsc::SyncSender<Reply>,
+    wv:     &webkit2gtk::WebView,
+    w:      u32,
+    h:      u32,
+    nav_id: u64,
+    title:  String,
+    url:    String,
+    tx:     mpsc::SyncSender<Reply>,
 ) {
     use webkit2gtk::{SnapshotOptions, SnapshotRegion, WebViewExt};
     use cairo;
@@ -315,7 +371,7 @@ fn take_snapshot(
             match result {
                 Err(e) => {
                     eprintln!("[webkit] snapshot error: {e}");
-                    let _ = tx.try_send(Reply::LoadFailed(e.to_string()));
+                    let _ = tx.try_send(Reply::LoadFailed(nav_id, e.to_string()));
                 }
                 Ok(src_surface) => {
                     let mut img = match cairo::ImageSurface::create(
@@ -323,7 +379,7 @@ fn take_snapshot(
                     ) {
                         Ok(s) => s,
                         Err(e) => {
-                            let _ = tx.try_send(Reply::LoadFailed(format!("cairo create: {e:?}")));
+                            let _ = tx.try_send(Reply::LoadFailed(nav_id, format!("cairo create: {e:?}")));
                             return;
                         }
                     };
@@ -331,7 +387,7 @@ fn take_snapshot(
                         let ctx = match cairo::Context::new(&img) {
                             Ok(c) => c,
                             Err(e) => {
-                                let _ = tx.try_send(Reply::LoadFailed(format!("cairo ctx: {e:?}")));
+                                let _ = tx.try_send(Reply::LoadFailed(nav_id, format!("cairo ctx: {e:?}")));
                                 return;
                             }
                         };
@@ -346,7 +402,7 @@ fn take_snapshot(
 
                     let pixels: Vec<u8> = match img.data() {
                         Err(e) => {
-                            let _ = tx.try_send(Reply::LoadFailed(format!("cairo borrow: {e:?}")));
+                            let _ = tx.try_send(Reply::LoadFailed(nav_id, format!("cairo borrow: {e:?}")));
                             return;
                         }
                         Ok(data) => {
@@ -368,8 +424,10 @@ fn take_snapshot(
                         }
                     };
 
-                    eprintln!("[webkit] sending frame: {} bytes", pixels.len());
-                    let _ = tx.try_send(Reply::FrameReady { pixels, width: sw, height: sh, title, url });
+                    eprintln!("[webkit] sending frame nav={nav_id}: {} bytes", pixels.len());
+                    let _ = tx.try_send(Reply::FrameReady {
+                        nav_id, pixels, width: sw, height: sh, title, url,
+                    });
                 }
             }
         },

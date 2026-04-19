@@ -59,7 +59,8 @@ fn omnibox_navigate(
     match resolve(raw, bm_iter, hist_iter, &DEFAULT_PROVIDER) {
         OmniboxResult::Navigate(url) => {
             if let Some(url) = state.begin_navigate(&url) {
-                engine.navigate(&url).ok();
+                let nav_id = state.active_tab().map_or(0, |t| t.nav_id);
+                engine.navigate(&url, nav_id).ok();
             }
         }
         OmniboxResult::OpenOverlay(InternalRoute::History)   => {
@@ -257,7 +258,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         };
         if let Some(url) = nav_url {
             if let Some(url) = state.begin_navigate(&url) {
-                engine.navigate(&url).ok();
+                let nav_id = state.active_tab().map_or(0, |t| t.nav_id);
+                engine.navigate(&url, nav_id).ok();
                 // Text-fetch fallback only when no real engine is active
                 if !engine.is_real_engine() {
                     pending_fetch = Some(spawn_fetch(state.active_tab_id, url));
@@ -398,7 +400,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
 
         // ── Engine events — sync title/url/load state from WebKit/Servo ──────
+        let engine_nav_id = engine.current_nav_id();
         for ev in engine.poll_events() {
+            let active_nav_id = state.active_tab().map_or(0, |t| t.nav_id);
+            if engine_nav_id != 0 && active_nav_id != engine_nav_id { continue; }
             match ev {
                 EngineEvent::TitleChanged(t) => {
                     if let Some(tab) = state.active_tab_mut() { tab.title = t; }
@@ -490,7 +495,8 @@ fn on_key(
             input::Key::Enter  => {
                 if let Some(url) = state.activate_overlay_item() {
                     if let Some(url) = state.begin_navigate(&url) {
-                        engine.navigate(&url).ok();
+                        let nav_id = state.active_tab().map_or(0, |t| t.nav_id);
+                        engine.navigate(&url, nav_id).ok();
                     }
                 }
                 return Ok(());
@@ -530,14 +536,24 @@ fn on_key(
         input::Key::Char('w') if input.is_ctrl_pressed() => {
             let id = state.active_tab_id;
             state.close_tab(id);
-            if let Some(url) = state.active_tab().map(|t| t.url.clone()).filter(|u| !u.is_empty()) {
-                engine.navigate(&url).ok();
+            if engine.is_real_engine() {
+                if let Some(url) = state.active_tab().map(|t| t.url.clone()).filter(|u| !u.is_empty()) {
+                    if let Some(url) = state.begin_navigate(&url) {
+                        let nav_id = state.active_tab().map_or(0, |t| t.nav_id);
+                        engine.navigate(&url, nav_id).ok();
+                    }
+                }
+            } else if let Some(url) = state.active_tab().map(|t| t.url.clone()).filter(|u| !u.is_empty()) {
+                engine.navigate(&url, 0).ok();
             }
         }
 
         input::Key::Char('r') if input.is_ctrl_pressed() => {
             state.press_nav_btn(3);
-            if let Some(url) = state.reload() { engine.navigate(&url).ok(); }
+            if let Some(url) = state.reload() {
+                let nav_id = state.active_tab().map_or(0, |t| t.nav_id);
+                engine.navigate(&url, nav_id).ok();
+            }
         }
 
         input::Key::Char('h') if input.is_ctrl_pressed() => {
@@ -617,26 +633,25 @@ fn click_tab_bar(state: &mut BrowserState, engine: &mut RenderEngine, x: u32) {
                 if engine.is_real_engine() {
                     if let Some(url) = state.active_tab().map(|t| t.url.clone()).filter(|u| !u.is_empty()) {
                         if let Some(url) = state.begin_navigate(&url) {
-                            engine.navigate(&url).ok();
+                            let nav_id = state.active_tab().map_or(0, |t| t.nav_id);
+                            engine.navigate(&url, nav_id).ok();
                         }
                     }
                 } else if let Some(url) = state.active_tab().map(|t| t.url.clone()).filter(|u| !u.is_empty()) {
-                    engine.navigate(&url).ok();
+                    engine.navigate(&url, 0).ok();
                 }
             } else if id != state.active_tab_id {
                 // Switch to another tab: activate, then re-navigate the single WebView.
                 state.activate_tab(id);
                 if engine.is_real_engine() {
                     if let Some(url) = state.active_tab().map(|t| t.url.clone()).filter(|u| !u.is_empty()) {
-                        // Go through begin_navigate so the state machine (Loading →
-                        // Loaded) runs correctly and resolve_engine_loading commits the
-                        // page into history.
                         if let Some(url) = state.begin_navigate(&url) {
-                            engine.navigate(&url).ok();
+                            let nav_id = state.active_tab().map_or(0, |t| t.nav_id);
+                            engine.navigate(&url, nav_id).ok();
                         }
                     }
                 } else if let Some(url) = state.active_tab().map(|t| t.url.clone()).filter(|u| !u.is_empty()) {
-                    engine.navigate(&url).ok();
+                    engine.navigate(&url, 0).ok();
                 }
             }
             return;
@@ -654,17 +669,26 @@ fn click_chrome_bar(state: &mut BrowserState, engine: &mut RenderEngine, x: u32,
     let btn_r: u32 = 16;
     if x >= 12 && x < 12 + btn_r * 2 {
         state.press_nav_btn(1);
-        if let Some(url) = state.go_back() { engine.navigate(&url).ok(); }
+        if let Some(url) = state.go_back() {
+            let nav_id = state.active_tab().map_or(0, |t| t.nav_id);
+            engine.navigate(&url, nav_id).ok();
+        }
         return;
     }
     if x >= 54 && x < 54 + btn_r * 2 {
         state.press_nav_btn(2);
-        if let Some(url) = state.go_forward() { engine.navigate(&url).ok(); }
+        if let Some(url) = state.go_forward() {
+            let nav_id = state.active_tab().map_or(0, |t| t.nav_id);
+            engine.navigate(&url, nav_id).ok();
+        }
         return;
     }
     if x >= 96 && x < 96 + btn_r * 2 {
         state.press_nav_btn(3);
-        if let Some(url) = state.reload() { engine.navigate(&url).ok(); }
+        if let Some(url) = state.reload() {
+            let nav_id = state.active_tab().map_or(0, |t| t.nav_id);
+            engine.navigate(&url, nav_id).ok();
+        }
         return;
     }
     let bar_x = (FB_WIDTH - ADDR_BAR_W) / 2;
@@ -686,7 +710,8 @@ fn click_chrome_bar(state: &mut BrowserState, engine: &mut RenderEngine, x: u32,
 fn click_overlay(state: &mut BrowserState, engine: &mut RenderEngine) {
     if let Some(url) = state.activate_overlay_item() {
         if let Some(url) = state.begin_navigate(&url) {
-            engine.navigate(&url).ok();
+            let nav_id = state.active_tab().map_or(0, |t| t.nav_id);
+            engine.navigate(&url, nav_id).ok();
         }
     }
 }
@@ -696,7 +721,10 @@ fn click_content(state: &mut BrowserState, engine: &mut RenderEngine, x: u32, y:
         Some(PageState::Error(_)) => {
             let (bx, by) = layout::retry_btn_pos();
             if x >= bx && x < bx + RETRY_BTN_W && y >= by && y < by + RETRY_BTN_H {
-                if let Some(url) = state.reload() { engine.navigate(&url).ok(); }
+                if let Some(url) = state.reload() {
+                    let nav_id = state.active_tab().map_or(0, |t| t.nav_id);
+                    engine.navigate(&url, nav_id).ok();
+                }
                 return;
             }
         }
@@ -718,7 +746,10 @@ fn click_content(state: &mut BrowserState, engine: &mut RenderEngine, x: u32, y:
                 let urls: Vec<String> = state.bookmarks.iter().take(6).map(|b| b.url.clone()).collect();
                 for url in urls {
                     if x >= lx && x < lx + QUICK_LINK_W && y >= ly && y < ly + QUICK_LINK_H {
-                        if let Some(url) = state.begin_navigate(&url) { engine.navigate(&url).ok(); }
+                        if let Some(url) = state.begin_navigate(&url) {
+                            let nav_id = state.active_tab().map_or(0, |t| t.nav_id);
+                            engine.navigate(&url, nav_id).ok();
+                        }
                         return;
                     }
                     lx += QUICK_LINK_W + QUICK_LINK_GAP;

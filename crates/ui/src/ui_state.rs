@@ -3,9 +3,14 @@
 use crate::layout::{self, *};
 use crate::page::PageNode;
 use crate::theme::{get_theme, ColorPalette, Theme};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
-static NEXT_ID: AtomicUsize = AtomicUsize::new(1);
+static NEXT_ID:     AtomicUsize = AtomicUsize::new(1);
+static NEXT_NAV_ID: AtomicU64  = AtomicU64::new(1);
+
+fn next_nav_id() -> u64 {
+    NEXT_NAV_ID.fetch_add(1, Ordering::Relaxed)
+}
 
 // ── TabId ─────────────────────────────────────────────────────────────────────
 
@@ -177,6 +182,10 @@ pub struct TabState {
     pub nav_result:         NavResult,
     pub scroll_y:           u32,
     pub content_height:     u32,
+    /// Monotonically-increasing token minted by every navigation action
+    /// (begin_navigate, go_back, go_forward, reload).  Engine events are
+    /// compared against this before being applied to the tab.
+    pub nav_id:             u64,
 }
 
 impl TabState {
@@ -200,6 +209,7 @@ impl TabState {
             nav_result:         NavResult::WillLoad,
             scroll_y:           0,
             content_height:     0,
+            nav_id:             0,
         }
     }
 
@@ -620,6 +630,7 @@ impl BrowserState {
             tab.nav_result       = result;
             tab.scroll_y         = 0;
             tab.content_height   = 0;
+            tab.nav_id           = next_nav_id();
         }
         self.address_bar_input   = url.clone();
         self.address_bar_focused = false;
@@ -729,6 +740,7 @@ impl BrowserState {
         tab.page_state       = PageState::Loading;
         tab.load_start_frame = frame;
         tab.nav_result       = NavResult::WillLoad;
+        tab.nav_id           = next_nav_id();
         self.address_bar_input = entry.url.clone();
         self.update_bookmark_flag();
         self.dirty.all();
@@ -752,6 +764,7 @@ impl BrowserState {
         tab.page_state       = PageState::Loading;
         tab.load_start_frame = frame;
         tab.nav_result       = NavResult::WillLoad;
+        tab.nav_id           = next_nav_id();
         self.address_bar_input = entry.url.clone();
         self.update_bookmark_flag();
         self.dirty.all();
@@ -770,6 +783,7 @@ impl BrowserState {
             tab.nav_result       = result;
             tab.scroll_y         = 0;
             tab.content_height   = 0;
+            tab.nav_id           = next_nav_id();
         }
         self.dirty.all();
         Some(url)

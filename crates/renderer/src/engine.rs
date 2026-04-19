@@ -2,11 +2,13 @@
 //!
 //! Selection order (highest priority first):
 //!   1. ServoHost     (feature = "servo")   — Servo engine
-//!   2. WebKitEngine  (feature = "webkit")  — WebKitGTK 2.50+, default real engine
-//!   3. ServoHost stub (always available)   — text-renderer fallback
+//!   2. WebKitEngine  (feature = "webkit")  — WebKitGTK 2.50+
+//!   3. ServoHost stub                      — text-renderer fallback
 //!
-//! GTK note: when WebKit is active, RenderEngine owns a WebKitDriver.
-//! Call `pump_gtk()` once per frame from the main thread so GTK events are processed.
+//! Navigation session identity:
+//!   RenderEngine::navigate(url, nav_id) stores the nav_id locally and
+//!   forwards it to the inner engine. Call current_nav_id() to retrieve the
+//!   most-recently-dispatched token for shell-side event guards.
 
 use crate::engine_trait::{ContentEngine, EngineEvent, EngineFrame};
 use crate::framebuffer::Framebuffer;
@@ -23,15 +25,15 @@ use crate::servo_embedder::ServoHost;
 /// Top-level rendering handle owned by the browser shell.
 /// Must remain on the main thread when WebKit is active.
 pub struct RenderEngine {
-    inner:       Box<dyn ContentEngine>,
-    real_engine: bool,
+    inner:           Box<dyn ContentEngine>,
+    real_engine:     bool,
+    current_nav_id:  u64,
     #[cfg(feature = "webkit")]
-    driver:      Option<WebKitDriver>,
+    driver:          Option<WebKitDriver>,
 }
 
 impl RenderEngine {
     pub fn new(content_w: u32, content_h: u32) -> Result<Self, Box<dyn std::error::Error>> {
-        // Servo takes priority when built.
         #[cfg(feature = "servo")]
         match ServoHost::new(content_w, content_h) {
             Ok(sh) => {
@@ -39,6 +41,7 @@ impl RenderEngine {
                 return Ok(Self {
                     inner: Box::new(sh),
                     real_engine: true,
+                    current_nav_id: 0,
                     #[cfg(feature = "webkit")]
                     driver: None,
                 });
@@ -46,27 +49,27 @@ impl RenderEngine {
             Err(e) => eprintln!("[renderer] Servo init failed ({e}), falling back"),
         }
 
-        // WebKitGTK — real rendering. GTK is initialised here (main thread).
         #[cfg(feature = "webkit")]
         match WebKitEngine::create(content_w, content_h) {
             Ok((wk, driver)) => {
                 eprintln!("[renderer] Using WebKitGTK engine");
                 return Ok(Self {
-                    inner:       Box::new(wk),
-                    real_engine: true,
-                    driver:      Some(driver),
+                    inner:          Box::new(wk),
+                    real_engine:    true,
+                    current_nav_id: 0,
+                    driver:         Some(driver),
                 });
             }
             Err(e) => eprintln!("[renderer] WebKit init failed ({e}), falling back to stub"),
         }
 
-        // Stub fallback: text renderer handles content.
         eprintln!("[renderer] Using stub engine (text renderer active)");
         Ok(Self {
-            inner:       Box::new(ServoHost::new()?),
-            real_engine: false,
+            inner:          Box::new(ServoHost::new()?),
+            real_engine:    false,
+            current_nav_id: 0,
             #[cfg(feature = "webkit")]
-            driver:      None,
+            driver:         None,
         })
     }
 
@@ -79,9 +82,13 @@ impl RenderEngine {
         }
     }
 
-    pub fn navigate(&mut self, url: &str) -> Result<(), Box<dyn std::error::Error>> {
-        self.inner.navigate(url)
+    pub fn navigate(&mut self, url: &str, nav_id: u64) -> Result<(), Box<dyn std::error::Error>> {
+        self.current_nav_id = nav_id;
+        self.inner.navigate(url, nav_id)
     }
+
+    /// The `nav_id` of the most recently dispatched navigation.
+    pub fn current_nav_id(&self) -> u64 { self.current_nav_id }
 
     pub fn go_back(&mut self)    -> Result<(), Box<dyn std::error::Error>> { self.inner.go_back() }
     pub fn go_forward(&mut self) -> Result<(), Box<dyn std::error::Error>> { self.inner.go_forward() }
@@ -104,6 +111,5 @@ impl RenderEngine {
     pub fn title(&self)       -> Option<String> { self.inner.title() }
     pub fn current_url(&self) -> Option<String> { self.inner.current_url() }
 
-    /// True when a real rendering engine (Servo or WebKit) is active.
     pub fn is_real_engine(&self) -> bool { self.real_engine }
 }

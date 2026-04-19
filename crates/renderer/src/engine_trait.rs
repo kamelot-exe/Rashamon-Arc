@@ -1,7 +1,4 @@
 //! ContentEngine — stable interface every rendering backend must implement.
-//!
-//! The browser shell calls only these methods. Servo, WPE, or the text fallback
-//! all implement the same surface. Switching engines needs no changes in main.rs.
 
 use crate::framebuffer::Framebuffer;
 
@@ -30,9 +27,18 @@ pub enum EngineFrame {
 
 /// Stable contract every content engine must satisfy.
 pub trait ContentEngine: Send {
-    /// Navigate to an absolute URL. Triggers a load; engine will emit
-    /// `LoadStarted` then `LoadComplete` / `LoadFailed` via `poll_events`.
-    fn navigate(&mut self, url: &str) -> Result<(), Box<dyn std::error::Error>>;
+    /// Navigate to an absolute URL.
+    ///
+    /// `nav_id` is a monotonically-increasing session token minted by
+    /// `BrowserState` for every navigation (begin_navigate / go_back /
+    /// go_forward / reload).  The engine tags every asynchronous reply with
+    /// this token; replies whose token differs from the most recently accepted
+    /// one are silently discarded before they become `EngineEvent`s.
+    fn navigate(&mut self, url: &str, nav_id: u64) -> Result<(), Box<dyn std::error::Error>>;
+
+    /// The `nav_id` passed to the most recent `navigate()` call, or 0.
+    /// The shell uses this to guard event application against stale sessions.
+    fn current_nav_id(&self) -> u64 { 0 }
 
     fn go_back(&mut self)    -> Result<(), Box<dyn std::error::Error>>;
     fn go_forward(&mut self) -> Result<(), Box<dyn std::error::Error>>;
@@ -42,10 +48,6 @@ pub trait ContentEngine: Send {
     fn scroll(&mut self, delta_y: i32);
 
     /// Composite the current page into `fb` at the given content rectangle.
-    ///
-    /// Returns `EngineFrame::Ready` when real pixels were written so the caller
-    /// can skip its own renderer.  Returns `NotReady` when the engine has
-    /// nothing to show yet (new tab, still loading, or stub mode).
     fn render_into(
         &mut self,
         fb:  &mut Framebuffer,

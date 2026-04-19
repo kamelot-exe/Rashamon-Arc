@@ -71,6 +71,9 @@ fn omnibox_navigate(
         }
         OmniboxResult::OpenOverlay(InternalRoute::Blank) => {
             state.open_new_tab();
+            let id = state.active_tab_id;
+            engine.create_tab(id.raw(), false);
+            engine.set_active_tab(id.raw());
         }
         OmniboxResult::Nothing => {
             state.cancel_address_bar_edit();
@@ -245,6 +248,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut display = display::Display::new(&video, win_w, win_h, FB_WIDTH, FB_HEIGHT)?;
     let mut input   = input::InputHandler::new(event_pump)?;
 
+    // Register the initial tab with the engine so it gets its own WebView.
+    {
+        let id         = state.active_tab_id;
+        let is_private = state.active_tab().map_or(false, |t| t.is_private);
+        engine.create_tab(id.raw(), is_private);
+        engine.set_active_tab(id.raw());
+    }
+
     let mut pending_fetch:    Option<PendingFetch>          = None;
     let mut buffered_outcome: Option<(TabId, FetchOutcome)> = None;
     let mut save_dirty = SaveDirty::default();
@@ -399,33 +410,49 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
 
-        // ── Engine events — sync title/url/load state from WebKit/Servo ──────
-        let engine_nav_id = engine.current_nav_id();
-        for ev in engine.poll_events() {
-            let active_nav_id = state.active_tab().map_or(0, |t| t.nav_id);
-            if engine_nav_id != 0 && active_nav_id != engine_nav_id { continue; }
+        // ── Engine events — routed to the owning tab by tab_id ───────────────
+        for (tab_id, ev) in engine.poll_events() {
+            // tab_id == 0 means "active tab" (stub / text-renderer path).
+            let target_raw: u64 = if tab_id == 0 {
+                state.active_tab_id.raw()
+            } else {
+                tab_id
+            };
+            let is_active = target_raw == state.active_tab_id.raw();
+
             match ev {
                 EngineEvent::TitleChanged(t) => {
-                    if let Some(tab) = state.active_tab_mut() { tab.title = t; }
-                    state.dirty.chrome = true;
+                    if let Some(tab) = state.tabs.iter_mut()
+                        .find(|t| t.id.raw() == target_raw)
+                    { tab.title = t; }
+                    if is_active { state.dirty.chrome = true; }
+                    else { state.dirty.tabs = true; }
                 }
                 EngineEvent::UrlChanged(u) => {
-                    // WebKit reports the real URL (after redirects).
-                    if let Some(tab) = state.active_tab_mut() { tab.url = u.clone(); }
-                    if !state.address_bar_focused {
-                        state.address_bar_input = u;
+                    if let Some(tab) = state.tabs.iter_mut()
+                        .find(|t| t.id.raw() == target_raw)
+                    { tab.url = u.clone(); }
+                    if is_active {
+                        if !state.address_bar_focused {
+                            state.address_bar_input = u;
+                        }
+                        state.dirty.chrome = true;
                     }
-                    state.dirty.chrome = true;
                 }
                 EngineEvent::LoadComplete => {
-                    state.resolve_engine_loading();
-                    // Sync address bar to the final URL reported by the engine.
-                    if !state.address_bar_focused { state.sync_address_bar(); }
-                    state.dirty.content = true;
-                    save_dirty.history  = true;
+                    state.resolve_engine_loading_for(target_raw);
+                    if is_active {
+                        if !state.address_bar_focused { state.sync_address_bar(); }
+                        state.dirty.content = true;
+                        save_dirty.history  = true;
+                    }
                 }
-                EngineEvent::LoadFailed(reason) => { state.fail_loading(&reason); }
-                EngineEvent::ContentHeightChanged(h) => { state.set_content_height(h); }
+                EngineEvent::LoadFailed(reason) => {
+                    state.fail_loading_for(target_raw, &reason);
+                }
+                EngineEvent::ContentHeightChanged(h) => {
+                    state.set_content_height_for(target_raw, h);
+                }
                 EngineEvent::LoadStarted => {}
             }
         }
@@ -525,24 +552,34 @@ fn on_key(
             save_dirty.prefs = true;
         }
 
-        input::Key::Char('t') if input.is_ctrl_pressed() => state.open_new_tab(),
+        input::Key::Char('t') if input.is_ctrl_pressed() => {
+            state.open_new_tab();
+            let id = state.active_tab_id;
+            engine.create_tab(id.raw(), false);
+            engine.set_active_tab(id.raw());
+        }
 
         input::Key::Char('n') if input.is_ctrl_pressed() && input.is_shift_pressed() => {
             state.open_private_tab();
+            let id = state.active_tab_id;
+            engine.create_tab(id.raw(), true);
+            engine.set_active_tab(id.raw());
         }
 
-        input::Key::Char('i') if input.is_ctrl_pressed() => state.open_private_tab(),
+        input::Key::Char('i') if input.is_ctrl_pressed() => {
+            state.open_private_tab();
+            let id = state.active_tab_id;
+            engine.create_tab(id.raw(), true);
+            engine.set_active_tab(id.raw());
+        }
 
         input::Key::Char('w') if input.is_ctrl_pressed() => {
-            let id = state.active_tab_id;
-            state.close_tab(id);
+            let old_id = state.active_tab_id;
+            engine.close_tab(old_id.raw());
+            state.close_tab(old_id);
+            // Switch to newly-active tab (no reload needed — it keeps its WebView).
             if engine.is_real_engine() {
-                if let Some(url) = state.active_tab().map(|t| t.url.clone()).filter(|u| !u.is_empty()) {
-                    if let Some(url) = state.begin_navigate(&url) {
-                        let nav_id = state.active_tab().map_or(0, |t| t.nav_id);
-                        engine.navigate(&url, nav_id).ok();
-                    }
-                }
+                engine.set_active_tab(state.active_tab_id.raw());
             } else if let Some(url) = state.active_tab().map(|t| t.url.clone()).filter(|u| !u.is_empty()) {
                 engine.navigate(&url, 0).ok();
             }
@@ -628,29 +665,28 @@ fn click_tab_bar(state: &mut BrowserState, engine: &mut RenderEngine, x: u32) {
         if x >= lx && x < rx {
             let id = state.tabs[i].id;
             if x >= lx + tw.saturating_sub(18) {
-                // Close button: close tab, re-navigate engine to new active tab.
+                // ── Close tab ─────────────────────────────────────────────────
+                // Destroy the WebView first, then update shell state, then
+                // activate the new tab's existing WebView (no reload).
+                engine.close_tab(id.raw());
                 state.close_tab(id);
                 if engine.is_real_engine() {
-                    if let Some(url) = state.active_tab().map(|t| t.url.clone()).filter(|u| !u.is_empty()) {
-                        if let Some(url) = state.begin_navigate(&url) {
-                            let nav_id = state.active_tab().map_or(0, |t| t.nav_id);
-                            engine.navigate(&url, nav_id).ok();
-                        }
-                    }
-                } else if let Some(url) = state.active_tab().map(|t| t.url.clone()).filter(|u| !u.is_empty()) {
+                    engine.set_active_tab(state.active_tab_id.raw());
+                } else if let Some(url) = state.active_tab()
+                    .map(|t| t.url.clone()).filter(|u| !u.is_empty())
+                {
                     engine.navigate(&url, 0).ok();
                 }
             } else if id != state.active_tab_id {
-                // Switch to another tab: activate, then re-navigate the single WebView.
+                // ── Switch tab — no reload ────────────────────────────────────
                 state.activate_tab(id);
                 if engine.is_real_engine() {
-                    if let Some(url) = state.active_tab().map(|t| t.url.clone()).filter(|u| !u.is_empty()) {
-                        if let Some(url) = state.begin_navigate(&url) {
-                            let nav_id = state.active_tab().map_or(0, |t| t.nav_id);
-                            engine.navigate(&url, nav_id).ok();
-                        }
-                    }
-                } else if let Some(url) = state.active_tab().map(|t| t.url.clone()).filter(|u| !u.is_empty()) {
+                    // set_active_tab triggers a fresh snapshot; the WebView
+                    // already has its page loaded and scroll position intact.
+                    engine.set_active_tab(id.raw());
+                } else if let Some(url) = state.active_tab()
+                    .map(|t| t.url.clone()).filter(|u| !u.is_empty())
+                {
                     engine.navigate(&url, 0).ok();
                 }
             }
@@ -660,6 +696,9 @@ fn click_tab_bar(state: &mut BrowserState, engine: &mut RenderEngine, x: u32) {
     let next_x = TAB_START_X + state.tabs.len() as u32 * (tw + TAB_SEP);
     if x >= next_x && x < next_x + TAB_NEW_BTN_W {
         state.open_new_tab();
+        let id = state.active_tab_id;
+        engine.create_tab(id.raw(), false);
+        engine.set_active_tab(id.raw());
     }
 }
 

@@ -19,6 +19,8 @@ pub struct TabId(usize);
 
 impl TabId {
     fn next() -> Self { Self(NEXT_ID.fetch_add(1, Ordering::Relaxed)) }
+    /// Raw integer — used to key engine-side per-tab state.
+    pub fn raw(self) -> u64 { self.0 as u64 }
 }
 
 // ── PageState ─────────────────────────────────────────────────────────────────
@@ -719,6 +721,54 @@ impl BrowserState {
             if tab.page_state.is_loading() {
                 tab.page_state = PageState::Error(message.to_string());
                 self.dirty.all();
+            }
+        }
+    }
+
+    // ── Tab-targeted variants (used by per-tab event routing) ─────────────────
+
+    /// Like `resolve_engine_loading` but targets any tab by raw id.
+    /// Emits dirty flags only for the active tab to avoid spurious redraws.
+    pub fn resolve_engine_loading_for(&mut self, tab_id: u64) {
+        let pos = self.tabs.iter().position(|t| t.id.raw() == tab_id);
+        let Some(pos) = pos else { return };
+
+        let tab = &self.tabs[pos];
+        if !tab.page_state.is_loading() { return; }
+        let url        = tab.url.clone();
+        let is_private = tab.is_private;
+        let title = if tab.title.is_empty() {
+            derive_title(&url).to_string()
+        } else {
+            tab.title.clone()
+        };
+
+        let tab = &mut self.tabs[pos];
+        tab.title      = title.clone();
+        tab.page_state = PageState::Loaded;
+        tab.scroll_y   = 0;
+        tab.commit(&url, &title, None, vec![], None, None);
+
+        if !is_private {
+            self.record_visit(&url, &title);
+        }
+        self.dirty.all();
+    }
+
+    pub fn fail_loading_for(&mut self, tab_id: u64, message: &str) {
+        if let Some(tab) = self.tabs.iter_mut().find(|t| t.id.raw() == tab_id) {
+            if tab.page_state.is_loading() {
+                tab.page_state = PageState::Error(message.to_string());
+                self.dirty.all();
+            }
+        }
+    }
+
+    pub fn set_content_height_for(&mut self, tab_id: u64, h: u32) {
+        if let Some(tab) = self.tabs.iter_mut().find(|t| t.id.raw() == tab_id) {
+            tab.content_height = h;
+            if let Some(entry) = tab.history.get_mut(tab.history_index) {
+                entry.content_height = h;
             }
         }
     }

@@ -157,7 +157,7 @@ impl ContentEngine for ServoHost {
         Ok(EngineFrame::Ready)
     }
 
-    fn poll_events(&mut self) -> Vec<EngineEvent> {
+    fn poll_events(&mut self) -> Vec<(u64, EngineEvent)> {
         loop {
             match self.reply_rx.try_recv() {
                 Ok(ServoReply::FrameReady(frame)) => {
@@ -189,6 +189,9 @@ impl ContentEngine for ServoHost {
             }
         }
         std::mem::take(&mut self.events)
+            .into_iter()
+            .map(|ev| (0u64, ev))
+            .collect()
     }
 
     fn title(&self)       -> Option<String> { self.title.clone() }

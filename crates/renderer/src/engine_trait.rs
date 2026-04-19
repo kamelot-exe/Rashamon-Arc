@@ -4,6 +4,8 @@ use crate::framebuffer::Framebuffer;
 
 /// Events the engine pushes up to the browser shell.
 /// Drained once per frame via `ContentEngine::poll_events`.
+/// Each event is tagged with the `tab_id` of the WebView that produced it.
+/// A `tab_id` of 0 means "active tab" (used by single-view stubs).
 #[derive(Debug, Clone)]
 pub enum EngineEvent {
     TitleChanged(String),
@@ -27,27 +29,35 @@ pub enum EngineFrame {
 
 /// Stable contract every content engine must satisfy.
 pub trait ContentEngine: Send {
-    /// Navigate to an absolute URL.
+    // ── Tab lifecycle (default no-ops for single-view stubs) ──────────────────
+
+    /// Create a new WebView for `tab_id`.  Private tabs get an ephemeral context.
+    fn create_tab(&mut self, _tab_id: u64, _is_private: bool) {}
+
+    /// Destroy the WebView for `tab_id` and release its resources.
+    fn close_tab(&mut self, _tab_id: u64) {}
+
+    /// Mark `tab_id` as the active tab and request a fresh snapshot.
+    /// For per-tab engines this does NOT trigger a page reload.
+    fn set_active_tab(&mut self, _tab_id: u64) {}
+
+    // ── Navigation (operate on the currently active tab) ──────────────────────
+
+    /// Navigate the active tab's WebView to `url`.
     ///
     /// `nav_id` is a monotonically-increasing session token minted by
-    /// `BrowserState` for every navigation (begin_navigate / go_back /
-    /// go_forward / reload).  The engine tags every asynchronous reply with
-    /// this token; replies whose token differs from the most recently accepted
-    /// one are silently discarded before they become `EngineEvent`s.
+    /// `BrowserState`; the engine tags every async reply with it so that
+    /// stale replies are discarded before becoming `EngineEvent`s.
     fn navigate(&mut self, url: &str, nav_id: u64) -> Result<(), Box<dyn std::error::Error>>;
-
-    /// The `nav_id` passed to the most recent `navigate()` call, or 0.
-    /// The shell uses this to guard event application against stale sessions.
-    fn current_nav_id(&self) -> u64 { 0 }
 
     fn go_back(&mut self)    -> Result<(), Box<dyn std::error::Error>>;
     fn go_forward(&mut self) -> Result<(), Box<dyn std::error::Error>>;
     fn reload(&mut self)     -> Result<(), Box<dyn std::error::Error>>;
 
-    /// Scroll the viewport by `delta_y` pixels (positive = scroll down).
+    /// Scroll the active tab's viewport by `delta_y` pixels (positive = down).
     fn scroll(&mut self, delta_y: i32);
 
-    /// Composite the current page into `fb` at the given content rectangle.
+    /// Composite the active tab's current page into `fb` at the content rect.
     fn render_into(
         &mut self,
         fb:  &mut Framebuffer,
@@ -57,9 +67,13 @@ pub trait ContentEngine: Send {
         h:   u32,
     ) -> Result<EngineFrame, Box<dyn std::error::Error>>;
 
-    /// Drain queued events produced since the last call. Call once per frame.
-    fn poll_events(&mut self) -> Vec<EngineEvent>;
+    /// Drain queued `(tab_id, event)` pairs produced since the last call.
+    /// `tab_id == 0` means "the active tab" — stubs always emit 0.
+    fn poll_events(&mut self) -> Vec<(u64, EngineEvent)>;
 
     fn title(&self)       -> Option<String>;
     fn current_url(&self) -> Option<String>;
+
+    /// The `nav_id` of the most recent `navigate()` for the active tab, or 0.
+    fn current_nav_id(&self) -> u64 { 0 }
 }

@@ -44,8 +44,8 @@ enum Cmd {
     SwitchTab  { tab_id: u64 },
     /// Load a URL in the specified tab's WebView.
     Navigate   { tab_id: u64, url: String, nav_id: u64 },
-    /// Scroll and re-snapshot the specified tab.
-    ScrollTo   { tab_id: u64, y: i32 },
+    /// Scroll by delta pixels and re-snapshot the specified tab.
+    ScrollBy   { tab_id: u64, delta: i32 },
     Shutdown,
 }
 
@@ -84,7 +84,6 @@ pub struct WebKitEngine {
     active_tab_id:  u64,
     tab_states:     HashMap<u64, PerTabState>,
     pending_events: Vec<(u64, EngineEvent)>,
-    scroll_y:       i32,
 }
 
 // ── WebKitDriver (!Send — main thread only) ───────────────────────────────────
@@ -124,7 +123,6 @@ impl WebKitEngine {
             active_tab_id:  0,
             tab_states:     HashMap::new(),
             pending_events: Vec::new(),
-            scroll_y:       0,
         };
 
         let driver = WebKitDriver {
@@ -161,7 +159,6 @@ impl ContentEngine for WebKitEngine {
     fn set_active_tab(&mut self, tab_id: u64) {
         eprintln!("[webkit] set_active_tab {tab_id}");
         self.active_tab_id = tab_id;
-        self.scroll_y = 0;
         // Request a fresh snapshot — the WebView already has its page loaded.
         let _ = self.cmd_tx.try_send(Cmd::SwitchTab { tab_id });
     }
@@ -173,7 +170,6 @@ impl ContentEngine for WebKitEngine {
         state.expected_nav_id = nav_id;
         state.cache           = None;
         state.url             = Some(url.to_string());
-        self.scroll_y = 0;
         self.pending_events.push((tab_id, EngineEvent::LoadStarted));
         self.cmd_tx.send(Cmd::Navigate { tab_id, url: url.to_string(), nav_id })
             .map_err(|e| format!("webkit cmd channel closed: {e}"))?;
@@ -201,9 +197,8 @@ impl ContentEngine for WebKitEngine {
     }
 
     fn scroll(&mut self, delta_y: i32) {
-        self.scroll_y = (self.scroll_y + delta_y).max(0);
         let tab_id = self.active_tab_id;
-        let _ = self.cmd_tx.try_send(Cmd::ScrollTo { tab_id, y: self.scroll_y });
+        let _ = self.cmd_tx.try_send(Cmd::ScrollBy { tab_id, delta: delta_y });
     }
 
     fn render_into(
@@ -258,7 +253,6 @@ impl ContentEngine for WebKitEngine {
                     self.pending_events.push((tab_id, EngineEvent::TitleChanged(title)));
                     self.pending_events.push((tab_id, EngineEvent::UrlChanged(url)));
                     self.pending_events.push((tab_id, EngineEvent::LoadComplete));
-                    self.pending_events.push((tab_id, EngineEvent::ContentHeightChanged(height)));
                 }
                 Ok(Reply::TitleChanged { tab_id, nav_id, title }) => {
                     let state = self.tab_states.entry(tab_id).or_insert_with(PerTabState::default);
@@ -355,19 +349,19 @@ impl WebKitDriver {
                     }
                 }
 
-                Ok(Cmd::ScrollTo { tab_id, y }) => {
+                Ok(Cmd::ScrollBy { tab_id, delta }) => {
                     if let Some(entry) = self.tabs.get(&tab_id) {
                         use webkit2gtk::WebViewExt;
-                        let script = format!("window.scrollTo(0, {y})");
+                        let script = format!("window.scrollBy(0, {delta})");
                         entry.webview.run_javascript(
                             &script, None::<&gio::Cancellable>, |_| {},
                         );
-                        // Re-snapshot after a short delay so the scroll settles.
-                        let wv       = entry.webview.clone();
-                        let tx       = self.reply_tx.clone();
-                        let nc       = Rc::clone(&entry.nav_id_cell);
-                        let (w, h)   = (self.w, self.h);
-                        glib::timeout_add_local(Duration::from_millis(150), move || {
+                        // Re-snapshot after scroll settles.
+                        let wv     = entry.webview.clone();
+                        let tx     = self.reply_tx.clone();
+                        let nc     = Rc::clone(&entry.nav_id_cell);
+                        let (w, h) = (self.w, self.h);
+                        glib::timeout_add_local(Duration::from_millis(80), move || {
                             let nav_id = nc.get();
                             take_snapshot(
                                 &wv, w, h, tab_id, nav_id,
@@ -431,7 +425,11 @@ fn make_tab_entry(
         webview.connect_load_changed(move |wv, event| {
             if event == LoadEvent::Finished {
                 let nav_id = nc.get();
-                let _ = tx.try_send(Reply::ContentHeight { tab_id, nav_id, h: 8000 });
+                // Emit a generous virtual height so the shell scroll tracker
+                // never clamps before WebKit does.  WebKit's scrollBy itself
+                // stops at the real document bottom, so this value only needs
+                // to be larger than any real page height.
+                let _ = tx.try_send(Reply::ContentHeight { tab_id, nav_id, h: 200_000 });
                 take_snapshot(
                     wv, w, h, tab_id, nav_id,
                     wv_title(wv), wv_url(wv), tx.clone(),

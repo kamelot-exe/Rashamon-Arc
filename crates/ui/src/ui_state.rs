@@ -850,8 +850,10 @@ impl BrowserState {
             .clamp(0, max as i64) as u32;
         if new_scroll != tab.scroll_y {
             tab.scroll_y = new_scroll;
-            self.dirty.content = true;
         }
+        // Always dirty: the engine (WebKit) may have scrolled even if shell
+        // scroll_y is already at its limit (e.g. content_height not yet known).
+        self.dirty.content = true;
     }
 
     pub fn set_content_height(&mut self, h: u32) {

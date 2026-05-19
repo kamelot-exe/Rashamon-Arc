@@ -23,6 +23,10 @@ use crate::webkit_engine::{WebKitEngine, WebKitDriver};
 #[cfg(feature = "servo")]
 use crate::servo_embedder::ServoHost;
 
+fn debug_enabled() -> bool {
+    std::env::var_os("RASHAMON_DEBUG").is_some()
+}
+
 /// Top-level rendering handle owned by the browser shell.
 /// Must remain on the main thread when WebKit is active.
 pub struct RenderEngine {
@@ -37,7 +41,7 @@ impl RenderEngine {
         #[cfg(feature = "servo")]
         match ServoHost::new(content_w, content_h) {
             Ok(sh) => {
-                eprintln!("[renderer] Using Servo engine");
+                eprintln!("Renderer: Servo");
                 return Ok(Self {
                     inner:       Box::new(sh),
                     real_engine: true,
@@ -45,23 +49,35 @@ impl RenderEngine {
                     driver:      None,
                 });
             }
-            Err(e) => eprintln!("[renderer] Servo init failed ({e}), falling back"),
+            Err(e) => {
+                if debug_enabled() {
+                    eprintln!("[renderer] Servo init failed ({e}), falling back");
+                }
+            }
         }
 
         #[cfg(feature = "webkit")]
         match WebKitEngine::create(content_w, content_h) {
             Ok((wk, driver)) => {
-                eprintln!("[renderer] Using WebKitGTK engine (per-tab WebViews)");
+                eprintln!("Renderer: WebKitGTK");
                 return Ok(Self {
                     inner:       Box::new(wk),
                     real_engine: true,
                     driver:      Some(driver),
                 });
             }
-            Err(e) => eprintln!("[renderer] WebKit init failed ({e}), falling back to stub"),
+            Err(e) => {
+                if debug_enabled() {
+                    eprintln!("[renderer] WebKit init failed ({e}), falling back to stub");
+                } else {
+                    eprintln!("Renderer: text fallback");
+                }
+            }
         }
 
-        eprintln!("[renderer] Using stub engine (text renderer active)");
+        if debug_enabled() {
+            eprintln!("[renderer] Using stub engine (text renderer active)");
+        }
         Ok(Self {
             inner:       Box::new(ServoHost::new()?),
             real_engine: false,
@@ -105,6 +121,9 @@ impl RenderEngine {
     pub fn go_back(&mut self)    -> Result<(), Box<dyn std::error::Error>> { self.inner.go_back() }
     pub fn go_forward(&mut self) -> Result<(), Box<dyn std::error::Error>> { self.inner.go_forward() }
     pub fn reload(&mut self)     -> Result<(), Box<dyn std::error::Error>> { self.inner.reload() }
+    pub fn zoom_in(&mut self)    { self.inner.zoom_in(); }
+    pub fn zoom_out(&mut self)   { self.inner.zoom_out(); }
+    pub fn zoom_reset(&mut self) { self.inner.zoom_reset(); }
 
     pub fn can_go_back(&self)    -> bool { self.inner.can_go_back() }
     pub fn can_go_forward(&self) -> bool { self.inner.can_go_forward() }

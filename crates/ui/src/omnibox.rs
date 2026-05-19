@@ -3,6 +3,7 @@
 // ── Search provider ───────────────────────────────────────────────────────────
 
 pub struct SearchProvider {
+    #[allow(dead_code)]
     pub name:      &'static str,
     /// Query URL template — `{}` is replaced with the percent-encoded query.
     pub query_url: &'static str,

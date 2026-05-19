@@ -21,7 +21,7 @@ impl Display {
         win_w: u32, win_h: u32,
         fb_w:  u32, fb_h:  u32,
     ) -> io::Result<Self> {
-        eprintln!("[display] window {}×{}, fb {}×{} (SDL2)", win_w, win_h, fb_w, fb_h);
+        eprintln!("Display: SDL2 window {}x{}", win_w, win_h);
 
         let window = video
             .window("Rashamon Arc", win_w, win_h)

@@ -23,7 +23,9 @@ impl HttpClient {
         // Check adblock rules.
         let (blocked, block_reason) = self.adblock.should_block(&req.url, &req.origin);
         if blocked {
-            eprintln!("[http] BLOCKED: {} ({})", req.url, block_reason.as_deref().unwrap_or(""));
+            if std::env::var_os("RASHAMON_DEBUG").is_some() {
+                eprintln!("[http] BLOCKED: {} ({})", req.url, block_reason.as_deref().unwrap_or(""));
+            }
             return NetworkResponse {
                 status: 0,
                 headers: vec![],
@@ -35,7 +37,9 @@ impl HttpClient {
 
         // In production: use hyper + rustls here.
         // For now, return a stub response.
-        eprintln!("[http] {} {}", req.method, req.url);
+        if std::env::var_os("RASHAMON_DEBUG").is_some() {
+            eprintln!("[http] {} {}", req.method, req.url);
+        }
 
         NetworkResponse {
             status: 200,
@@ -117,7 +121,9 @@ impl HttpClient {
                 });
             }
 
-            eprintln!("[http] {} OK — {} bytes", url, body.len());
+            if std::env::var_os("RASHAMON_DEBUG").is_some() {
+                eprintln!("[http] {} OK - {} bytes", url, body.len());
+            }
             Ok(body)
         } else {
             // Sentinel missing: curl may have been interrupted after partial output.

@@ -26,6 +26,9 @@ pub enum Key {
     Down,
     PageUp,
     PageDown,
+    ZoomIn,
+    ZoomOut,
+    ZoomReset,
     Char(char),
 }
 
@@ -88,6 +91,11 @@ impl InputHandler {
                         Scancode::I if self.ctrl_pressed => Some(Key::Char('i')),
                         Scancode::L if self.ctrl_pressed => Some(Key::Char('l')),
                         Scancode::N if self.ctrl_pressed => Some(Key::Char('n')),
+                        Scancode::Equals if self.ctrl_pressed => Some(Key::ZoomIn),
+                        Scancode::KpPlus if self.ctrl_pressed => Some(Key::ZoomIn),
+                        Scancode::Minus if self.ctrl_pressed => Some(Key::ZoomOut),
+                        Scancode::KpMinus if self.ctrl_pressed => Some(Key::ZoomOut),
+                        Scancode::Num0 if self.ctrl_pressed => Some(Key::ZoomReset),
                         _ => None,
                     };
                     key.map(Event::KeyPress)

@@ -24,7 +24,9 @@ pub struct ServoHost {
 
 impl ServoHost {
     pub fn new() -> Result<Self, Box<dyn std::error::Error>> {
-        eprintln!("[renderer] ServoHost: stub mode — compile with --features servo for real rendering");
+        if std::env::var_os("RASHAMON_DEBUG").is_some() {
+            eprintln!("[renderer] ServoHost: stub mode");
+        }
         Ok(Self {
             title:         None,
             url:           None,
@@ -57,7 +59,9 @@ fn derive_title(url: &str) -> String {
 
 impl ContentEngine for ServoHost {
     fn navigate(&mut self, url: &str, _nav_id: u64) -> Result<(), Box<dyn std::error::Error>> {
-        eprintln!("[renderer] navigate -> {url}");
+        if std::env::var_os("RASHAMON_DEBUG").is_some() {
+            eprintln!("[renderer] navigate -> {url}");
+        }
         self.push_url(url);
         self.events.push(EngineEvent::LoadStarted);
         self.events.push(EngineEvent::TitleChanged(self.title.clone().unwrap_or_default()));

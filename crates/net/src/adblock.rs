@@ -11,6 +11,7 @@ pub struct Rule {
     /// The raw filter text.
     pub text: String,
     /// Whether this is a third-party rule.
+    #[allow(dead_code)]
     pub third_party: bool,
     /// Match type.
     pub kind: RuleKind,
@@ -21,8 +22,10 @@ pub enum RuleKind {
     /// URL substring match.
     Contains(String),
     /// Exact domain match.
+    #[allow(dead_code)]
     Domain(String),
     /// Regex match.
+    #[allow(dead_code)]
     Regex(String),
 }
 
@@ -85,7 +88,9 @@ impl AdblockEngine {
             });
         }
 
-        eprintln!("[adblock] Loaded {} default rules", default_domains.len());
+        if std::env::var_os("RASHAMON_DEBUG").is_some() {
+            eprintln!("[adblock] Loaded {} default rules", default_domains.len());
+        }
     }
 
     /// Load additional rules from a text file (EasyList format).

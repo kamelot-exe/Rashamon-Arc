@@ -33,7 +33,11 @@ impl Display {
         // Try DRM/KMS first (uses fb dimensions directly).
         match drm_display::Display::new(fb_w, fb_h) {
             Ok(drm) => return Ok(Self { inner: DisplayInner::Drm(drm) }),
-            Err(e)  => eprintln!("[display] DRM/KMS unavailable ({e}), falling back to SDL2 window"),
+            Err(e)  => {
+                if std::env::var_os("RASHAMON_DEBUG").is_some() {
+                    eprintln!("[display] DRM/KMS unavailable ({e}), falling back to SDL2 window");
+                }
+            }
         }
 
         let sdl = sdl_display::Display::new(video, win_w, win_h, fb_w, fb_h)?;

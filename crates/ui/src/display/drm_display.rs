@@ -1,4 +1,5 @@
 //! DRM/KMS direct display — bypasses X11/Wayland completely.
+#![allow(dead_code)]
 //!
 //! Uses DRM ioctls to:
 //! 1. Open /dev/dri/card0

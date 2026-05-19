@@ -55,6 +55,9 @@ pub trait ContentEngine: Send {
     fn go_back(&mut self)    -> Result<(), Box<dyn std::error::Error>>;
     fn go_forward(&mut self) -> Result<(), Box<dyn std::error::Error>>;
     fn reload(&mut self)     -> Result<(), Box<dyn std::error::Error>>;
+    fn zoom_in(&mut self) {}
+    fn zoom_out(&mut self) {}
+    fn zoom_reset(&mut self) {}
 
     /// Whether the active tab's WebView has native back/forward history.
     /// Returns false on stub engines — shell history is used instead.

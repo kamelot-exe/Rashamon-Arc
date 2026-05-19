@@ -33,6 +33,14 @@ use std::rc::Rc;
 use std::sync::mpsc;
 use std::time::Duration;
 
+macro_rules! trace {
+    ($($arg:tt)*) => {
+        if std::env::var_os("RASHAMON_DEBUG").is_some() {
+            eprintln!($($arg)*);
+        }
+    };
+}
+
 // ── IPC ───────────────────────────────────────────────────────────────────────
 
 enum Cmd {
@@ -49,6 +57,7 @@ enum Cmd {
     /// Native WebKit back/forward — no URL re-load.
     GoBack     { tab_id: u64 },
     GoForward  { tab_id: u64 },
+    Zoom       { tab_id: u64, step: i32 },
     Shutdown,
 }
 
@@ -63,6 +72,7 @@ enum Reply {
         url:    String,
     },
     TitleChanged  { tab_id: u64, nav_id: u64, title:  String },
+    UrlChanged    { tab_id: u64, nav_id: u64, url:    String },
     ContentHeight { tab_id: u64, nav_id: u64, h:      u32    },
     LoadFailed    { tab_id: u64, nav_id: u64, reason: String },
     /// WebKit reports whether the tab's history stack has back/forward entries.
@@ -99,6 +109,7 @@ struct TabEntry {
     webview:     webkit2gtk::WebView,
     _window:     gtk::OffscreenWindow,
     nav_id_cell: Rc<Cell<u64>>,
+    snapshot_gen: Rc<Cell<u64>>,
 }
 
 pub struct WebKitDriver {
@@ -122,7 +133,7 @@ impl WebKitEngine {
         let (cmd_tx, cmd_rx)     = mpsc::sync_channel::<Cmd>(32);
         let (reply_tx, reply_rx) = mpsc::sync_channel::<Reply>(32);
 
-        eprintln!("[webkit] Engine created ({}×{})", content_w, content_h);
+        trace!("[webkit] Engine created ({}×{})", content_w, content_h);
 
         let engine = WebKitEngine {
             cmd_tx,
@@ -152,19 +163,19 @@ impl Drop for WebKitEngine {
 
 impl ContentEngine for WebKitEngine {
     fn create_tab(&mut self, tab_id: u64, is_private: bool) {
-        eprintln!("[webkit] create_tab {tab_id} private={is_private}");
+        trace!("[webkit] create_tab {tab_id} private={is_private}");
         self.tab_states.entry(tab_id).or_insert_with(PerTabState::default);
         let _ = self.cmd_tx.try_send(Cmd::CreateTab { tab_id, is_private });
     }
 
     fn close_tab(&mut self, tab_id: u64) {
-        eprintln!("[webkit] close_tab {tab_id}");
+        trace!("[webkit] close_tab {tab_id}");
         self.tab_states.remove(&tab_id);
         let _ = self.cmd_tx.try_send(Cmd::CloseTab { tab_id });
     }
 
     fn set_active_tab(&mut self, tab_id: u64) {
-        eprintln!("[webkit] set_active_tab {tab_id}");
+        trace!("[webkit] set_active_tab {tab_id}");
         self.active_tab_id = tab_id;
         // Request a fresh snapshot — the WebView already has its page loaded.
         let _ = self.cmd_tx.try_send(Cmd::SwitchTab { tab_id });
@@ -172,7 +183,7 @@ impl ContentEngine for WebKitEngine {
 
     fn navigate(&mut self, url: &str, nav_id: u64) -> Result<(), Box<dyn std::error::Error>> {
         let tab_id = self.active_tab_id;
-        eprintln!("[webkit] navigate tab={tab_id} nav={nav_id} → {url}");
+        trace!("[webkit] navigate tab={tab_id} nav={nav_id} -> {url}");
         let state = self.tab_states.entry(tab_id).or_insert_with(PerTabState::default);
         state.expected_nav_id = nav_id;
         state.cache           = None;
@@ -223,6 +234,21 @@ impl ContentEngine for WebKitEngine {
         Ok(())
     }
 
+    fn zoom_in(&mut self) {
+        let tab_id = self.active_tab_id;
+        let _ = self.cmd_tx.try_send(Cmd::Zoom { tab_id, step: 1 });
+    }
+
+    fn zoom_out(&mut self) {
+        let tab_id = self.active_tab_id;
+        let _ = self.cmd_tx.try_send(Cmd::Zoom { tab_id, step: -1 });
+    }
+
+    fn zoom_reset(&mut self) {
+        let tab_id = self.active_tab_id;
+        let _ = self.cmd_tx.try_send(Cmd::Zoom { tab_id, step: 0 });
+    }
+
     fn scroll(&mut self, delta_y: i32) {
         let tab_id = self.active_tab_id;
         let _ = self.cmd_tx.try_send(Cmd::ScrollBy { tab_id, delta: delta_y });
@@ -268,11 +294,11 @@ impl ContentEngine for WebKitEngine {
                     if nav_id != 0 && state.expected_nav_id != 0
                         && nav_id != state.expected_nav_id
                     {
-                        eprintln!("[webkit] drop stale FrameReady tab={tab_id} nav={nav_id} (expected {})",
+                        trace!("[webkit] drop stale FrameReady tab={tab_id} nav={nav_id} (expected {})",
                             state.expected_nav_id);
                         continue;
                     }
-                    eprintln!("[webkit] FrameReady tab={tab_id} {}×{} ({} bytes)",
+                    trace!("[webkit] FrameReady tab={tab_id} {}x{} ({} bytes)",
                         width, height, pixels.len());
                     state.cache = Some(CachedFrame { pixels, width, height });
                     state.title = Some(title.clone());
@@ -289,6 +315,14 @@ impl ContentEngine for WebKitEngine {
                     state.title = Some(title.clone());
                     self.pending_events.push((tab_id, EngineEvent::TitleChanged(title)));
                 }
+                Ok(Reply::UrlChanged { tab_id, nav_id, url }) => {
+                    let state = self.tab_states.entry(tab_id).or_insert_with(PerTabState::default);
+                    if nav_id != 0 && state.expected_nav_id != 0
+                        && nav_id != state.expected_nav_id
+                    { continue; }
+                    state.url = Some(url.clone());
+                    self.pending_events.push((tab_id, EngineEvent::UrlChanged(url)));
+                }
                 Ok(Reply::ContentHeight { tab_id, nav_id, h }) => {
                     let state = self.tab_states.entry(tab_id).or_insert_with(PerTabState::default);
                     if nav_id != 0 && state.expected_nav_id != 0
@@ -301,10 +335,10 @@ impl ContentEngine for WebKitEngine {
                     if nav_id != 0 && state.expected_nav_id != 0
                         && nav_id != state.expected_nav_id
                     {
-                        eprintln!("[webkit] drop stale LoadFailed tab={tab_id} nav={nav_id}");
+                        trace!("[webkit] drop stale LoadFailed tab={tab_id} nav={nav_id}");
                         continue;
                     }
-                    eprintln!("[webkit] LoadFailed tab={tab_id}: {reason}");
+                    trace!("[webkit] LoadFailed tab={tab_id}: {reason}");
                     self.pending_events.push((tab_id, EngineEvent::LoadFailed(reason)));
                 }
                 Ok(Reply::NavState { tab_id, can_back, can_forward }) => {
@@ -348,12 +382,12 @@ impl WebKitDriver {
                         tab_id, is_private, self.w, self.h, self.reply_tx.clone(),
                     );
                     self.tabs.insert(tab_id, entry);
-                    eprintln!("[webkit-driver] created WebView for tab {tab_id}");
+                    trace!("[webkit-driver] created WebView for tab {tab_id}");
                 }
 
                 Ok(Cmd::CloseTab { tab_id }) => {
                     self.tabs.remove(&tab_id);
-                    eprintln!("[webkit-driver] dropped WebView for tab {tab_id}");
+                    trace!("[webkit-driver] dropped WebView for tab {tab_id}");
                 }
 
                 Ok(Cmd::SwitchTab { tab_id }) => {
@@ -364,14 +398,26 @@ impl WebKitDriver {
                         let url        = wv_url(&entry.webview);
                         let can_back   = entry.webview.can_go_back();
                         let can_fwd    = entry.webview.can_go_forward();
-                        eprintln!("[webkit-driver] SwitchTab {tab_id} → snapshot nav={nav_id}");
+                        trace!("[webkit-driver] SwitchTab {tab_id} -> snapshot nav={nav_id}");
+                        let _ = self.reply_tx.try_send(Reply::TitleChanged {
+                            tab_id, nav_id: 0, title: title.clone(),
+                        });
+                        let _ = self.reply_tx.try_send(Reply::UrlChanged {
+                            tab_id, nav_id: 0, url: url.clone(),
+                        });
                         let _ = self.reply_tx.try_send(Reply::NavState {
                             tab_id, can_back, can_forward: can_fwd,
                         });
+                        let gen = next_snapshot_generation(&entry.snapshot_gen);
                         take_snapshot(
                             &entry.webview, self.w, self.h,
                             tab_id, nav_id, title, url,
                             self.reply_tx.clone(),
+                        );
+                        schedule_snapshot(
+                            &entry.webview, self.w, self.h, tab_id,
+                            self.reply_tx.clone(), Rc::clone(&entry.nav_id_cell),
+                            Rc::clone(&entry.snapshot_gen), gen, Duration::from_millis(180),
                         );
                     }
                 }
@@ -379,13 +425,14 @@ impl WebKitDriver {
                 Ok(Cmd::Navigate { tab_id, url, nav_id }) => {
                     if let Some(entry) = self.tabs.get(&tab_id) {
                         use webkit2gtk::WebViewExt;
-                        eprintln!("[webkit-driver] Navigate tab={tab_id} nav={nav_id}: {url}");
+                        trace!("[webkit-driver] Navigate tab={tab_id} nav={nav_id}: {url}");
                         // Update shared cell BEFORE load_uri so synchronous signals
                         // fire with the correct nav_id.
                         entry.nav_id_cell.set(nav_id);
+                        next_snapshot_generation(&entry.snapshot_gen);
                         entry.webview.load_uri(&url);
                     } else {
-                        eprintln!("[webkit-driver] Navigate for unknown tab {tab_id}");
+                        trace!("[webkit-driver] Navigate for unknown tab {tab_id}");
                     }
                 }
 
@@ -393,22 +440,21 @@ impl WebKitDriver {
                     if let Some(entry) = self.tabs.get(&tab_id) {
                         use webkit2gtk::WebViewExt;
                         let script = format!("window.scrollBy(0, {delta})");
+                        #[allow(deprecated)]
                         entry.webview.run_javascript(
                             &script, None::<&gio::Cancellable>, |_| {},
                         );
-                        // Re-snapshot after scroll settles.
-                        let wv     = entry.webview.clone();
-                        let tx     = self.reply_tx.clone();
-                        let nc     = Rc::clone(&entry.nav_id_cell);
-                        let (w, h) = (self.w, self.h);
-                        glib::timeout_add_local(Duration::from_millis(80), move || {
-                            let nav_id = nc.get();
-                            take_snapshot(
-                                &wv, w, h, tab_id, nav_id,
-                                wv_title(&wv), wv_url(&wv), tx.clone(),
-                            );
-                            glib::ControlFlow::Break
-                        });
+                        let gen = next_snapshot_generation(&entry.snapshot_gen);
+                        schedule_snapshot(
+                            &entry.webview, self.w, self.h, tab_id,
+                            self.reply_tx.clone(), Rc::clone(&entry.nav_id_cell),
+                            Rc::clone(&entry.snapshot_gen), gen, Duration::from_millis(32),
+                        );
+                        schedule_snapshot(
+                            &entry.webview, self.w, self.h, tab_id,
+                            self.reply_tx.clone(), Rc::clone(&entry.nav_id_cell),
+                            Rc::clone(&entry.snapshot_gen), gen, Duration::from_millis(120),
+                        );
                     }
                 }
 
@@ -422,16 +468,12 @@ impl WebKitDriver {
                             // load-changed will fire and snapshot when done.
                             // Safety-net: snapshot after a delay in case it was
                             // a same-page (fragment) navigation.
-                            let wv     = entry.webview.clone();
-                            let tx     = self.reply_tx.clone();
-                            let nc     = Rc::clone(&entry.nav_id_cell);
-                            let (w, h) = (self.w, self.h);
-                            glib::timeout_add_local(Duration::from_millis(400), move || {
-                                let nav_id = nc.get();
-                                take_snapshot(&wv, w, h, tab_id, nav_id,
-                                    wv_title(&wv), wv_url(&wv), tx.clone());
-                                glib::ControlFlow::Break
-                            });
+                            let gen = next_snapshot_generation(&entry.snapshot_gen);
+                            schedule_snapshot(
+                                &entry.webview, self.w, self.h, tab_id,
+                                self.reply_tx.clone(), Rc::clone(&entry.nav_id_cell),
+                                Rc::clone(&entry.snapshot_gen), gen, Duration::from_millis(350),
+                            );
                         }
                     }
                 }
@@ -442,17 +484,31 @@ impl WebKitDriver {
                         if entry.webview.can_go_forward() {
                             entry.nav_id_cell.set(0);
                             entry.webview.go_forward();
-                            let wv     = entry.webview.clone();
-                            let tx     = self.reply_tx.clone();
-                            let nc     = Rc::clone(&entry.nav_id_cell);
-                            let (w, h) = (self.w, self.h);
-                            glib::timeout_add_local(Duration::from_millis(400), move || {
-                                let nav_id = nc.get();
-                                take_snapshot(&wv, w, h, tab_id, nav_id,
-                                    wv_title(&wv), wv_url(&wv), tx.clone());
-                                glib::ControlFlow::Break
-                            });
+                            let gen = next_snapshot_generation(&entry.snapshot_gen);
+                            schedule_snapshot(
+                                &entry.webview, self.w, self.h, tab_id,
+                                self.reply_tx.clone(), Rc::clone(&entry.nav_id_cell),
+                                Rc::clone(&entry.snapshot_gen), gen, Duration::from_millis(350),
+                            );
                         }
+                    }
+                }
+
+                Ok(Cmd::Zoom { tab_id, step }) => {
+                    if let Some(entry) = self.tabs.get(&tab_id) {
+                        use webkit2gtk::WebViewExt;
+                        let next = if step == 0 {
+                            1.0
+                        } else {
+                            (entry.webview.zoom_level() + step as f64 * 0.1).clamp(0.5, 2.0)
+                        };
+                        entry.webview.set_zoom_level(next);
+                        let gen = next_snapshot_generation(&entry.snapshot_gen);
+                        schedule_snapshot(
+                            &entry.webview, self.w, self.h, tab_id,
+                            self.reply_tx.clone(), Rc::clone(&entry.nav_id_cell),
+                            Rc::clone(&entry.snapshot_gen), gen, Duration::from_millis(40),
+                        );
                     }
                 }
 
@@ -501,17 +557,26 @@ fn make_tab_entry(
     window.show_all();
 
     let nav_id_cell: Rc<Cell<u64>> = Rc::new(Cell::new(0));
+    let snapshot_gen: Rc<Cell<u64>> = Rc::new(Cell::new(0));
 
     // load-changed: snapshot on Finished, height hint on Committed.
     {
         let tx  = reply_tx.clone();
         let nc  = Rc::clone(&nav_id_cell);
+        let sg  = Rc::clone(&snapshot_gen);
         webview.connect_load_changed(move |wv, event| {
+            if event == LoadEvent::Committed {
+                let nav_id = nc.get();
+                let _ = tx.try_send(Reply::UrlChanged {
+                    tab_id, nav_id, url: wv_url(wv),
+                });
+            }
             if event == LoadEvent::Finished {
                 use webkit2gtk::WebViewExt as _;
                 let nav_id    = nc.get();
                 let can_back  = wv.can_go_back();
                 let can_fwd   = wv.can_go_forward();
+                let gen       = next_snapshot_generation(&sg);
                 let _ = tx.try_send(Reply::ContentHeight { tab_id, nav_id, h: 200_000 });
                 let _ = tx.try_send(Reply::NavState {
                     tab_id, can_back, can_forward: can_fwd,
@@ -519,6 +584,14 @@ fn make_tab_entry(
                 take_snapshot(
                     wv, w, h, tab_id, nav_id,
                     wv_title(wv), wv_url(wv), tx.clone(),
+                );
+                schedule_snapshot(
+                    wv, w, h, tab_id, tx.clone(), Rc::clone(&nc),
+                    Rc::clone(&sg), gen, Duration::from_millis(250),
+                );
+                schedule_snapshot(
+                    wv, w, h, tab_id, tx.clone(), Rc::clone(&nc),
+                    Rc::clone(&sg), gen, Duration::from_millis(900),
                 );
             }
         });
@@ -557,10 +630,40 @@ fn make_tab_entry(
         });
     }
 
-    TabEntry { webview, _window: window, nav_id_cell }
+    TabEntry { webview, _window: window, nav_id_cell, snapshot_gen }
 }
 
 // ── Snapshot helper ───────────────────────────────────────────────────────────
+
+fn next_snapshot_generation(cell: &Rc<Cell<u64>>) -> u64 {
+    let next = cell.get().wrapping_add(1).max(1);
+    cell.set(next);
+    next
+}
+
+fn schedule_snapshot(
+    wv:      &webkit2gtk::WebView,
+    w:       u32,
+    h:       u32,
+    tab_id:  u64,
+    tx:      mpsc::SyncSender<Reply>,
+    nav_id:  Rc<Cell<u64>>,
+    gen_cell: Rc<Cell<u64>>,
+    gen:     u64,
+    delay:   Duration,
+) {
+    let wv = wv.clone();
+    glib::timeout_add_local(delay, move || {
+        if gen_cell.get() == gen {
+            let nav_id = nav_id.get();
+            take_snapshot(
+                &wv, w, h, tab_id, nav_id,
+                wv_title(&wv), wv_url(&wv), tx.clone(),
+            );
+        }
+        glib::ControlFlow::Break
+    });
+}
 
 fn take_snapshot(
     wv:     &webkit2gtk::WebView,
@@ -580,7 +683,7 @@ fn take_snapshot(
         None::<&gio::Cancellable>,
         move |result| match result {
             Err(e) => {
-                eprintln!("[webkit] snapshot error tab={tab_id}: {e}");
+                trace!("[webkit] snapshot error tab={tab_id}: {e}");
                 let _ = tx.try_send(Reply::LoadFailed {
                     tab_id, nav_id, reason: e.to_string(),
                 });
@@ -641,7 +744,7 @@ fn take_snapshot(
                     }
                 };
 
-                eprintln!("[webkit] FrameReady tab={tab_id} nav={nav_id}: {} bytes",
+                trace!("[webkit] FrameReady tab={tab_id} nav={nav_id}: {} bytes",
                     pixels.len());
                 let _ = tx.try_send(Reply::FrameReady {
                     tab_id, nav_id, pixels,

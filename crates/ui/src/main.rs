@@ -36,6 +36,15 @@ const SCROLL_WHEEL: i32 = 80;
 // Private tab accent colour (purple stripe)
 const PRIVATE_ACCENT: Pixel = Pixel { r: 130, g: 70, b: 200 };
 
+const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ContentRenderMode {
+    Text,
+    Engine,
+    EnginePending,
+}
+
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 #[inline]
@@ -126,8 +135,6 @@ fn load_user_data(state: &mut BrowserState) {
 
 /// Flush any dirty saves in background threads (fire-and-forget).
 fn flush_saves(state: &BrowserState, dirty: &mut SaveDirty) {
-    use crate::theme::ColorPalette;
-
     if dirty.bookmarks {
         let bm: Vec<persist::StoredBookmark> = state.bookmarks.iter()
             .map(|b| persist::StoredBookmark { title: b.title.clone(), url: b.url.clone() })
@@ -220,7 +227,7 @@ fn measure_content_height(nodes: &[PageNode], font: &FontManager) -> u32 {
 // ── Main ──────────────────────────────────────────────────────────────────────
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    eprintln!("=== Rashamon Arc ===");
+    eprintln!("Rashamon Arc {APP_VERSION}");
 
     let sdl   = sdl2::init()?;
     let video = sdl.video()?;
@@ -234,7 +241,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let win_h   = win_h.min(FB_HEIGHT);
     let scale_x = FB_WIDTH  as f32 / win_w as f32;
     let scale_y = FB_HEIGHT as f32 / win_h as f32;
-    eprintln!("[main] window {}x{}, scale {:.2}x{:.2}", win_w, win_h, scale_x, scale_y);
 
     let event_pump = sdl.event_pump()?;
     let font_data  = include_bytes!("../assets/DejaVuSansMono.ttf");
@@ -260,9 +266,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut buffered_outcome: Option<(TabId, FetchOutcome)> = None;
     let mut save_dirty = SaveDirty::default();
 
-    if let Some(arg_url) = std::env::args().nth(1) {
+    let startup_input = std::env::args().skip(1).collect::<Vec<_>>().join(" ");
+    if !startup_input.trim().is_empty() {
         use omnibox::{classify_input, InputKind};
-        let nav_url = match classify_input(&arg_url) {
+        let nav_url = match classify_input(startup_input.trim()) {
             InputKind::Url(u)    => Some(u),
             InputKind::Search(q) => Some(omnibox::DEFAULT_PROVIDER.build_url(&q)),
             _                    => None,
@@ -278,6 +285,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
     }
+
+    render_ui(
+        &mut fb,
+        &state,
+        &font,
+        DirtyFlags { tabs: true, chrome: true, content: true },
+        ContentRenderMode::Text,
+    );
+    display.present(&fb)?;
 
     let mut running          = true;
     let mut last_blink_phase = 0u64;
@@ -471,23 +487,29 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let dirty = state.dirty;
             state.dirty.clear();
 
-            // Ask the engine to composite content pixels first.
-            // When Servo is active it returns Ready and owns the content rect;
-            // the stub always returns NotReady so the text renderer takes over.
-            let engine_rendered = if dirty.content
+            // Ask the engine to composite content pixels first. While a real
+            // engine is waiting on a fresh snapshot, keep the shell in an
+            // intentional pending state instead of showing text fallback.
+            let content_mode = if dirty.content
                 && state.overlay == OverlayKind::None
                 && state.active_tab().map_or(false, |t| matches!(t.page_state, PageState::Loaded))
             {
                 match engine.render_into(&mut fb, 0, TOP_BAR_HEIGHT, FB_WIDTH, FB_HEIGHT - TOP_BAR_HEIGHT) {
-                    Ok(EngineFrame::Ready) => true,
-                    Ok(_)  => false,
-                    Err(e) => { eprintln!("[render] engine.render_into error: {e}"); false }
+                    Ok(EngineFrame::Ready) => ContentRenderMode::Engine,
+                    Ok(_) if engine.is_real_engine() => ContentRenderMode::EnginePending,
+                    Ok(_) => ContentRenderMode::Text,
+                    Err(e) => {
+                        if std::env::var_os("RASHAMON_DEBUG").is_some() {
+                            eprintln!("[render] engine.render_into error: {e}");
+                        }
+                        ContentRenderMode::Text
+                    }
                 }
             } else {
-                false
+                ContentRenderMode::Text
             };
 
-            render_ui(&mut fb, &state, &font, dirty, engine_rendered);
+            render_ui(&mut fb, &state, &font, dirty, content_mode);
             display.present(&fb)?;
         }
 
@@ -537,8 +559,8 @@ fn on_key(
                 }
                 return Ok(());
             }
-            input::Key::Up   => { state.overlay_scroll_by(-1); return Ok(()); }
-            input::Key::Down => { state.overlay_scroll_by( 1); return Ok(()); }
+            input::Key::Up   => { state.overlay_move_selection(-1); return Ok(()); }
+            input::Key::Down => { state.overlay_move_selection( 1); return Ok(()); }
             input::Key::PageUp   => { state.overlay_scroll_by(-(OVERLAY_VISIBLE as i32)); return Ok(()); }
             input::Key::PageDown => { state.overlay_scroll_by( OVERLAY_VISIBLE as i32);  return Ok(()); }
             // Let Ctrl+shortcuts fall through so user can still open new tab etc.
@@ -584,8 +606,13 @@ fn on_key(
 
         input::Key::Char('w') if input.is_ctrl_pressed() => {
             let old_id = state.active_tab_id;
+            let was_last = state.tabs.len() == 1;
             engine.close_tab(old_id.raw());
             state.close_tab(old_id);
+            if was_last {
+                let id = state.active_tab_id;
+                engine.create_tab(id.raw(), false);
+            }
             // Switch to newly-active tab (no reload needed — it keeps its WebView).
             if engine.is_real_engine() {
                 engine.set_active_tab(state.active_tab_id.raw());
@@ -613,6 +640,10 @@ fn on_key(
         input::Key::Char('l') if input.is_ctrl_pressed() => {
             state.focus_address_bar();
         }
+
+        input::Key::ZoomIn if input.is_ctrl_pressed() => engine.zoom_in(),
+        input::Key::ZoomOut if input.is_ctrl_pressed() => engine.zoom_out(),
+        input::Key::ZoomReset if input.is_ctrl_pressed() => engine.zoom_reset(),
 
         input::Key::Enter if state.address_bar_focused => {
             let raw = state.address_bar_input.trim().to_string();
@@ -677,8 +708,13 @@ fn click_tab_bar(state: &mut BrowserState, engine: &mut RenderEngine, x: u32) {
                 // ── Close tab ─────────────────────────────────────────────────
                 // Destroy the WebView first, then update shell state, then
                 // activate the new tab's existing WebView (no reload).
+                let was_last = state.tabs.len() == 1;
                 engine.close_tab(id.raw());
                 state.close_tab(id);
+                if was_last {
+                    let new_id = state.active_tab_id;
+                    engine.create_tab(new_id.raw(), false);
+                }
                 if engine.is_real_engine() {
                     engine.set_active_tab(state.active_tab_id.raw());
                 } else if let Some(url) = state.active_tab()
@@ -817,14 +853,14 @@ fn click_content(state: &mut BrowserState, engine: &mut RenderEngine, x: u32, y:
 
 // ── Top-level render ──────────────────────────────────────────────────────────
 
-/// `engine_rendered`: Servo (or future engine) already wrote content pixels into
-/// `fb` for the content rect — skip the text renderer for `PageState::Loaded`.
+/// `content_mode` tells the shell whether the engine already wrote pixels or
+/// whether it is still waiting on the next snapshot for a loaded page.
 fn render_ui(
     fb:              &mut Framebuffer,
     state:           &BrowserState,
     font:            &FontManager,
     dirty:           DirtyFlags,
-    engine_rendered: bool,
+    content_mode:    ContentRenderMode,
 ) {
     let theme      = state.theme;
     let tw         = state.tab_width;
@@ -844,8 +880,11 @@ fn render_ui(
                 }
                 Some(PageState::Loading)  => draw_loading(fb, state, font),
                 Some(PageState::Error(_)) => draw_error(fb, state, font),
-                Some(PageState::Loaded) if engine_rendered => {
+                Some(PageState::Loaded) if content_mode == ContentRenderMode::Engine => {
                     // Engine composited pixels directly into fb — nothing to do.
+                }
+                Some(PageState::Loaded) if content_mode == ContentRenderMode::EnginePending => {
+                    draw_snapshot_pending(fb, state, font);
                 }
                 Some(PageState::Loaded)   => {
                     let (nodes, scroll_y) = state.active_tab()
@@ -1314,6 +1353,17 @@ fn draw_loading(fb: &mut Framebuffer, state: &BrowserState, font: &FontManager) 
     let elapsed  = state.frame_count.saturating_sub(state.active_tab().map_or(0, |t| t.load_start_frame));
     let progress = ((elapsed as f32 / LOAD_MIN_FRAMES as f32) * FB_WIDTH as f32) as u32;
     fb.fill_rect(0, TOP_BAR_HEIGHT + 1, progress.min(FB_WIDTH - 4), 2, theme.accent);
+}
+
+fn draw_snapshot_pending(fb: &mut Framebuffer, state: &BrowserState, font: &FontManager) {
+    let theme = state.theme;
+    let cx    = FB_WIDTH / 2;
+    let cy    = TOP_BAR_HEIGHT + (FB_HEIGHT - TOP_BAR_HEIGHT) / 2;
+    fb.fill_rect(0, TOP_BAR_HEIGHT, FB_WIDTH, FB_HEIGHT - TOP_BAR_HEIGHT, theme.bg);
+    draw::draw_icon_spinner(fb, cx, cy.saturating_sub(18), 12, state.frame_count, theme.fg_secondary);
+    let msg = "Updating view...";
+    let mw  = font.text_width(msg, 13.0);
+    draw::draw_text(fb, font, cx.saturating_sub(mw / 2), cy + 10, msg, 13.0, theme.fg_secondary, 240);
 }
 
 // ── Loaded page ───────────────────────────────────────────────────────────────

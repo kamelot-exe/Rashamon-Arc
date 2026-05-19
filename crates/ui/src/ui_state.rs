@@ -118,6 +118,7 @@ pub struct GlobalHistoryEntry {
     pub url:   String,
     pub title: String,
     /// frame_count at visit time — used for recency ordering.
+    #[allow(dead_code)]
     pub when:  u64,
 }
 
@@ -345,7 +346,7 @@ impl BrowserState {
             frame_count:   0,
             palette,
             theme:         get_theme(palette),
-            address_bar_focused: false,
+            address_bar_focused: true,
             address_bar_input:   String::new(),
             bookmarks: vec![
                 QuickLink::new("GitHub",      "https://github.com"),
@@ -558,6 +559,9 @@ impl BrowserState {
         let id  = tab.id;
         self.tabs.push(tab);
         self.activate_tab(id);
+        self.address_bar_focused = true;
+        self.address_bar_input.clear();
+        self.dirty.all();
     }
 
     /// Open a new private / incognito tab.
@@ -566,6 +570,9 @@ impl BrowserState {
         let id  = tab.id;
         self.tabs.push(tab);
         self.activate_tab(id);
+        self.address_bar_focused = true;
+        self.address_bar_input.clear();
+        self.dirty.all();
     }
 
     pub fn close_tab(&mut self, id: TabId) {
@@ -652,6 +659,7 @@ impl BrowserState {
         Some(url)
     }
 
+    #[allow(dead_code)]
     pub fn commit_navigation(&mut self) {
         let (url, result) = match self.active_tab() {
             Some(t) if t.page_state.is_loading() => (t.url.clone(), t.nav_result.clone()),
@@ -707,6 +715,7 @@ impl BrowserState {
 
     /// Called when the rendering engine (WebKit/Servo) signals load complete.
     /// The engine owns the pixels; we have no text nodes to store.
+    #[allow(dead_code)]
     pub fn resolve_engine_loading(&mut self) {
         let url = match self.active_tab() {
             Some(t) if t.page_state.is_loading() => t.url.clone(),
@@ -904,7 +913,7 @@ impl BrowserState {
         } else {
             self.overlay        = kind;
             self.overlay_scroll = 0;
-            self.overlay_hover  = None;
+            self.overlay_hover  = if self.overlay_item_count() > 0 { Some(0) } else { None };
             self.address_bar_focused = false;
         }
         self.dirty.content = true;
@@ -929,6 +938,29 @@ impl BrowserState {
             self.overlay_hover  = None;
             self.dirty.content  = true;
         }
+    }
+
+    pub fn overlay_move_selection(&mut self, delta: i32) {
+        if self.overlay == OverlayKind::None { return; }
+        let count = self.overlay_item_count();
+        if count == 0 {
+            self.overlay_hover = None;
+            return;
+        }
+
+        let cur = self.overlay_hover.unwrap_or(self.overlay_scroll);
+        let next = (cur as i64 + delta as i64).clamp(0, count.saturating_sub(1) as i64) as usize;
+        self.overlay_hover = Some(next);
+
+        if next < self.overlay_scroll {
+            self.overlay_scroll = next;
+        } else {
+            let last_visible = self.overlay_scroll + OVERLAY_VISIBLE.saturating_sub(1);
+            if next > last_visible {
+                self.overlay_scroll = next.saturating_sub(OVERLAY_VISIBLE.saturating_sub(1));
+            }
+        }
+        self.dirty.content = true;
     }
 
     fn overlay_item_count(&self) -> usize {

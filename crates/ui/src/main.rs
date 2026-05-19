@@ -19,6 +19,7 @@ use rashamon_renderer::framebuffer::Pixel;
 use ui_state::{BrowserState, DirtyFlags, OverlayKind, PageState, TabId, derive_title};
 
 use std::sync::mpsc;
+use std::time::{Duration, Instant};
 
 // Loading timing (at 60 fps)
 const LOAD_MIN_FRAMES:     u64 = 60;   // 1 s minimum visible loading state
@@ -197,6 +198,238 @@ fn spawn_fetch(tab_id: TabId, url: String) -> PendingFetch {
     PendingFetch { tab_id, receiver: rx }
 }
 
+// ── Internal release smoke test ───────────────────────────────────────────────
+
+fn smoke_fail(msg: impl Into<String>) -> Box<dyn std::error::Error> {
+    msg.into().into()
+}
+
+fn smoke_create_tab(state: &mut BrowserState, engine: &mut RenderEngine, private: bool) {
+    if private {
+        state.open_private_tab();
+    } else {
+        state.open_new_tab();
+    }
+    let id = state.active_tab_id;
+    engine.create_tab(id.raw(), private);
+    engine.set_active_tab(id.raw());
+}
+
+fn smoke_navigate(
+    state:  &mut BrowserState,
+    engine: &mut RenderEngine,
+    url:    &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let url = state.begin_navigate(url)
+        .ok_or_else(|| smoke_fail(format!("begin_navigate rejected {url}")))?;
+    let nav_id = state.active_tab().map_or(0, |t| t.nav_id);
+    engine.navigate(&url, nav_id)?;
+    Ok(())
+}
+
+fn smoke_apply_engine_events(
+    state:  &mut BrowserState,
+    engine: &mut RenderEngine,
+) -> Vec<EngineEvent> {
+    let mut seen = Vec::new();
+    for (tab_id, ev) in engine.poll_events() {
+        let target_raw = if tab_id == 0 { state.active_tab_id.raw() } else { tab_id };
+        match &ev {
+            EngineEvent::TitleChanged(t) => {
+                if let Some(tab) = state.tabs.iter_mut().find(|t2| t2.id.raw() == target_raw) {
+                    tab.title = t.clone();
+                }
+            }
+            EngineEvent::UrlChanged(u) => {
+                if let Some(tab) = state.tabs.iter_mut().find(|t2| t2.id.raw() == target_raw) {
+                    tab.url = u.clone();
+                }
+            }
+            EngineEvent::LoadComplete => state.resolve_engine_loading_for(target_raw),
+            EngineEvent::LoadFailed(reason) => state.fail_loading_for(target_raw, reason),
+            EngineEvent::ContentHeightChanged(h) => state.set_content_height_for(target_raw, *h),
+            EngineEvent::NavStateChanged { can_back, can_forward } => {
+                if let Some(tab) = state.tabs.iter_mut().find(|t2| t2.id.raw() == target_raw) {
+                    tab.webkit_can_back = *can_back;
+                    tab.webkit_can_forward = *can_forward;
+                }
+            }
+            EngineEvent::LoadStarted => {}
+        }
+        seen.push(ev);
+    }
+    seen
+}
+
+fn smoke_wait_for<F>(
+    state:  &mut BrowserState,
+    engine: &mut RenderEngine,
+    label:  &str,
+    timeout: Duration,
+    mut pred: F,
+) -> Result<(), Box<dyn std::error::Error>>
+where
+    F: FnMut(&BrowserState, &[EngineEvent]) -> bool,
+{
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        state.frame_count += 1;
+        engine.pump_gtk();
+        let events = smoke_apply_engine_events(state, engine);
+        if pred(state, &events) {
+            eprintln!("[smoke] PASS {label}");
+            return Ok(());
+        }
+        std::thread::sleep(Duration::from_millis(16));
+    }
+    Err(smoke_fail(format!("smoke timeout: {label}")))
+}
+
+fn run_webkit_smoke_test() -> Result<(), Box<dyn std::error::Error>> {
+    eprintln!("[smoke] starting WebKit smoke test");
+    let mut engine = RenderEngine::new(FB_WIDTH, FB_HEIGHT.saturating_sub(TOP_BAR_HEIGHT))?;
+    if !engine.is_real_engine() {
+        return Err(smoke_fail("WebKit smoke test requires a real engine, got fallback"));
+    }
+
+    let mut state = BrowserState::new();
+    let first_id = state.active_tab_id;
+    engine.create_tab(first_id.raw(), false);
+    engine.set_active_tab(first_id.raw());
+    smoke_wait_for(&mut state, &mut engine, "startup no args", Duration::from_secs(2), |s, _| {
+        s.tabs.len() == 1 && s.active_tab().map_or(false, |t| matches!(t.page_state, PageState::NewTab))
+    })?;
+
+    smoke_navigate(&mut state, &mut engine, "https://example.com")?;
+    smoke_wait_for(&mut state, &mut engine, "startup/direct URL renders", Duration::from_secs(12), |s, events| {
+        events.iter().any(|e| matches!(e, EngineEvent::LoadComplete))
+            && s.active_tab().map_or(false, |t| matches!(t.page_state, PageState::Loaded))
+    })?;
+    let first_loaded_id = state.active_tab_id;
+
+    smoke_create_tab(&mut state, &mut engine, false);
+    {
+        use omnibox::{classify_input, InputKind, DEFAULT_PROVIDER};
+        let search_url = match classify_input("rust browser engine") {
+            InputKind::Search(q) => DEFAULT_PROVIDER.build_url(&q),
+            _ => return Err(smoke_fail("search query was not classified as search")),
+        };
+        smoke_navigate(&mut state, &mut engine, &search_url)?;
+    }
+    smoke_wait_for(&mut state, &mut engine, "startup/search query renders", Duration::from_secs(12), |s, events| {
+        events.iter().any(|e| matches!(e, EngineEvent::LoadComplete))
+            && s.active_tab().map_or(false, |t| t.url.contains("duckduckgo.com"))
+    })?;
+
+    state.activate_tab(first_loaded_id);
+    engine.set_active_tab(first_loaded_id.raw());
+    smoke_wait_for(&mut state, &mut engine, "tab switch without reload", Duration::from_secs(3), |s, _| {
+        s.active_tab_id == first_loaded_id
+            && s.active_tab().map_or(false, |t| matches!(t.page_state, PageState::Loaded))
+    })?;
+
+    smoke_navigate(&mut state, &mut engine, "https://example.org")?;
+    smoke_wait_for(&mut state, &mut engine, "second URL renders", Duration::from_secs(12), |s, events| {
+        events.iter().any(|e| matches!(e, EngineEvent::LoadComplete))
+            && s.active_tab().map_or(false, |t| t.url.contains("example.org"))
+    })?;
+    engine.go_back().ok();
+    smoke_wait_for(&mut state, &mut engine, "back returns to first URL", Duration::from_secs(8), |s, _| {
+        s.active_tab().map_or(false, |t| t.url.contains("example.com"))
+    })?;
+    engine.go_forward().ok();
+    smoke_wait_for(&mut state, &mut engine, "forward returns to second URL", Duration::from_secs(8), |s, _| {
+        s.active_tab().map_or(false, |t| t.url.contains("example.org"))
+    })?;
+    let reload_url = state.active_tab().map(|t| t.url.clone()).unwrap_or_default();
+    smoke_navigate(&mut state, &mut engine, &reload_url)?;
+    smoke_wait_for(&mut state, &mut engine, "reload renders", Duration::from_secs(12), |_s, events| {
+        events.iter().any(|e| matches!(e, EngineEvent::LoadComplete))
+    })?;
+
+    state.scroll_by(SCROLL_WHEEL * 4);
+    engine.scroll(SCROLL_WHEEL * 4);
+    smoke_wait_for(&mut state, &mut engine, "scroll command stable", Duration::from_secs(2), |_s, _| true)?;
+
+    let before_bookmarks = state.bookmarks.len();
+    state.toggle_bookmark();
+    if state.bookmarks.len() != before_bookmarks + 1 {
+        return Err(smoke_fail("bookmark add failed"));
+    }
+    let bm_url = state.bookmarks.last().map(|b| b.url.clone()).ok_or_else(|| smoke_fail("missing added bookmark"))?;
+    state.toggle_bookmark();
+    if state.bookmarks.len() != before_bookmarks {
+        return Err(smoke_fail("bookmark remove failed"));
+    }
+    smoke_navigate(&mut state, &mut engine, &bm_url)?;
+    smoke_wait_for(&mut state, &mut engine, "bookmark open renders", Duration::from_secs(12), |_s, events| {
+        events.iter().any(|e| matches!(e, EngineEvent::LoadComplete))
+    })?;
+
+    let hist_url = state.global_history.last()
+        .map(|e| e.url.clone())
+        .ok_or_else(|| smoke_fail("history was not recorded"))?;
+    state.toggle_overlay(OverlayKind::History);
+    let overlay_url = state.activate_overlay_item()
+        .ok_or_else(|| smoke_fail("history overlay did not select an entry"))?;
+    if overlay_url != hist_url {
+        return Err(smoke_fail("history overlay selected unexpected URL"));
+    }
+    smoke_navigate(&mut state, &mut engine, &overlay_url)?;
+    smoke_wait_for(&mut state, &mut engine, "history reopen renders", Duration::from_secs(12), |_s, events| {
+        events.iter().any(|e| matches!(e, EngineEvent::LoadComplete))
+    })?;
+
+    let public_history_len = state.global_history.len();
+    smoke_create_tab(&mut state, &mut engine, true);
+    smoke_navigate(&mut state, &mut engine, "https://example.com")?;
+    smoke_wait_for(&mut state, &mut engine, "private tab renders", Duration::from_secs(12), |_s, events| {
+        events.iter().any(|e| matches!(e, EngineEvent::LoadComplete))
+    })?;
+    if state.global_history.len() != public_history_len {
+        return Err(smoke_fail("private tab persisted global history"));
+    }
+
+    engine.zoom_in();
+    engine.zoom_out();
+    engine.zoom_reset();
+    smoke_wait_for(&mut state, &mut engine, "zoom commands stable", Duration::from_secs(2), |_s, _| true)?;
+
+    smoke_create_tab(&mut state, &mut engine, false);
+    smoke_navigate(&mut state, &mut engine, "http://nonexistent.invalid")?;
+    smoke_wait_for(&mut state, &mut engine, "broken URL errors", Duration::from_secs(12), |s, events| {
+        events.iter().any(|e| matches!(e, EngineEvent::LoadFailed(_)))
+            && s.active_tab().map_or(false, |t| matches!(t.page_state, PageState::Error(_)))
+    })?;
+
+    let closing_id = state.active_tab_id;
+    engine.close_tab(closing_id.raw());
+    state.close_tab(closing_id);
+    engine.set_active_tab(state.active_tab_id.raw());
+    if state.tabs.iter().any(|t| t.id == closing_id) {
+        return Err(smoke_fail("close tab failed"));
+    }
+    eprintln!("[smoke] PASS close tab");
+
+    while state.tabs.len() > 1 {
+        let id = state.active_tab_id;
+        engine.close_tab(id.raw());
+        state.close_tab(id);
+        engine.set_active_tab(state.active_tab_id.raw());
+    }
+    let last_id = state.active_tab_id;
+    engine.close_tab(last_id.raw());
+    state.close_tab(last_id);
+    engine.create_tab(state.active_tab_id.raw(), false);
+    engine.set_active_tab(state.active_tab_id.raw());
+    if state.tabs.len() != 1 || !state.active_tab().map_or(false, |t| matches!(t.page_state, PageState::NewTab)) {
+        return Err(smoke_fail("close last tab did not restore a new tab"));
+    }
+    eprintln!("[smoke] PASS close last tab");
+    eprintln!("[smoke] PASS WebKit smoke test complete");
+    Ok(())
+}
+
 // ── Content height measurement ────────────────────────────────────────────────
 
 fn measure_content_height(nodes: &[PageNode], font: &FontManager) -> u32 {
@@ -229,6 +462,13 @@ fn measure_content_height(nodes: &[PageNode], font: &FontManager) -> u32 {
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     eprintln!("Rashamon Arc {APP_VERSION}");
 
+    if std::env::args().skip(1).any(|arg| arg == "--smoke-test-webkit") {
+        return run_webkit_smoke_test();
+    }
+
+    let content_h  = FB_HEIGHT.saturating_sub(TOP_BAR_HEIGHT);
+    let mut engine = RenderEngine::new(FB_WIDTH, content_h)?;
+
     let sdl   = sdl2::init()?;
     let video = sdl.video()?;
     let _     = sdl.mouse().show_cursor(true);
@@ -246,8 +486,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let font_data  = include_bytes!("../assets/DejaVuSansMono.ttf");
     let font       = FontManager::new(font_data)?;
     let mut fb      = Framebuffer::new(FB_WIDTH, FB_HEIGHT);
-    let content_h   = FB_HEIGHT.saturating_sub(TOP_BAR_HEIGHT);
-    let mut engine  = RenderEngine::new(FB_WIDTH, content_h)?;
     let _http       = HttpClient::new();
     let mut state   = BrowserState::new();
     load_user_data(&mut state);
@@ -266,7 +504,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut buffered_outcome: Option<(TabId, FetchOutcome)> = None;
     let mut save_dirty = SaveDirty::default();
 
-    let startup_input = std::env::args().skip(1).collect::<Vec<_>>().join(" ");
+    let startup_input = std::env::args()
+        .skip(1)
+        .filter(|arg| arg != "--smoke-test" && arg != "--smoke-test-webkit")
+        .collect::<Vec<_>>()
+        .join(" ");
     if !startup_input.trim().is_empty() {
         use omnibox::{classify_input, InputKind};
         let nav_url = match classify_input(startup_input.trim()) {

@@ -128,6 +128,12 @@ impl WebKitEngine {
     pub fn create(content_w: u32, content_h: u32)
         -> Result<(Self, WebKitDriver), Box<dyn std::error::Error>>
     {
+        if std::env::var_os("GDK_BACKEND").is_none() {
+            std::env::set_var("GDK_BACKEND", "x11,wayland");
+        }
+        if std::env::var_os("WEBKIT_DISABLE_COMPOSITING_MODE").is_none() {
+            std::env::set_var("WEBKIT_DISABLE_COMPOSITING_MODE", "1");
+        }
         gtk::init().map_err(|e| format!("GTK init failed: {e}"))?;
 
         let (cmd_tx, cmd_rx)     = mpsc::sync_channel::<Cmd>(32);
@@ -386,7 +392,10 @@ impl WebKitDriver {
                 }
 
                 Ok(Cmd::CloseTab { tab_id }) => {
-                    self.tabs.remove(&tab_id);
+                    if let Some(entry) = self.tabs.remove(&tab_id) {
+                        use webkit2gtk::WebViewExt;
+                        entry.webview.stop_loading();
+                    }
                     trace!("[webkit-driver] dropped WebView for tab {tab_id}");
                 }
 
@@ -684,9 +693,6 @@ fn take_snapshot(
         move |result| match result {
             Err(e) => {
                 trace!("[webkit] snapshot error tab={tab_id}: {e}");
-                let _ = tx.try_send(Reply::LoadFailed {
-                    tab_id, nav_id, reason: e.to_string(),
-                });
             }
             Ok(src_surface) => {
                 let mut img = match cairo::ImageSurface::create(

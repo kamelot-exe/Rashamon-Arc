@@ -1,6 +1,7 @@
 //! ContentEngine — stable interface every rendering backend must implement.
 
 use crate::framebuffer::Framebuffer;
+use crate::permissions::{PermissionDecision, PermissionKind};
 
 /// Events the engine pushes up to the browser shell.
 /// Drained once per frame via `ContentEngine::poll_events`.
@@ -24,6 +25,20 @@ pub enum EngineEvent {
     DownloadProgress { id: u64, received: u64, progress: f64 },
     DownloadFinished { id: u64, path: String },
     DownloadFailed { id: u64, reason: String },
+    PermissionPrompt {
+        id: u64,
+        origin: String,
+        kind: PermissionKind,
+        nav_id: u64,
+    },
+    PermissionResolved { id: u64 },
+    SitePermissions {
+        origin: String,
+        decisions: Vec<(PermissionKind, PermissionDecision)>,
+        adblock_enabled: bool,
+        adblock_allowlisted: bool,
+        blocked_count: u64,
+    },
 }
 
 /// Whether the engine wrote real pixels into the framebuffer.
@@ -71,6 +86,16 @@ pub trait ContentEngine: Send {
     fn find_previous(&mut self) {}
     fn find_clear(&mut self) {}
     fn download_url(&mut self, _url: &str) {}
+    fn resolve_permission(&mut self, _id: u64, _allow: bool, _remember: bool) {}
+    fn query_site_permissions(&mut self, _origin: &str, _private: bool) {}
+    fn set_site_permission(
+        &mut self,
+        _origin: &str,
+        _kind: PermissionKind,
+        _decision: PermissionDecision,
+        _private: bool,
+    ) {}
+    fn set_site_adblock_allowlisted(&mut self, _origin: &str, _allowlisted: bool, _private: bool) {}
 
     /// Whether the active tab's WebView has native back/forward history.
     /// Returns false on stub engines — shell history is used instead.

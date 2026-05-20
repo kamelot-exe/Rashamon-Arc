@@ -26,6 +26,9 @@
 
 use crate::engine_trait::{ContentEngine, EngineEvent, EngineFrame};
 use crate::framebuffer::{Framebuffer, Pixel};
+use crate::permissions::{
+    origin_from_url, DecisionSource, PermissionDecision, PermissionKind, PermissionStore,
+};
 use glib::Cast;
 use rashamon_net::AdblockEngine;
 
@@ -68,6 +71,10 @@ enum Cmd {
     FindPrevious { tab_id: u64 },
     FindClear { tab_id: u64 },
     DownloadUrl { tab_id: u64, url: String },
+    ResolvePermission { id: u64, allow: bool, remember: bool },
+    QuerySitePermissions { origin: String, private: bool },
+    SetSitePermission { origin: String, kind: PermissionKind, decision: PermissionDecision, private: bool },
+    SetSiteAdblock { origin: String, allowlisted: bool, private: bool },
     Shutdown,
 }
 
@@ -94,6 +101,15 @@ enum Reply {
     DownloadProgress { id: u64, received: u64, progress: f64 },
     DownloadFinished { id: u64, path: String },
     DownloadFailed { id: u64, reason: String },
+    PermissionPrompt { id: u64, tab_id: u64, nav_id: u64, origin: String, kind: PermissionKind },
+    PermissionResolved { tab_id: u64, id: u64 },
+    SitePermissions {
+        origin: String,
+        decisions: Vec<(PermissionKind, PermissionDecision)>,
+        adblock_enabled: bool,
+        adblock_allowlisted: bool,
+        blocked_count: u64,
+    },
 }
 
 // ── Per-tab engine state ──────────────────────────────────────────────────────
@@ -126,10 +142,21 @@ pub struct WebKitEngine {
 struct TabEntry {
     webview:     webkit2gtk::WebView,
     _window:     gtk::OffscreenWindow,
+    is_private:  bool,
     nav_id_cell: Rc<Cell<u64>>,
     frame_gen:   Rc<Cell<u64>>,
     schedule_gen: Rc<Cell<u64>>,
     alive:       Rc<Cell<bool>>,
+}
+
+struct PendingPermission {
+    id: u64,
+    tab_id: u64,
+    nav_id: u64,
+    origin: String,
+    kind: PermissionKind,
+    private: bool,
+    request: webkit2gtk::PermissionRequest,
 }
 
 pub struct WebKitDriver {
@@ -137,6 +164,10 @@ pub struct WebKitDriver {
     reply_tx: mpsc::SyncSender<Reply>,
     tabs:     HashMap<u64, TabEntry>,
     adblock:  Rc<RefCell<AdblockEngine>>,
+    adblock_allowlist_path: PathBuf,
+    permissions: Rc<RefCell<PermissionStore>>,
+    pending_permission: Rc<RefCell<Option<PendingPermission>>>,
+    permission_seq: Rc<Cell<u64>>,
     normal_context: webkit2gtk::WebContext,
     download_seq: Rc<Cell<u64>>,
     w:        u32,
@@ -162,6 +193,11 @@ impl WebKitEngine {
         let (cmd_tx, cmd_rx)     = mpsc::sync_channel::<Cmd>(32);
         let (reply_tx, reply_rx) = mpsc::sync_channel::<Reply>(32);
         let download_seq = Rc::new(Cell::new(0));
+        let pending_permission = Rc::new(RefCell::new(None));
+        let permission_seq = Rc::new(Cell::new(0));
+        let adblock_allowlist_path = rashamon_data_dir().join("adblock_allowlist.json");
+        let mut adblock = AdblockEngine::new();
+        adblock.load_allowlist_from_path(&adblock_allowlist_path);
         let normal_context = webkit2gtk::WebContext::default()
             .unwrap_or_else(webkit2gtk::WebContext::new);
         connect_downloads_for_context(
@@ -184,7 +220,11 @@ impl WebKitEngine {
             cmd_rx,
             reply_tx,
             tabs: HashMap::new(),
-            adblock: Rc::new(RefCell::new(AdblockEngine::new())),
+            adblock: Rc::new(RefCell::new(adblock)),
+            adblock_allowlist_path,
+            permissions: Rc::new(RefCell::new(PermissionStore::load_default())),
+            pending_permission,
+            permission_seq,
             normal_context,
             download_seq,
             w:    content_w,
@@ -332,6 +372,40 @@ impl ContentEngine for WebKitEngine {
         });
     }
 
+    fn resolve_permission(&mut self, id: u64, allow: bool, remember: bool) {
+        let _ = self.cmd_tx.try_send(Cmd::ResolvePermission { id, allow, remember });
+    }
+
+    fn query_site_permissions(&mut self, origin: &str, private: bool) {
+        let _ = self.cmd_tx.try_send(Cmd::QuerySitePermissions {
+            origin: origin.to_string(),
+            private,
+        });
+    }
+
+    fn set_site_permission(
+        &mut self,
+        origin: &str,
+        kind: PermissionKind,
+        decision: PermissionDecision,
+        private: bool,
+    ) {
+        let _ = self.cmd_tx.try_send(Cmd::SetSitePermission {
+            origin: origin.to_string(),
+            kind,
+            decision,
+            private,
+        });
+    }
+
+    fn set_site_adblock_allowlisted(&mut self, origin: &str, allowlisted: bool, private: bool) {
+        let _ = self.cmd_tx.try_send(Cmd::SetSiteAdblock {
+            origin: origin.to_string(),
+            allowlisted,
+            private,
+        });
+    }
+
     fn scroll(&mut self, delta_y: i32) {
         let tab_id = self.active_tab_id;
         let _ = self.cmd_tx.try_send(Cmd::ScrollBy { tab_id, delta: delta_y });
@@ -455,6 +529,32 @@ impl ContentEngine for WebKitEngine {
                 Ok(Reply::DownloadFailed { id, reason }) => {
                     self.pending_events.push((0, EngineEvent::DownloadFailed { id, reason }));
                 }
+                Ok(Reply::PermissionPrompt { id, tab_id, nav_id, origin, kind }) => {
+                    self.pending_events.push((tab_id, EngineEvent::PermissionPrompt {
+                        id,
+                        origin,
+                        kind,
+                        nav_id,
+                    }));
+                }
+                Ok(Reply::PermissionResolved { tab_id, id }) => {
+                    self.pending_events.push((tab_id, EngineEvent::PermissionResolved { id }));
+                }
+                Ok(Reply::SitePermissions {
+                    origin,
+                    decisions,
+                    adblock_enabled,
+                    adblock_allowlisted,
+                    blocked_count,
+                }) => {
+                    self.pending_events.push((0, EngineEvent::SitePermissions {
+                        origin,
+                        decisions,
+                        adblock_enabled,
+                        adblock_allowlisted,
+                        blocked_count,
+                    }));
+                }
                 Err(mpsc::TryRecvError::Empty | mpsc::TryRecvError::Disconnected) => break,
             }
         }
@@ -488,6 +588,9 @@ impl WebKitDriver {
                     let entry = make_tab_entry(
                         tab_id, is_private, self.w, self.h, self.reply_tx.clone(),
                         Rc::clone(&self.adblock),
+                        Rc::clone(&self.permissions),
+                        Rc::clone(&self.pending_permission),
+                        Rc::clone(&self.permission_seq),
                         &self.normal_context,
                         Rc::clone(&self.download_seq),
                     );
@@ -496,6 +599,12 @@ impl WebKitDriver {
                 }
 
                 Ok(Cmd::CloseTab { tab_id }) => {
+                    deny_pending_permission_for_tab(
+                        &self.pending_permission,
+                        tab_id,
+                        &self.reply_tx,
+                        "tab-close",
+                    );
                     if let Some(entry) = self.tabs.remove(&tab_id) {
                         use webkit2gtk::WebViewExt;
                         entry.alive.set(false);
@@ -532,13 +641,19 @@ impl WebKitDriver {
                     if let Some(entry) = self.tabs.get(&tab_id) {
                         use webkit2gtk::WebViewExt;
                         trace!("[webkit-driver] Navigate tab={tab_id} nav={nav_id}: {url}");
+                        deny_pending_permission_for_tab(
+                            &self.pending_permission,
+                            tab_id,
+                            &self.reply_tx,
+                            "navigation",
+                        );
                         // Update shared cell BEFORE load_uri so synchronous signals
                         // fire with the correct nav_id.
                         entry.nav_id_cell.set(nav_id);
                         next_cell_generation(&entry.schedule_gen);
                         next_cell_generation(&entry.frame_gen);
                         if let Some(reason) = adblock_block_reason(
-                            &self.adblock, &url, &wv_url(&entry.webview),
+                            &self.adblock, &url, &wv_url(&entry.webview), entry.is_private,
                         ) {
                             log_adblock_block(&url, &reason);
                             let _ = self.reply_tx.try_send(Reply::LoadFailed {
@@ -669,11 +784,13 @@ impl WebKitDriver {
 
                 Ok(Cmd::AdblockAllowDomain { domain }) => {
                     self.adblock.borrow_mut().allowlist_domain(&domain);
+                    self.adblock.borrow().save_allowlist_to_path(&self.adblock_allowlist_path);
                     trace!("[adblock] allowlisted {domain}");
                 }
 
                 Ok(Cmd::AdblockRemoveAllowDomain { domain }) => {
                     self.adblock.borrow_mut().remove_allowlist_domain(&domain);
+                    self.adblock.borrow().save_allowlist_to_path(&self.adblock_allowlist_path);
                     trace!("[adblock] removed allowlist {domain}");
                 }
 
@@ -714,6 +831,75 @@ impl WebKitDriver {
                     }
                 }
 
+                Ok(Cmd::ResolvePermission { id, allow, remember }) => {
+                    resolve_pending_permission(
+                        &self.pending_permission,
+                        &self.permissions,
+                        &self.tabs,
+                        &self.reply_tx,
+                        id,
+                        allow,
+                        remember,
+                    );
+                }
+
+                Ok(Cmd::QuerySitePermissions { origin, private }) => {
+                    send_site_info(
+                        &self.reply_tx,
+                        &self.permissions,
+                        &self.adblock,
+                        &origin,
+                        private,
+                    );
+                }
+
+                Ok(Cmd::SetSitePermission { origin, kind, decision, private }) => {
+                    self.permissions.borrow_mut().set(&origin, kind, decision, private);
+                    trace!(
+                        "[permissions] site-panel set origin={} kind={} decision={} private={}",
+                        origin,
+                        kind.as_str(),
+                        decision.as_str(),
+                        private,
+                    );
+                    send_site_info(
+                        &self.reply_tx,
+                        &self.permissions,
+                        &self.adblock,
+                        &origin,
+                        private,
+                    );
+                }
+
+                Ok(Cmd::SetSiteAdblock { origin, allowlisted, private }) => {
+                    {
+                        let mut adblock = self.adblock.borrow_mut();
+                        if allowlisted {
+                            adblock.allowlist_domain_for_context(&origin, private);
+                        } else {
+                            adblock.remove_allowlist_domain_for_context(&origin, private);
+                        }
+                    }
+                    if !private {
+                        self.adblock
+                            .borrow()
+                            .save_allowlist_to_path(&self.adblock_allowlist_path);
+                    }
+                    trace!(
+                        "[adblock] site-panel origin={} allowlisted={} private={}",
+                        origin,
+                        allowlisted,
+                        private,
+                    );
+                    send_site_info(
+                        &self.reply_tx,
+                        &self.permissions,
+                        &self.adblock,
+                        &origin,
+                        private,
+                    );
+                }
+
                 Ok(Cmd::Shutdown) | Err(mpsc::TryRecvError::Disconnected) => break,
                 Err(mpsc::TryRecvError::Empty) => break,
             }
@@ -730,6 +916,9 @@ fn make_tab_entry(
     h:         u32,
     reply_tx:  mpsc::SyncSender<Reply>,
     adblock:   Rc<RefCell<AdblockEngine>>,
+    permissions: Rc<RefCell<PermissionStore>>,
+    pending_permission: Rc<RefCell<Option<PendingPermission>>>,
+    permission_seq: Rc<Cell<u64>>,
     normal_context: &webkit2gtk::WebContext,
     download_seq: Rc<Cell<u64>>,
 ) -> TabEntry {
@@ -743,6 +932,7 @@ fn make_tab_entry(
 
     let settings = Settings::new();
     settings.set_enable_webgl(false);
+    settings.set_javascript_can_access_clipboard(false);
     settings.set_hardware_acceleration_policy(HardwareAccelerationPolicy::Never);
 
     let webview = if is_private {
@@ -772,6 +962,27 @@ fn make_tab_entry(
     let frame_gen: Rc<Cell<u64>> = Rc::new(Cell::new(0));
     let schedule_gen: Rc<Cell<u64>> = Rc::new(Cell::new(0));
     let alive: Rc<Cell<bool>> = Rc::new(Cell::new(true));
+
+    {
+        let permissions = Rc::clone(&permissions);
+        let pending_permission = Rc::clone(&pending_permission);
+        let permission_seq = Rc::clone(&permission_seq);
+        let reply_tx = reply_tx.clone();
+        let nav_id_cell = Rc::clone(&nav_id_cell);
+        webview.connect_permission_request(move |wv, request| {
+            handle_permission_request(
+                wv,
+                request,
+                tab_id,
+                nav_id_cell.get(),
+                Rc::clone(&permissions),
+                Rc::clone(&pending_permission),
+                Rc::clone(&permission_seq),
+                reply_tx.clone(),
+                is_private,
+            )
+        });
+    }
 
     if let Some(find) = webview.find_controller() {
         let tx = reply_tx.clone();
@@ -818,7 +1029,7 @@ fn make_tab_entry(
             let Some(uri) = uri else {
                 return false;
             };
-            if let Some(reason) = adblock_block_reason(&ab, &uri, &wv_url(wv)) {
+            if let Some(reason) = adblock_block_reason(&ab, &uri, &wv_url(wv), is_private) {
                 log_adblock_block(&uri, &reason);
                 decision.ignore();
                 let _ = tx.try_send(Reply::LoadFailed {
@@ -907,7 +1118,322 @@ fn make_tab_entry(
         });
     }
 
-    TabEntry { webview, _window: window, nav_id_cell, frame_gen, schedule_gen, alive }
+    TabEntry { webview, _window: window, is_private, nav_id_cell, frame_gen, schedule_gen, alive }
+}
+
+// ── Permission handling ──────────────────────────────────────────────────────
+
+fn handle_permission_request(
+    wv: &webkit2gtk::WebView,
+    request: &webkit2gtk::PermissionRequest,
+    tab_id: u64,
+    nav_id: u64,
+    store: Rc<RefCell<PermissionStore>>,
+    pending: Rc<RefCell<Option<PendingPermission>>>,
+    seq: Rc<Cell<u64>>,
+    tx: mpsc::SyncSender<Reply>,
+    private: bool,
+) -> bool {
+    use webkit2gtk::{
+        GeolocationPermissionRequest, NotificationPermissionRequest, PermissionRequestExt,
+        UserMediaPermissionRequest, UserMediaPermissionRequestExt,
+    };
+
+    let Some(origin) = origin_from_url(&wv_url(wv)) else {
+        request.deny();
+        trace!("[permissions] request origin=<unknown> kind=unknown source=default decision=deny final=deny");
+        return true;
+    };
+
+    if request.downcast_ref::<NotificationPermissionRequest>().is_some() {
+        return decide_single_permission(
+            request,
+            &store,
+            &pending,
+            &seq,
+            &tx,
+            tab_id,
+            nav_id,
+            private,
+            &origin,
+            PermissionKind::Notifications,
+        );
+    }
+    if request.downcast_ref::<GeolocationPermissionRequest>().is_some() {
+        return decide_single_permission(
+            request,
+            &store,
+            &pending,
+            &seq,
+            &tx,
+            tab_id,
+            nav_id,
+            private,
+            &origin,
+            PermissionKind::Geolocation,
+        );
+    }
+    if let Some(media) = request.downcast_ref::<UserMediaPermissionRequest>() {
+        let mut kinds = Vec::new();
+        if media.is_for_video_device() {
+            kinds.push(PermissionKind::Camera);
+        }
+        if media.is_for_audio_device() {
+            kinds.push(PermissionKind::Microphone);
+        }
+        if kinds.is_empty() {
+            request.deny();
+            trace!("[permissions] request origin={origin} kind=user-media source=default decision=deny final=deny");
+            return true;
+        }
+
+        let mut all_allowed = true;
+        for kind in kinds {
+            let (decision, source) = store.borrow().get(&origin, kind, private);
+            if decision == PermissionDecision::Ask {
+                return queue_permission_prompt(
+                    request, pending, seq, tx, tab_id, nav_id, private, origin, kind,
+                );
+            }
+            let allowed = decision == PermissionDecision::Allow;
+            all_allowed &= allowed;
+            trace_permission_decision(
+                &origin,
+                kind,
+                decision,
+                source,
+                if allowed { "allow" } else { "deny" },
+            );
+        }
+        if all_allowed {
+            request.allow();
+        } else {
+            request.deny();
+        }
+        return true;
+    }
+
+    request.deny();
+    trace!("[permissions] request origin={origin} kind=unsupported source=default decision=deny final=deny");
+    true
+}
+
+fn decide_single_permission(
+    request: &webkit2gtk::PermissionRequest,
+    store: &Rc<RefCell<PermissionStore>>,
+    pending: &Rc<RefCell<Option<PendingPermission>>>,
+    seq: &Rc<Cell<u64>>,
+    tx: &mpsc::SyncSender<Reply>,
+    tab_id: u64,
+    nav_id: u64,
+    private: bool,
+    origin: &str,
+    kind: PermissionKind,
+) -> bool {
+    use webkit2gtk::PermissionRequestExt;
+
+    let (decision, source) = store.borrow().get(origin, kind, private);
+    match decision {
+        PermissionDecision::Allow => {
+            request.allow();
+            trace_permission_decision(origin, kind, decision, source, "allow");
+        }
+        PermissionDecision::Deny | PermissionDecision::Ask => {
+            if decision == PermissionDecision::Ask {
+                return queue_permission_prompt(
+                    request, Rc::clone(pending), Rc::clone(seq), tx.clone(),
+                    tab_id, nav_id, private, origin.to_string(), kind,
+                );
+            } else {
+                request.deny();
+                trace_permission_decision(origin, kind, decision, source, "deny");
+            }
+        }
+    }
+    true
+}
+
+fn queue_permission_prompt(
+    request: &webkit2gtk::PermissionRequest,
+    pending: Rc<RefCell<Option<PendingPermission>>>,
+    seq: Rc<Cell<u64>>,
+    tx: mpsc::SyncSender<Reply>,
+    tab_id: u64,
+    nav_id: u64,
+    private: bool,
+    origin: String,
+    kind: PermissionKind,
+) -> bool {
+    use webkit2gtk::PermissionRequestExt;
+
+    if let Some(old) = pending.borrow_mut().take() {
+        trace!("[permissions] stale prompt denied id={} reason=replaced", old.id);
+        old.request.deny();
+        let _ = tx.try_send(Reply::PermissionResolved {
+            tab_id: old.tab_id,
+            id: old.id,
+        });
+    }
+
+    let id = seq.get().wrapping_add(1).max(1);
+    seq.set(id);
+    *pending.borrow_mut() = Some(PendingPermission {
+        id,
+        tab_id,
+        nav_id,
+        origin: origin.clone(),
+        kind,
+        private,
+        request: request.clone(),
+    });
+    trace!(
+        "[permissions] prompt id={} tab={} nav={} origin={} kind={}",
+        id,
+        tab_id,
+        nav_id,
+        origin,
+        kind.as_str(),
+    );
+    let _ = tx.try_send(Reply::PermissionPrompt { id, tab_id, nav_id, origin, kind });
+    true
+}
+
+fn resolve_pending_permission(
+    pending: &Rc<RefCell<Option<PendingPermission>>>,
+    store: &Rc<RefCell<PermissionStore>>,
+    tabs: &HashMap<u64, TabEntry>,
+    tx: &mpsc::SyncSender<Reply>,
+    id: u64,
+    allow: bool,
+    remember: bool,
+) {
+    use webkit2gtk::PermissionRequestExt;
+
+    let Some(p) = pending.borrow_mut().take() else {
+        trace!("[permissions] resolve ignored id={id} reason=no-pending");
+        return;
+    };
+    if p.id != id {
+        trace!("[permissions] resolve ignored id={id} pending={} reason=mismatch", p.id);
+        *pending.borrow_mut() = Some(p);
+        return;
+    }
+
+    let nav_current = tabs
+        .get(&p.tab_id)
+        .map(|tab| tab.nav_id_cell.get() == p.nav_id)
+        .unwrap_or(false);
+    if !nav_current {
+        trace!("[permissions] stale prompt denied id={} reason=nav-changed", p.id);
+        p.request.deny();
+    } else if allow {
+        if remember || p.private {
+            store.borrow_mut().set(&p.origin, p.kind, PermissionDecision::Allow, p.private);
+        }
+        trace!("[permissions] prompt allowed id={} remember={} private={}", p.id, remember, p.private);
+        p.request.allow();
+    } else {
+        if remember || p.private {
+            store.borrow_mut().set(&p.origin, p.kind, PermissionDecision::Deny, p.private);
+        }
+        trace!("[permissions] prompt denied id={} remember={} private={}", p.id, remember, p.private);
+        p.request.deny();
+    }
+    let _ = tx.try_send(Reply::PermissionResolved { tab_id: p.tab_id, id: p.id });
+}
+
+fn deny_pending_permission_for_tab(
+    pending: &Rc<RefCell<Option<PendingPermission>>>,
+    tab_id: u64,
+    tx: &mpsc::SyncSender<Reply>,
+    reason: &'static str,
+) {
+    use webkit2gtk::PermissionRequestExt;
+
+    let should_deny = pending.borrow().as_ref().map_or(false, |p| p.tab_id == tab_id);
+    if !should_deny {
+        return;
+    }
+    if let Some(p) = pending.borrow_mut().take() {
+        trace!("[permissions] stale prompt denied id={} reason={reason}", p.id);
+        p.request.deny();
+        let _ = tx.try_send(Reply::PermissionResolved { tab_id: p.tab_id, id: p.id });
+    }
+}
+
+fn trace_permission_decision(
+    origin: &str,
+    kind: PermissionKind,
+    decision: PermissionDecision,
+    source: DecisionSource,
+    final_action: &str,
+) {
+    trace!(
+        "[permissions] request origin={} kind={} source={} decision={} final={}",
+        origin,
+        kind.as_str(),
+        decision_source_label(source),
+        decision.as_str(),
+        final_action,
+    );
+}
+
+fn decision_source_label(source: DecisionSource) -> &'static str {
+    match source {
+        DecisionSource::Persisted => "persisted",
+        DecisionSource::Session => "session",
+        DecisionSource::Default => "default",
+    }
+}
+
+fn permission_kinds() -> [PermissionKind; 5] {
+    [
+        PermissionKind::Notifications,
+        PermissionKind::Geolocation,
+        PermissionKind::Camera,
+        PermissionKind::Microphone,
+        PermissionKind::Clipboard,
+    ]
+}
+
+fn send_site_info(
+    tx: &mpsc::SyncSender<Reply>,
+    permissions: &Rc<RefCell<PermissionStore>>,
+    adblock: &Rc<RefCell<AdblockEngine>>,
+    origin: &str,
+    private: bool,
+) {
+    let decisions = permission_kinds()
+        .iter()
+        .map(|kind| {
+            let (decision, _) = permissions.borrow().get(origin, *kind, private);
+            (*kind, decision)
+        })
+        .collect();
+    let adblock_ref = adblock.borrow();
+    let adblock_enabled = adblock_ref.is_enabled();
+    let adblock_allowlisted = adblock_ref.is_allowlisted_domain(origin, private);
+    let blocked_count = adblock_ref.blocked_count();
+    let _ = tx.try_send(Reply::SitePermissions {
+        origin: origin.to_string(),
+        decisions,
+        adblock_enabled,
+        adblock_allowlisted,
+        blocked_count,
+    });
+}
+
+fn rashamon_data_dir() -> PathBuf {
+    let base = std::env::var("XDG_DATA_HOME")
+        .ok()
+        .map(PathBuf::from)
+        .or_else(|| {
+            std::env::var("HOME")
+                .ok()
+                .map(|h| PathBuf::from(h).join(".local").join("share"))
+        })
+        .unwrap_or_else(|| PathBuf::from("."));
+    base.join("rashamon-arc")
 }
 
 // ── Snapshot helper ───────────────────────────────────────────────────────────
@@ -1126,8 +1652,11 @@ fn adblock_block_reason(
     adblock: &Rc<RefCell<AdblockEngine>>,
     url: &str,
     origin: &str,
+    private: bool,
 ) -> Option<String> {
-    let (blocked, reason) = adblock.borrow_mut().should_block(url, origin);
+    let (blocked, reason) = adblock
+        .borrow_mut()
+        .should_block_for_context(url, origin, private);
     blocked.then(|| reason.unwrap_or_else(|| "matched rule".to_string()))
 }
 

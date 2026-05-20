@@ -14,7 +14,10 @@ use crate::font::FontManager;
 use crate::layout::*;
 use crate::page::{PageNode, parse_html, is_low_content};
 use rashamon_net::{AdblockEngine, HttpClient};
-use rashamon_renderer::{download_destination_for_test, Framebuffer, RenderEngine, EngineEvent, EngineFrame};
+use rashamon_renderer::{
+    download_destination_for_test, origin_from_url, DecisionSource, EngineEvent, EngineFrame,
+    Framebuffer, PermissionDecision, PermissionKind, PermissionStore, RenderEngine,
+};
 use rashamon_renderer::framebuffer::Pixel;
 use ui_state::{BrowserState, DirtyFlags, DownloadStatus, OverlayKind, PageState, TabId, derive_title};
 
@@ -271,6 +274,27 @@ fn smoke_apply_engine_events(
             EngineEvent::DownloadFailed { id, reason } => {
                 state.fail_download(*id, reason.clone());
             }
+            EngineEvent::PermissionPrompt { id, origin, kind, nav_id } => {
+                state.show_permission_prompt(*id, target_raw, *nav_id, origin.clone(), *kind);
+            }
+            EngineEvent::PermissionResolved { id } => {
+                state.clear_permission_prompt(*id);
+            }
+            EngineEvent::SitePermissions {
+                origin,
+                decisions,
+                adblock_enabled,
+                adblock_allowlisted,
+                blocked_count,
+            } => {
+                state.set_site_permissions(
+                    origin.clone(),
+                    decisions.clone(),
+                    *adblock_enabled,
+                    *adblock_allowlisted,
+                    *blocked_count,
+                );
+            }
             EngineEvent::LoadStarted => {}
         }
         seen.push(ev);
@@ -324,6 +348,48 @@ fn smoke_adblock_model() -> Result<(), Box<dyn std::error::Error>> {
         return Err(smoke_fail("adblock did not apply to private-mode model"));
     }
 
+    let path = std::env::temp_dir().join(format!(
+        "rashamon-adblock-smoke-{}.json",
+        std::process::id(),
+    ));
+    let _ = std::fs::remove_file(&path);
+    let mut persisted = AdblockEngine::new();
+    persisted.allowlist_domain("doubleclick.net");
+    persisted.save_allowlist_to_path(&path);
+    let mut loaded = AdblockEngine::new();
+    loaded.load_allowlist_from_path(&path);
+    let (blocked, _) =
+        loaded.should_block("https://ad.doubleclick.net/pagead/id", "https://example.com");
+    if blocked {
+        return Err(smoke_fail("adblock allowlist did not persist"));
+    }
+
+    let mut private_session = AdblockEngine::new();
+    private_session.allowlist_domain_for_context("doubleclick.net", true);
+    let (blocked_private, _) = private_session.should_block_for_context(
+        "https://ad.doubleclick.net/pagead/id",
+        "https://example.com",
+        true,
+    );
+    let (blocked_normal, _) = private_session.should_block_for_context(
+        "https://ad.doubleclick.net/pagead/id",
+        "https://example.com",
+        false,
+    );
+    if blocked_private || !blocked_normal {
+        return Err(smoke_fail("private adblock allowlist leaked into normal context"));
+    }
+
+    std::fs::write(&path, "{not-json")?;
+    let mut malformed = AdblockEngine::new();
+    malformed.load_allowlist_from_path(&path);
+    let _ = std::fs::remove_file(&path);
+    let (blocked, _) =
+        malformed.should_block("https://ad.doubleclick.net/pagead/id", "https://example.com");
+    if !blocked {
+        return Err(smoke_fail("malformed adblock allowlist disabled blocking"));
+    }
+
     eprintln!("[smoke] PASS adblock model");
     Ok(())
 }
@@ -347,10 +413,105 @@ fn smoke_download_destination_model() -> Result<(), Box<dyn std::error::Error>> 
     Ok(())
 }
 
+fn smoke_permissions_model() -> Result<(), Box<dyn std::error::Error>> {
+    let path = std::env::temp_dir().join(format!(
+        "rashamon-permissions-smoke-{}.json",
+        std::process::id(),
+    ));
+    let _ = std::fs::remove_file(&path);
+
+    let https_origin = origin_from_url("https://Example.com/path?q=1")
+        .ok_or_else(|| smoke_fail("permission origin parse failed"))?;
+    if https_origin != "https://example.com" {
+        return Err(smoke_fail("permission origin was not normalized"));
+    }
+    if origin_from_url("http://example.com") == origin_from_url("https://example.com") {
+        return Err(smoke_fail("permission origin mixed http and https"));
+    }
+
+    let mut store = PermissionStore::load_from_path(path.clone());
+    let (decision, source) = store.get(&https_origin, PermissionKind::Camera, false);
+    if decision != PermissionDecision::Ask || source != DecisionSource::Default {
+        return Err(smoke_fail("unknown permission did not default to ask"));
+    }
+
+    store.set(
+        &https_origin,
+        PermissionKind::Notifications,
+        PermissionDecision::Allow,
+        false,
+    );
+    let reloaded = PermissionStore::load_from_path(path.clone());
+    let (decision, source) = reloaded.get(&https_origin, PermissionKind::Notifications, false);
+    if decision != PermissionDecision::Allow || source != DecisionSource::Persisted {
+        return Err(smoke_fail("normal permission did not persist"));
+    }
+    let mut store = PermissionStore::load_from_path(path.clone());
+    store.set(
+        &https_origin,
+        PermissionKind::Camera,
+        PermissionDecision::Deny,
+        false,
+    );
+    let reloaded = PermissionStore::load_from_path(path.clone());
+    let (decision, source) = reloaded.get(&https_origin, PermissionKind::Camera, false);
+    if decision != PermissionDecision::Deny || source != DecisionSource::Persisted {
+        return Err(smoke_fail("normal deny permission did not persist"));
+    }
+    let mut panel_state = BrowserState::new();
+    panel_state.open_site_info(Some(https_origin.clone()));
+    panel_state.set_site_permissions(
+        https_origin.clone(),
+        vec![(PermissionKind::Camera, PermissionDecision::Deny)],
+        true,
+        true,
+        3,
+    );
+    if permission_decision_for(&panel_state, PermissionKind::Camera) != PermissionDecision::Deny {
+        return Err(smoke_fail("site info panel did not reflect permission decision"));
+    }
+
+    let private_origin = origin_from_url("https://private.example")
+        .ok_or_else(|| smoke_fail("private origin parse failed"))?;
+    let mut private_store = PermissionStore::load_from_path(path.clone());
+    private_store.set(
+        &private_origin,
+        PermissionKind::Geolocation,
+        PermissionDecision::Allow,
+        true,
+    );
+    let (decision, source) = private_store.get(&private_origin, PermissionKind::Geolocation, true);
+    if decision != PermissionDecision::Allow || source != DecisionSource::Session {
+        return Err(smoke_fail("private permission did not use session store"));
+    }
+    let (decision, source) =
+        private_store.get(&private_origin, PermissionKind::Geolocation, false);
+    if decision != PermissionDecision::Ask || source != DecisionSource::Default {
+        return Err(smoke_fail("private permission leaked into normal context"));
+    }
+    let private_reloaded = PermissionStore::load_from_path(path.clone());
+    let (decision, source) =
+        private_reloaded.get(&private_origin, PermissionKind::Geolocation, false);
+    if decision != PermissionDecision::Ask || source != DecisionSource::Default {
+        return Err(smoke_fail("private permission persisted unexpectedly"));
+    }
+
+    std::fs::write(&path, "{not-json")?;
+    let malformed = PermissionStore::load_from_path(path.clone());
+    let _ = std::fs::remove_file(&path);
+    if !malformed.entries().is_empty() {
+        return Err(smoke_fail("malformed permissions file was not ignored"));
+    }
+
+    eprintln!("[smoke] PASS permissions model");
+    Ok(())
+}
+
 fn run_webkit_smoke_test() -> Result<(), Box<dyn std::error::Error>> {
     eprintln!("[smoke] starting WebKit smoke test");
     smoke_adblock_model()?;
     smoke_download_destination_model()?;
+    smoke_permissions_model()?;
     let mut engine = RenderEngine::new(FB_WIDTH, FB_HEIGHT.saturating_sub(TOP_BAR_HEIGHT))?;
     if !engine.is_real_engine() {
         return Err(smoke_fail("WebKit smoke test requires a real engine, got fallback"));
@@ -576,6 +737,10 @@ fn measure_content_height(nodes: &[PageNode], font: &FontManager) -> u32 {
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     eprintln!("Rashamon Arc {APP_VERSION}");
+
+    if std::env::args().skip(1).any(|arg| arg == "--smoke-test-permissions") {
+        return smoke_permissions_model();
+    }
 
     if std::env::args().skip(1).any(|arg| arg == "--smoke-test-webkit" || arg == "--smoke-test-adblock" || arg == "--smoke-test-find") {
         return run_webkit_smoke_test();
@@ -853,6 +1018,27 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 EngineEvent::DownloadFailed { id, reason } => {
                     state.fail_download(id, reason);
                 }
+                EngineEvent::PermissionPrompt { id, origin, kind, nav_id } => {
+                    state.show_permission_prompt(id, target_raw, nav_id, origin, kind);
+                }
+                EngineEvent::PermissionResolved { id } => {
+                    state.clear_permission_prompt(id);
+                }
+                EngineEvent::SitePermissions {
+                    origin,
+                    decisions,
+                    adblock_enabled,
+                    adblock_allowlisted,
+                    blocked_count,
+                } => {
+                    state.set_site_permissions(
+                        origin,
+                        decisions,
+                        adblock_enabled,
+                        adblock_allowlisted,
+                        blocked_count,
+                    );
+                }
                 EngineEvent::LoadStarted => {}
             }
         }
@@ -910,6 +1096,23 @@ fn tick_loading(state: &mut BrowserState, engine: &mut RenderEngine) {
     }
 }
 
+fn active_origin(state: &BrowserState) -> Option<String> {
+    state
+        .active_tab()
+        .and_then(|tab| origin_from_url(&tab.url))
+}
+
+fn open_site_info_panel(state: &mut BrowserState, engine: &mut RenderEngine) {
+    let origin = active_origin(state);
+    let private = state.active_tab().map_or(false, |tab| tab.is_private);
+    state.close_overlay();
+    state.open_site_info(origin.clone());
+    state.address_bar_focused = false;
+    if let Some(origin) = origin {
+        engine.query_site_permissions(&origin, private);
+    }
+}
+
 // ── Keyboard ──────────────────────────────────────────────────────────────────
 
 fn on_key(
@@ -920,6 +1123,14 @@ fn on_key(
     input:      &input::InputHandler,
     save_dirty: &mut SaveDirty,
 ) -> Result<(), Box<dyn std::error::Error>> {
+
+    if let Some(prompt) = state.permission_prompt.clone() {
+        if matches!(key, input::Key::Escape) {
+            engine.resolve_permission(prompt.id, false, prompt.remember);
+            state.clear_permission_prompt(prompt.id);
+            return Ok(());
+        }
+    }
 
     if state.find_open {
         match key {
@@ -989,7 +1200,9 @@ fn on_key(
 
     match key {
         input::Key::Escape => {
-            if state.address_bar_focused {
+            if state.site_info.is_some() {
+                state.close_site_info();
+            } else if state.address_bar_focused {
                 state.cancel_address_bar_edit();
             } else {
                 *running = false;
@@ -1119,7 +1332,11 @@ fn on_key(
 fn on_click(state: &mut BrowserState, engine: &mut RenderEngine, x: u32, y: u32,
             save_dirty: &mut SaveDirty)
 {
-    if y < TAB_BAR_HEIGHT {
+    if click_permission_prompt(state, engine, x, y) {
+        return;
+    } else if click_site_info_panel(state, engine, x, y) {
+        return;
+    } else if y < TAB_BAR_HEIGHT {
         click_tab_bar(state, engine, x);
     } else if y < TOP_BAR_HEIGHT {
         click_chrome_bar(state, engine, x, y, save_dirty);
@@ -1128,6 +1345,78 @@ fn on_click(state: &mut BrowserState, engine: &mut RenderEngine, x: u32, y: u32,
     } else {
         click_content(state, engine, x, y);
     }
+}
+
+fn click_site_info_panel(state: &mut BrowserState, engine: &mut RenderEngine, x: u32, y: u32) -> bool {
+    if state.site_info.is_none() {
+        return false;
+    }
+    if !in_rect(x, y, site_info_rect()) {
+        state.close_site_info();
+        return false;
+    }
+
+    let Some(origin) = state.site_info.as_ref().and_then(|p| p.origin.clone()) else {
+        return true;
+    };
+    let private = state.active_tab().map_or(false, |tab| tab.is_private);
+    if in_rect(x, y, site_info_adblock_rect()) {
+        let next_allowlisted = !state
+            .site_info
+            .as_ref()
+            .map_or(false, |panel| panel.adblock_allowlisted);
+        engine.set_site_adblock_allowlisted(&origin, next_allowlisted, private);
+        if let Some(panel) = state.site_info.as_mut() {
+            panel.adblock_allowlisted = next_allowlisted;
+        }
+        state.dirty.content = true;
+        return true;
+    }
+    for (idx, kind) in permission_kinds_ui().iter().enumerate() {
+        for (decision, rect) in site_info_permission_rects(idx) {
+            if in_rect(x, y, rect) {
+                engine.set_site_permission(&origin, *kind, decision, private);
+                if let Some(panel) = state.site_info.as_mut() {
+                    if let Some((_, current)) = panel.permissions.iter_mut().find(|(k, _)| k == kind) {
+                        *current = decision;
+                    }
+                }
+                state.dirty.content = true;
+                return true;
+            }
+        }
+    }
+    true
+}
+
+fn click_permission_prompt(state: &mut BrowserState, engine: &mut RenderEngine, x: u32, y: u32) -> bool {
+    let Some(prompt) = state.permission_prompt.clone() else { return false };
+    let prompt_current = state.tabs.iter().any(|t| {
+        t.id.raw() == prompt.tab_id && t.id == state.active_tab_id && t.nav_id == prompt.nav_id
+    });
+    if !prompt_current {
+        return false;
+    }
+    let (remember, deny, allow) = permission_prompt_hit_rects();
+
+    if in_rect(x, y, remember) {
+        if let Some(p) = state.permission_prompt.as_mut() {
+            p.remember = !p.remember;
+            state.dirty.content = true;
+        }
+        return true;
+    }
+    if in_rect(x, y, deny) {
+        engine.resolve_permission(prompt.id, false, prompt.remember);
+        state.clear_permission_prompt(prompt.id);
+        return true;
+    }
+    if in_rect(x, y, allow) {
+        engine.resolve_permission(prompt.id, true, prompt.remember);
+        state.clear_permission_prompt(prompt.id);
+        return true;
+    }
+    in_rect(x, y, permission_prompt_rect())
 }
 
 fn click_tab_bar(state: &mut BrowserState, engine: &mut RenderEngine, x: u32) {
@@ -1228,6 +1517,10 @@ fn click_chrome_bar(state: &mut BrowserState, engine: &mut RenderEngine, x: u32,
     }
     let bar_x = (FB_WIDTH - ADDR_BAR_W) / 2;
     let bar_y = TAB_BAR_HEIGHT + (CHROME_BAR_HEIGHT - ADDR_BAR_H) / 2;
+    if x >= bar_x && x < bar_x + 30 && y >= bar_y && y < bar_y + ADDR_BAR_H {
+        open_site_info_panel(state, engine);
+        return;
+    }
     if x >= bar_x + ADDR_BAR_W - 26 && x < bar_x + ADDR_BAR_W
         && y >= bar_y && y < bar_y + ADDR_BAR_H
     {
@@ -1340,6 +1633,8 @@ fn render_ui(
                 None => {}
             }
             draw_download_status(fb, state, font);
+            draw_permission_prompt(fb, state, font);
+            draw_site_info_panel(fb, state, font);
         }
     }
 
@@ -1590,6 +1885,204 @@ fn draw_download_status(fb: &mut Framebuffer, state: &BrowserState, font: &FontM
         DownloadStatus::Failed(reason) => reason.clone(),
     };
     draw::draw_text(fb, font, x + 14, y + 34, &detail, 12.0, theme.fg_secondary, w - 28);
+}
+
+type Rect = (u32, u32, u32, u32);
+
+fn in_rect(x: u32, y: u32, rect: Rect) -> bool {
+    let (rx, ry, rw, rh) = rect;
+    x >= rx && x < rx + rw && y >= ry && y < ry + rh
+}
+
+fn permission_prompt_rect() -> Rect {
+    (24, TOP_BAR_HEIGHT + 20, 560, 88)
+}
+
+fn permission_prompt_hit_rects() -> (Rect, Rect, Rect) {
+    let (x, y, w, _) = permission_prompt_rect();
+    (
+        (x + 18, y + 56, 150, 22),
+        (x + w - 180, y + 52, 72, 26),
+        (x + w - 96, y + 52, 72, 26),
+    )
+}
+
+fn draw_permission_prompt(fb: &mut Framebuffer, state: &BrowserState, font: &FontManager) {
+    let Some(prompt) = &state.permission_prompt else { return };
+    let Some(tab) = state.tabs.iter().find(|t| t.id.raw() == prompt.tab_id) else { return };
+    if tab.id != state.active_tab_id || tab.nav_id != prompt.nav_id {
+        return;
+    }
+
+    let theme = state.theme;
+    let (x, y, w, h) = permission_prompt_rect();
+    draw::draw_rounded_rect(fb, x.saturating_sub(1), y.saturating_sub(1), w + 2, h + 2, 12, theme.border);
+    draw::draw_rounded_rect(fb, x, y, w, h, 12, theme.surface);
+    fb.fill_rect(x, y, 4, h, theme.accent);
+
+    let title = format!("{} wants to access {}", prompt.origin, prompt.kind.as_str());
+    draw::draw_text(fb, font, x + 18, y + 14, &title, 14.0, theme.fg, w - 36);
+    draw::draw_text(
+        fb,
+        font,
+        x + 18,
+        y + 34,
+        "Choose for this request. Remember stores the decision for this site.",
+        12.0,
+        theme.fg_secondary,
+        w - 36,
+    );
+
+    let (remember, deny, allow) = permission_prompt_hit_rects();
+    let box_col = if prompt.remember { theme.accent } else { theme.address_bar_border };
+    draw::draw_rounded_rect_outline(fb, remember.0 as i32, (remember.1 + 3) as i32, 14, 14, 3, box_col);
+    if prompt.remember {
+        fb.fill_rect(remember.0 + 4, remember.1 + 7, 6, 3, theme.accent);
+    }
+    draw::draw_text(fb, font, remember.0 + 22, remember.1 + 4, "Remember", 12.0, theme.fg_secondary, 110);
+
+    draw_prompt_button(fb, font, deny, "Deny", theme.control_hover_bg, theme.fg);
+    draw_prompt_button(fb, font, allow, "Allow", theme.accent, theme.accent_fg);
+}
+
+fn draw_prompt_button(
+    fb: &mut Framebuffer,
+    font: &FontManager,
+    rect: Rect,
+    label: &str,
+    bg: Pixel,
+    fg: Pixel,
+) {
+    draw::draw_rounded_rect(fb, rect.0, rect.1, rect.2, rect.3, 8, bg);
+    draw::draw_text(fb, font, rect.0 + 15, rect.1 + 7, label, 12.0, fg, rect.2 - 20);
+}
+
+fn site_info_rect() -> Rect {
+    let bar_x = (FB_WIDTH - ADDR_BAR_W) / 2;
+    (bar_x, TOP_BAR_HEIGHT + 8, 560, 292)
+}
+
+fn permission_kinds_ui() -> [PermissionKind; 5] {
+    [
+        PermissionKind::Notifications,
+        PermissionKind::Geolocation,
+        PermissionKind::Camera,
+        PermissionKind::Microphone,
+        PermissionKind::Clipboard,
+    ]
+}
+
+fn site_info_permission_rects(row: usize) -> [(PermissionDecision, Rect); 3] {
+    let (x, y, _, _) = site_info_rect();
+    let row_y = y + 108 + row as u32 * 30;
+    [
+        (PermissionDecision::Ask,   (x + 300, row_y, 52, 22)),
+        (PermissionDecision::Allow, (x + 360, row_y, 62, 22)),
+        (PermissionDecision::Deny,  (x + 430, row_y, 56, 22)),
+    ]
+}
+
+fn site_info_adblock_rect() -> Rect {
+    let (x, y, w, h) = site_info_rect();
+    (x + w - 190, y + h - 34, 166, 24)
+}
+
+fn permission_decision_for(
+    state: &BrowserState,
+    kind: PermissionKind,
+) -> PermissionDecision {
+    state
+        .site_info
+        .as_ref()
+        .and_then(|panel| panel.permissions.iter().find(|(k, _)| *k == kind).map(|(_, d)| *d))
+        .unwrap_or(PermissionDecision::Ask)
+}
+
+fn draw_site_info_panel(fb: &mut Framebuffer, state: &BrowserState, font: &FontManager) {
+    let Some(panel) = &state.site_info else { return };
+    let theme = state.theme;
+    let (x, y, w, h) = site_info_rect();
+    draw::draw_rounded_rect(fb, x.saturating_sub(1), y.saturating_sub(1), w + 2, h + 2, 12, theme.border);
+    draw::draw_rounded_rect(fb, x, y, w, h, 12, theme.surface);
+
+    let tab = state.active_tab();
+    let url = tab.map(|t| t.url.as_str()).unwrap_or("");
+    let private = tab.map_or(false, |t| t.is_private);
+    let security = if url.starts_with("https://") {
+        ("HTTPS secure", theme.security_ok)
+    } else if url.starts_with("http://") {
+        ("HTTP not secure", theme.security_err)
+    } else {
+        ("Internal / new tab", theme.fg_secondary)
+    };
+    let origin = panel.origin.as_deref().unwrap_or("No site loaded");
+
+    draw::draw_text(fb, font, x + 18, y + 14, "Site information", 16.0, theme.fg, 220);
+    draw::draw_text(fb, font, x + 18, y + 40, origin, 13.0, theme.fg, w - 36);
+    draw::draw_text(fb, font, x + 18, y + 62, security.0, 12.0, security.1, 180);
+    if private {
+        draw::draw_text(fb, font, x + 160, y + 62, "Private mode", 12.0, PRIVATE_ACCENT, 140);
+    }
+    let adblock_label = if panel.adblock_enabled { "Adblock: enabled" } else { "Adblock: disabled" };
+    draw::draw_text(fb, font, x + 320, y + 62, adblock_label, 12.0, theme.fg_secondary, 160);
+    let blocked = format!("Blocked this session: {}", panel.blocked_count);
+    draw::draw_text(fb, font, x + 320, y + 80, &blocked, 11.0, theme.fg_secondary, 190);
+    draw::draw_text(fb, font, x + 18, y + 86, "Permissions", 13.0, theme.fg, 160);
+
+    if panel.origin.is_none() {
+        draw::draw_text(fb, font, x + 18, y + 116, "Permissions are available after loading an HTTP/HTTPS site.", 12.0, theme.fg_secondary, w - 36);
+        return;
+    }
+
+    for (idx, kind) in permission_kinds_ui().iter().enumerate() {
+        let row_y = y + 108 + idx as u32 * 30;
+        let label = permission_label(*kind);
+        draw::draw_text(fb, font, x + 18, row_y + 5, label, 12.0, theme.fg, 150);
+        let current = permission_decision_for(state, *kind);
+        draw::draw_text(fb, font, x + 176, row_y + 5, current.as_str(), 12.0, theme.fg_secondary, 90);
+        for (decision, rect) in site_info_permission_rects(idx) {
+            let selected = decision == current;
+            let bg = if selected { theme.accent } else { theme.control_hover_bg };
+            let fg = if selected { theme.accent_fg } else { theme.fg };
+            draw::draw_rounded_rect(fb, rect.0, rect.1, rect.2, rect.3, 7, bg);
+            draw::draw_text(fb, font, rect.0 + 10, rect.1 + 6, decision_title(decision), 11.0, fg, rect.2 - 12);
+        }
+    }
+
+    let protection = if panel.adblock_allowlisted {
+        "Protection off for this site"
+    } else {
+        "Protection on for this site"
+    };
+    draw::draw_text(fb, font, x + 18, y + h - 24, protection, 11.0, theme.fg_secondary, 220);
+    let toggle = site_info_adblock_rect();
+    let toggle_label = if panel.adblock_allowlisted { "Block ads on site" } else { "Allow ads on site" };
+    draw_prompt_button(
+        fb,
+        font,
+        toggle,
+        toggle_label,
+        if panel.adblock_allowlisted { theme.accent } else { theme.control_hover_bg },
+        if panel.adblock_allowlisted { theme.accent_fg } else { theme.fg },
+    );
+}
+
+fn permission_label(kind: PermissionKind) -> &'static str {
+    match kind {
+        PermissionKind::Notifications => "Notifications",
+        PermissionKind::Geolocation => "Geolocation",
+        PermissionKind::Camera => "Camera",
+        PermissionKind::Microphone => "Microphone",
+        PermissionKind::Clipboard => "Clipboard",
+    }
+}
+
+fn decision_title(decision: PermissionDecision) -> &'static str {
+    match decision {
+        PermissionDecision::Ask => "Ask",
+        PermissionDecision::Allow => "Allow",
+        PermissionDecision::Deny => "Deny",
+    }
 }
 
 // ── Overlay panel (history / bookmarks) ──────────────────────────────────────

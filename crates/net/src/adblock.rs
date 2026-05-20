@@ -5,6 +5,8 @@
 //! URL substring rules for patterns that include a path.
 
 use std::collections::HashSet;
+use std::fs;
+use std::path::Path;
 
 /// A single adblock rule.
 #[derive(Debug, Clone)]
@@ -31,6 +33,8 @@ pub struct AdblockEngine {
     rules: Vec<Rule>,
     /// Domains that are always allowed.
     allowlist: HashSet<String>,
+    /// Session-only allowlist used by private tabs.
+    session_allowlist: HashSet<String>,
     enabled: bool,
     /// Stats.
     blocked_count: u64,
@@ -42,6 +46,7 @@ impl AdblockEngine {
         let mut engine = Self {
             rules: Vec::new(),
             allowlist: HashSet::new(),
+            session_allowlist: HashSet::new(),
             enabled: true,
             blocked_count: 0,
             total_count: 0,
@@ -92,6 +97,15 @@ impl AdblockEngine {
 
     /// Check if a request should be blocked.
     pub fn should_block(&mut self, url: &str, origin: &str) -> (bool, Option<String>) {
+        self.should_block_for_context(url, origin, false)
+    }
+
+    pub fn should_block_for_context(
+        &mut self,
+        url: &str,
+        origin: &str,
+        private: bool,
+    ) -> (bool, Option<String>) {
         self.total_count += 1;
         if !self.enabled {
             return (false, None);
@@ -102,6 +116,12 @@ impl AdblockEngine {
         let url_host = extract_host(&url_lc);
         let origin_host = extract_host(&origin_lc);
         if self.allowlist.iter().any(|domain| {
+            host_matches_domain(url_host.as_deref(), domain)
+                || host_matches_domain(origin_host.as_deref(), domain)
+        }) {
+            return (false, None);
+        }
+        if private && self.session_allowlist.iter().any(|domain| {
             host_matches_domain(url_host.as_deref(), domain)
                 || host_matches_domain(origin_host.as_deref(), domain)
         }) {
@@ -136,14 +156,77 @@ impl AdblockEngine {
     }
 
     pub fn allowlist_domain(&mut self, domain: &str) {
+        self.allowlist_domain_for_context(domain, false);
+    }
+
+    pub fn allowlist_domain_for_context(&mut self, domain: &str, private: bool) {
         let domain = normalize_domain(domain);
         if !domain.is_empty() {
-            self.allowlist.insert(domain);
+            if private {
+                self.session_allowlist.insert(domain);
+            } else {
+                self.allowlist.insert(domain);
+            }
         }
     }
 
     pub fn remove_allowlist_domain(&mut self, domain: &str) {
-        self.allowlist.remove(&normalize_domain(domain));
+        self.remove_allowlist_domain_for_context(domain, false);
+    }
+
+    pub fn remove_allowlist_domain_for_context(&mut self, domain: &str, private: bool) {
+        let domain = normalize_domain(domain);
+        if private {
+            self.session_allowlist.remove(&domain);
+        } else {
+            self.allowlist.remove(&domain);
+        }
+    }
+
+    pub fn is_allowlisted_domain(&self, domain: &str, private: bool) -> bool {
+        let domain = normalize_domain(domain);
+        self.allowlist.contains(&domain) || (private && self.session_allowlist.contains(&domain))
+    }
+
+    pub fn is_enabled(&self) -> bool {
+        self.enabled
+    }
+
+    pub fn allowlist_entries(&self) -> Vec<String> {
+        let mut entries = self.allowlist.iter().cloned().collect::<Vec<_>>();
+        entries.sort();
+        entries
+    }
+
+    pub fn load_allowlist_from_path(&mut self, path: &Path) {
+        let Ok(text) = fs::read_to_string(path) else { return };
+        self.allowlist.clear();
+        for domain in parse_string_array(&text) {
+            self.allowlist_domain(&domain);
+        }
+    }
+
+    pub fn save_allowlist_to_path(&self, path: &Path) {
+        if let Some(parent) = path.parent() {
+            if fs::create_dir_all(parent).is_err() {
+                return;
+            }
+        }
+        let mut out = String::from("[\n");
+        let entries = self.allowlist_entries();
+        for (i, domain) in entries.iter().enumerate() {
+            out.push_str("  ");
+            out.push_str(&json_str(domain));
+            if i + 1 < entries.len() {
+                out.push(',');
+            }
+            out.push('\n');
+        }
+        out.push_str("]\n");
+        let tmp = path.with_extension("json.tmp");
+        if fs::write(&tmp, out).is_ok() && fs::rename(&tmp, path).is_err() {
+            let _ = fs::remove_file(&tmp);
+        }
     }
 
     pub fn set_enabled(&mut self, enabled: bool) {
@@ -207,6 +290,60 @@ fn extract_host(input: &str) -> Option<String> {
     if host.is_empty() { None } else { Some(host.to_string()) }
 }
 
+fn parse_string_array(text: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut in_str = false;
+    let mut esc = false;
+    let mut cur = String::new();
+    for ch in text.chars() {
+        if in_str {
+            if esc {
+                cur.push(match ch {
+                    '"' => '"',
+                    '\\' => '\\',
+                    '/' => '/',
+                    'n' => '\n',
+                    'r' => '\r',
+                    't' => '\t',
+                    other => other,
+                });
+                esc = false;
+            } else if ch == '\\' {
+                esc = true;
+            } else if ch == '"' {
+                if !cur.trim().is_empty() {
+                    out.push(cur.trim().to_ascii_lowercase());
+                }
+                cur.clear();
+                in_str = false;
+            } else {
+                cur.push(ch);
+            }
+        } else if ch == '"' {
+            in_str = true;
+        }
+    }
+    out
+}
+
+fn json_str(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for ch in s.chars() {
+        match ch {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::AdblockEngine;
@@ -233,5 +370,41 @@ mod tests {
         engine.allowlist_domain("doubleclick.net");
         let (blocked, _) = engine.should_block("https://ad.doubleclick.net/page", "");
         assert!(!blocked);
+    }
+
+    #[test]
+    fn persisted_allowlist_roundtrips_and_bad_file_is_empty() {
+        let path = std::env::temp_dir().join(format!(
+            "rashamon-adblock-smoke-{}.json",
+            std::process::id(),
+        ));
+        let _ = std::fs::remove_file(&path);
+        let mut engine = AdblockEngine::new();
+        engine.allowlist_domain("doubleclick.net");
+        engine.save_allowlist_to_path(&path);
+
+        let mut loaded = AdblockEngine::new();
+        loaded.load_allowlist_from_path(&path);
+        let (blocked, _) = loaded.should_block("https://ad.doubleclick.net/page", "");
+        assert!(!blocked);
+
+        std::fs::write(&path, "{not-json").unwrap();
+        let mut bad = AdblockEngine::new();
+        bad.load_allowlist_from_path(&path);
+        let (blocked, _) = bad.should_block("https://ad.doubleclick.net/page", "");
+        let _ = std::fs::remove_file(path);
+        assert!(blocked);
+    }
+
+    #[test]
+    fn private_allowlist_is_session_only() {
+        let mut engine = AdblockEngine::new();
+        engine.allowlist_domain_for_context("doubleclick.net", true);
+        let (private_blocked, _) =
+            engine.should_block_for_context("https://ad.doubleclick.net/page", "", true);
+        let (normal_blocked, _) =
+            engine.should_block_for_context("https://ad.doubleclick.net/page", "", false);
+        assert!(!private_blocked);
+        assert!(normal_blocked);
     }
 }

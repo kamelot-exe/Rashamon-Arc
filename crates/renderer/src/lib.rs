@@ -6,6 +6,7 @@
 mod engine;
 mod engine_trait;
 pub mod framebuffer;
+mod permissions;
 #[cfg(feature = "servo")]
 mod servo_embedder;
 #[cfg(not(feature = "servo"))]
@@ -17,5 +18,8 @@ mod webkit_engine;
 pub use engine::RenderEngine;
 pub use engine_trait::{ContentEngine, EngineEvent, EngineFrame};
 pub use framebuffer::Framebuffer;
+pub use permissions::{
+    origin_from_url, DecisionSource, PermissionDecision, PermissionKind, PermissionStore,
+};
 #[cfg(feature = "webkit")]
 pub use webkit_engine::download_destination_for_test;

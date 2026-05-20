@@ -13,6 +13,7 @@
 
 use crate::engine_trait::{ContentEngine, EngineEvent, EngineFrame};
 use crate::framebuffer::Framebuffer;
+use crate::permissions::{PermissionDecision, PermissionKind};
 
 #[cfg(not(feature = "servo"))]
 use crate::servo_host::ServoHost;
@@ -135,6 +136,30 @@ impl RenderEngine {
     pub fn find_previous(&mut self) { self.inner.find_previous(); }
     pub fn find_clear(&mut self) { self.inner.find_clear(); }
     pub fn download_url(&mut self, url: &str) { self.inner.download_url(url); }
+    pub fn resolve_permission(&mut self, id: u64, allow: bool, remember: bool) {
+        self.inner.resolve_permission(id, allow, remember);
+    }
+    pub fn query_site_permissions(&mut self, origin: &str, private: bool) {
+        self.inner.query_site_permissions(origin, private);
+    }
+    pub fn set_site_permission(
+        &mut self,
+        origin: &str,
+        kind: PermissionKind,
+        decision: PermissionDecision,
+        private: bool,
+    ) {
+        self.inner.set_site_permission(origin, kind, decision, private);
+    }
+    pub fn set_site_adblock_allowlisted(
+        &mut self,
+        origin: &str,
+        allowlisted: bool,
+        private: bool,
+    ) {
+        self.inner
+            .set_site_adblock_allowlisted(origin, allowlisted, private);
+    }
 
     pub fn can_go_back(&self)    -> bool { self.inner.can_go_back() }
     pub fn can_go_forward(&self) -> bool { self.inner.can_go_forward() }

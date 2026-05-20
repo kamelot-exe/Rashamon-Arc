@@ -3,6 +3,7 @@
 use crate::layout::{self, *};
 use crate::page::PageNode;
 use crate::theme::{get_theme, ColorPalette, Theme};
+use rashamon_renderer::{PermissionDecision, PermissionKind};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 static NEXT_ID:     AtomicUsize = AtomicUsize::new(1);
@@ -104,6 +105,7 @@ pub enum HoveredRegion {
     NavForward,
     NavReload,
     AddressBar,
+    SiteIcon,
     BookmarkStar,
     QuickLink(usize),
     RetryBtn,
@@ -137,6 +139,25 @@ pub struct DownloadItem {
     pub received: u64,
     pub progress: f64,
     pub status:   DownloadStatus,
+}
+
+#[derive(Debug, Clone)]
+pub struct PermissionPrompt {
+    pub id: u64,
+    pub tab_id: u64,
+    pub nav_id: u64,
+    pub origin: String,
+    pub kind: PermissionKind,
+    pub remember: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct SiteInfoPanel {
+    pub origin: Option<String>,
+    pub permissions: Vec<(PermissionKind, PermissionDecision)>,
+    pub adblock_enabled: bool,
+    pub adblock_allowlisted: bool,
+    pub blocked_count: u64,
 }
 
 // ── NavigationEntry ───────────────────────────────────────────────────────────
@@ -329,12 +350,14 @@ pub struct BrowserState {
     pub find_open:           bool,
     pub find_input:          String,
     pub find_match_count:    Option<u32>,
+    pub site_info:           Option<SiteInfoPanel>,
 
     pub bookmarks: Vec<QuickLink>,
 
     /// Cross-tab global visit history (excludes private tab visits).
     pub global_history: Vec<GlobalHistoryEntry>,
     pub downloads:      Vec<DownloadItem>,
+    pub permission_prompt: Option<PermissionPrompt>,
 
     /// Which content overlay (history / bookmarks) is currently shown.
     pub overlay:        OverlayKind,
@@ -372,6 +395,7 @@ impl BrowserState {
             find_open:           false,
             find_input:          String::new(),
             find_match_count:    None,
+            site_info:           None,
             bookmarks: vec![
                 QuickLink::new("GitHub",      "https://github.com"),
                 QuickLink::new("Hacker News", "https://news.ycombinator.com"),
@@ -382,6 +406,7 @@ impl BrowserState {
             ],
             global_history:  Vec::new(),
             downloads:       Vec::new(),
+            permission_prompt: None,
             overlay:         OverlayKind::None,
             overlay_scroll:  0,
             overlay_hover:   None,
@@ -419,7 +444,7 @@ impl BrowserState {
             HoveredRegion::Tab(_) | HoveredRegion::TabClose(_) | HoveredRegion::NewTabBtn
                 => d.tabs = true,
             HoveredRegion::NavBack | HoveredRegion::NavForward | HoveredRegion::NavReload
-            | HoveredRegion::AddressBar | HoveredRegion::BookmarkStar
+            | HoveredRegion::AddressBar | HoveredRegion::SiteIcon | HoveredRegion::BookmarkStar
                 => d.chrome = true,
             HoveredRegion::QuickLink(_) | HoveredRegion::RetryBtn
                 => d.content = true,
@@ -437,6 +462,70 @@ impl BrowserState {
     pub fn dirty_find_bar(&mut self) {
         self.dirty.chrome = true;
         self.dirty.content = true;
+    }
+
+    pub fn close_site_info(&mut self) {
+        if self.site_info.take().is_some() {
+            self.dirty.content = true;
+            self.dirty.chrome = true;
+        }
+    }
+
+    pub fn open_site_info(&mut self, origin: Option<String>) {
+        self.site_info = Some(SiteInfoPanel {
+            origin,
+            permissions: Vec::new(),
+            adblock_enabled: true,
+            adblock_allowlisted: false,
+            blocked_count: 0,
+        });
+        self.dirty.content = true;
+        self.dirty.chrome = true;
+    }
+
+    pub fn set_site_permissions(
+        &mut self,
+        origin: String,
+        permissions: Vec<(PermissionKind, PermissionDecision)>,
+        adblock_enabled: bool,
+        adblock_allowlisted: bool,
+        blocked_count: u64,
+    ) {
+        if let Some(panel) = self.site_info.as_mut() {
+            if panel.origin.as_deref() == Some(origin.as_str()) {
+                panel.permissions = permissions;
+                panel.adblock_enabled = adblock_enabled;
+                panel.adblock_allowlisted = adblock_allowlisted;
+                panel.blocked_count = blocked_count;
+                self.dirty.content = true;
+            }
+        }
+    }
+
+    pub fn show_permission_prompt(
+        &mut self,
+        id: u64,
+        tab_id: u64,
+        nav_id: u64,
+        origin: String,
+        kind: PermissionKind,
+    ) {
+        self.permission_prompt = Some(PermissionPrompt {
+            id,
+            tab_id,
+            nav_id,
+            origin,
+            kind,
+            remember: false,
+        });
+        self.dirty.content = true;
+    }
+
+    pub fn clear_permission_prompt(&mut self, id: u64) {
+        if self.permission_prompt.as_ref().map_or(false, |p| p.id == id) {
+            self.permission_prompt = None;
+            self.dirty.content = true;
+        }
     }
 
     pub fn upsert_download_started(&mut self, id: u64, filename: String, path: String) {
@@ -519,7 +608,9 @@ impl BrowserState {
             let bar_x = (FB_WIDTH - ADDR_BAR_W) / 2;
             let bar_y = TAB_BAR_HEIGHT + (CHROME_BAR_HEIGHT - ADDR_BAR_H) / 2;
             if x >= bar_x && x < bar_x + ADDR_BAR_W && y >= bar_y && y < bar_y + ADDR_BAR_H {
-                return if x >= bar_x + ADDR_BAR_W - 26 {
+                return if x < bar_x + 30 {
+                    HoveredRegion::SiteIcon
+                } else if x >= bar_x + ADDR_BAR_W - 26 {
                     HoveredRegion::BookmarkStar
                 } else {
                     HoveredRegion::AddressBar
@@ -660,6 +751,7 @@ impl BrowserState {
             let fresh_id = fresh.id;
             self.tabs[0]       = fresh;
             self.active_tab_id = fresh_id;
+            self.close_site_info();
             self.sync_address_bar();
             self.update_layout();
             self.dirty.all();
@@ -682,6 +774,7 @@ impl BrowserState {
             self.active_tab_id       = id;
             self.address_bar_focused = false;
             self.close_overlay();
+            self.close_site_info();
             self.sync_address_bar();
             self.update_layout();
             self.update_bookmark_flag();
@@ -703,6 +796,7 @@ impl BrowserState {
         };
 
         self.close_overlay();
+        self.close_site_info();
 
         if let Some(reason) = fail_reason {
             if let Some(tab) = self.active_tab_mut() {
@@ -994,6 +1088,7 @@ impl BrowserState {
             self.overlay_scroll = 0;
             self.overlay_hover  = if self.overlay_item_count() > 0 { Some(0) } else { None };
             self.address_bar_focused = false;
+            self.close_site_info();
         }
         self.dirty.content = true;
     }

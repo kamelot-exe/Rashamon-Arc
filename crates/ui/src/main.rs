@@ -13,10 +13,10 @@ mod ui_state;
 use crate::font::FontManager;
 use crate::layout::*;
 use crate::page::{PageNode, parse_html, is_low_content};
-use rashamon_net::HttpClient;
-use rashamon_renderer::{Framebuffer, RenderEngine, EngineEvent, EngineFrame};
+use rashamon_net::{AdblockEngine, HttpClient};
+use rashamon_renderer::{download_destination_for_test, Framebuffer, RenderEngine, EngineEvent, EngineFrame};
 use rashamon_renderer::framebuffer::Pixel;
-use ui_state::{BrowserState, DirtyFlags, OverlayKind, PageState, TabId, derive_title};
+use ui_state::{BrowserState, DirtyFlags, DownloadStatus, OverlayKind, PageState, TabId, derive_title};
 
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
@@ -254,6 +254,23 @@ fn smoke_apply_engine_events(
                     tab.webkit_can_forward = *can_forward;
                 }
             }
+            EngineEvent::FindMatchCount(count) => {
+                if target_raw == state.active_tab_id.raw() {
+                    state.find_match_count = Some(*count);
+                }
+            }
+            EngineEvent::DownloadStarted { id, filename, path } => {
+                state.upsert_download_started(*id, filename.clone(), path.clone());
+            }
+            EngineEvent::DownloadProgress { id, received, progress } => {
+                state.update_download_progress(*id, *received, *progress);
+            }
+            EngineEvent::DownloadFinished { id, path } => {
+                state.finish_download(*id, path.clone());
+            }
+            EngineEvent::DownloadFailed { id, reason } => {
+                state.fail_download(*id, reason.clone());
+            }
             EngineEvent::LoadStarted => {}
         }
         seen.push(ev);
@@ -285,8 +302,55 @@ where
     Err(smoke_fail(format!("smoke timeout: {label}")))
 }
 
+fn smoke_adblock_model() -> Result<(), Box<dyn std::error::Error>> {
+    let mut engine = AdblockEngine::new();
+    let (blocked, reason) =
+        engine.should_block("https://ad.doubleclick.net/pagead/id", "https://example.com");
+    if !blocked || reason.as_deref() != Some("doubleclick.net") {
+        return Err(smoke_fail("adblock did not block default domain"));
+    }
+
+    engine.allowlist_domain("doubleclick.net");
+    let (blocked, _) =
+        engine.should_block("https://ad.doubleclick.net/pagead/id", "https://example.com");
+    if blocked {
+        return Err(smoke_fail("adblock allowlist did not override block rule"));
+    }
+
+    let mut private_engine = AdblockEngine::new();
+    let (blocked, _) =
+        private_engine.should_block("https://www.facebook.com/tr?id=1", "https://example.com");
+    if !blocked {
+        return Err(smoke_fail("adblock did not apply to private-mode model"));
+    }
+
+    eprintln!("[smoke] PASS adblock model");
+    Ok(())
+}
+
+fn smoke_download_destination_model() -> Result<(), Box<dyn std::error::Error>> {
+    let name = format!("rashamon-download-smoke-{}.txt", std::process::id());
+    let first = download_destination_for_test(&name);
+    if first.file_name().and_then(|n| n.to_str()) != Some(name.as_str()) {
+        return Err(smoke_fail("download destination did not preserve filename"));
+    }
+    if let Some(parent) = first.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(&first, b"rashamon smoke")?;
+    let second = download_destination_for_test(&name);
+    let _ = std::fs::remove_file(&first);
+    if second == first {
+        return Err(smoke_fail("download destination did not avoid duplicate filename"));
+    }
+    eprintln!("[smoke] PASS download destination model");
+    Ok(())
+}
+
 fn run_webkit_smoke_test() -> Result<(), Box<dyn std::error::Error>> {
     eprintln!("[smoke] starting WebKit smoke test");
+    smoke_adblock_model()?;
+    smoke_download_destination_model()?;
     let mut engine = RenderEngine::new(FB_WIDTH, FB_HEIGHT.saturating_sub(TOP_BAR_HEIGHT))?;
     if !engine.is_real_engine() {
         return Err(smoke_fail("WebKit smoke test requires a real engine, got fallback"));
@@ -300,10 +364,36 @@ fn run_webkit_smoke_test() -> Result<(), Box<dyn std::error::Error>> {
         s.tabs.len() == 1 && s.active_tab().map_or(false, |t| matches!(t.page_state, PageState::NewTab))
     })?;
 
+    smoke_navigate(&mut state, &mut engine, "https://doubleclick.net/pagead/id")?;
+    smoke_wait_for(&mut state, &mut engine, "adblock rejects blocked URL", Duration::from_secs(4), |s, events| {
+        events.iter().any(|e| matches!(e, EngineEvent::LoadFailed(reason) if reason.contains("Blocked by adblock")))
+            && s.active_tab().map_or(false, |t| matches!(t.page_state, PageState::Error(_)))
+    })?;
+
     smoke_navigate(&mut state, &mut engine, "https://example.com")?;
     smoke_wait_for(&mut state, &mut engine, "startup/direct URL renders", Duration::from_secs(12), |s, events| {
         events.iter().any(|e| matches!(e, EngineEvent::LoadComplete))
             && s.active_tab().map_or(false, |t| matches!(t.page_state, PageState::Loaded))
+    })?;
+    state.find_open = true;
+    state.find_input = "Example".to_string();
+    engine.find_text(&state.find_input);
+    smoke_wait_for(&mut state, &mut engine, "find in page counts matches", Duration::from_secs(4), |_s, events| {
+        events.iter().any(|e| matches!(e, EngineEvent::FindMatchCount(count) if *count > 0))
+    })?;
+    engine.find_next();
+    engine.find_previous();
+    engine.find_clear();
+    state.find_open = false;
+    state.find_input.clear();
+    state.find_match_count = None;
+    smoke_wait_for(&mut state, &mut engine, "find in page clears", Duration::from_secs(1), |_s, _| true)?;
+    engine.download_url("https://example.com/");
+    smoke_wait_for(&mut state, &mut engine, "download signal path starts", Duration::from_secs(8), |_s, events| {
+        events.iter().any(|e| matches!(e, EngineEvent::DownloadStarted { .. }))
+    })?;
+    smoke_wait_for(&mut state, &mut engine, "download finishes", Duration::from_secs(20), |_s, events| {
+        events.iter().any(|e| matches!(e, EngineEvent::DownloadFinished { .. }))
     })?;
     let first_loaded_id = state.active_tab_id;
 
@@ -320,10 +410,23 @@ fn run_webkit_smoke_test() -> Result<(), Box<dyn std::error::Error>> {
         events.iter().any(|e| matches!(e, EngineEvent::LoadComplete))
             && s.active_tab().map_or(false, |t| t.url.contains("duckduckgo.com"))
     })?;
+    let search_tab_id = state.active_tab_id;
 
     state.activate_tab(first_loaded_id);
     engine.set_active_tab(first_loaded_id.raw());
     smoke_wait_for(&mut state, &mut engine, "tab switch without reload", Duration::from_secs(3), |s, _| {
+        s.active_tab_id == first_loaded_id
+            && s.active_tab().map_or(false, |t| matches!(t.page_state, PageState::Loaded))
+    })?;
+    for _ in 0..4 {
+        state.activate_tab(search_tab_id);
+        engine.set_active_tab(search_tab_id.raw());
+        engine.pump_gtk();
+        state.activate_tab(first_loaded_id);
+        engine.set_active_tab(first_loaded_id.raw());
+        engine.pump_gtk();
+    }
+    smoke_wait_for(&mut state, &mut engine, "rapid tab switching stable", Duration::from_secs(3), |s, _| {
         s.active_tab_id == first_loaded_id
             && s.active_tab().map_or(false, |t| matches!(t.page_state, PageState::Loaded))
     })?;
@@ -333,9 +436,15 @@ fn run_webkit_smoke_test() -> Result<(), Box<dyn std::error::Error>> {
         events.iter().any(|e| matches!(e, EngineEvent::LoadComplete))
             && s.active_tab().map_or(false, |t| t.url.contains("example.org"))
     })?;
+    smoke_wait_for(&mut state, &mut engine, "native back becomes available", Duration::from_secs(3), |s, _| {
+        s.active_tab().map_or(false, |t| t.webkit_can_back)
+    })?;
     engine.go_back().ok();
     smoke_wait_for(&mut state, &mut engine, "back returns to first URL", Duration::from_secs(8), |s, _| {
         s.active_tab().map_or(false, |t| t.url.contains("example.com"))
+    })?;
+    smoke_wait_for(&mut state, &mut engine, "native forward becomes available", Duration::from_secs(3), |s, _| {
+        s.active_tab().map_or(false, |t| t.webkit_can_forward)
     })?;
     engine.go_forward().ok();
     smoke_wait_for(&mut state, &mut engine, "forward returns to second URL", Duration::from_secs(8), |s, _| {
@@ -350,6 +459,12 @@ fn run_webkit_smoke_test() -> Result<(), Box<dyn std::error::Error>> {
     state.scroll_by(SCROLL_WHEEL * 4);
     engine.scroll(SCROLL_WHEEL * 4);
     smoke_wait_for(&mut state, &mut engine, "scroll command stable", Duration::from_secs(2), |_s, _| true)?;
+    for _ in 0..8 {
+        state.scroll_by(SCROLL_WHEEL);
+        engine.scroll(SCROLL_WHEEL);
+        engine.pump_gtk();
+    }
+    smoke_wait_for(&mut state, &mut engine, "rapid scroll stable", Duration::from_secs(2), |_s, _| true)?;
 
     let before_bookmarks = state.bookmarks.len();
     state.toggle_bookmark();
@@ -462,7 +577,7 @@ fn measure_content_height(nodes: &[PageNode], font: &FontManager) -> u32 {
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     eprintln!("Rashamon Arc {APP_VERSION}");
 
-    if std::env::args().skip(1).any(|arg| arg == "--smoke-test-webkit") {
+    if std::env::args().skip(1).any(|arg| arg == "--smoke-test-webkit" || arg == "--smoke-test-adblock" || arg == "--smoke-test-find") {
         return run_webkit_smoke_test();
     }
 
@@ -506,7 +621,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let startup_input = std::env::args()
         .skip(1)
-        .filter(|arg| arg != "--smoke-test" && arg != "--smoke-test-webkit")
+        .filter(|arg| arg != "--smoke-test" && arg != "--smoke-test-webkit" && arg != "--smoke-test-adblock" && arg != "--smoke-test-find")
         .collect::<Vec<_>>()
         .join(" ");
     if !startup_input.trim().is_empty() {
@@ -720,6 +835,24 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                     if is_active { state.dirty.chrome = true; }
                 }
+                EngineEvent::FindMatchCount(count) => {
+                    if is_active {
+                        state.find_match_count = Some(count);
+                        state.dirty_find_bar();
+                    }
+                }
+                EngineEvent::DownloadStarted { id, filename, path } => {
+                    state.upsert_download_started(id, filename, path);
+                }
+                EngineEvent::DownloadProgress { id, received, progress } => {
+                    state.update_download_progress(id, received, progress);
+                }
+                EngineEvent::DownloadFinished { id, path } => {
+                    state.finish_download(id, path);
+                }
+                EngineEvent::DownloadFailed { id, reason } => {
+                    state.fail_download(id, reason);
+                }
                 EngineEvent::LoadStarted => {}
             }
         }
@@ -787,6 +920,49 @@ fn on_key(
     input:      &input::InputHandler,
     save_dirty: &mut SaveDirty,
 ) -> Result<(), Box<dyn std::error::Error>> {
+
+    if state.find_open {
+        match key {
+            input::Key::Escape => {
+                state.find_open = false;
+                state.find_match_count = None;
+                state.dirty_find_bar();
+                engine.find_clear();
+                return Ok(());
+            }
+            input::Key::Enter if input.is_shift_pressed() => {
+                engine.find_previous();
+                return Ok(());
+            }
+            input::Key::Enter => {
+                engine.find_next();
+                return Ok(());
+            }
+            input::Key::Backspace => {
+                if state.find_input.pop().is_some() {
+                    state.find_match_count = None;
+                    state.dirty_find_bar();
+                    engine.find_text(&state.find_input);
+                }
+                return Ok(());
+            }
+            input::Key::Char('f') if input.is_ctrl_pressed() => {
+                state.find_input.clear();
+                state.find_match_count = None;
+                state.dirty_find_bar();
+                engine.find_clear();
+                return Ok(());
+            }
+            input::Key::Char(c) if !input.is_ctrl_pressed() => {
+                state.find_input.push(c);
+                state.find_match_count = None;
+                state.dirty_find_bar();
+                engine.find_text(&state.find_input);
+                return Ok(());
+            }
+            _ => return Ok(()),
+        }
+    }
 
     // ── Overlay-active keys (intercept before normal flow) ────────────────────
     if state.overlay != OverlayKind::None {
@@ -879,7 +1055,22 @@ fn on_key(
             state.toggle_overlay(OverlayKind::Bookmarks);
         }
 
+        input::Key::Char('f') if input.is_ctrl_pressed() => {
+            state.close_overlay();
+            state.address_bar_focused = false;
+            state.find_open = true;
+            state.find_input.clear();
+            state.find_match_count = None;
+            state.dirty_find_bar();
+            engine.find_clear();
+        }
+
         input::Key::Char('l') if input.is_ctrl_pressed() => {
+            if state.find_open {
+                state.find_open = false;
+                state.find_match_count = None;
+                engine.find_clear();
+            }
             state.focus_address_bar();
         }
 
@@ -992,6 +1183,18 @@ fn click_tab_bar(state: &mut BrowserState, engine: &mut RenderEngine, x: u32) {
 fn click_chrome_bar(state: &mut BrowserState, engine: &mut RenderEngine, x: u32, y: u32,
                     save_dirty: &mut SaveDirty)
 {
+    if state.find_open {
+        let fx = FB_WIDTH.saturating_sub(380 + 48);
+        let fy = TAB_BAR_HEIGHT + (CHROME_BAR_HEIGHT - 28) / 2;
+        if x >= fx + 356 && x < fx + 380 && y >= fy && y < fy + 28 {
+            state.find_open = false;
+            state.find_match_count = None;
+            state.dirty_find_bar();
+            engine.find_clear();
+            return;
+        }
+    }
+
     let btn_r: u32 = 16;
     if x >= 12 && x < 12 + btn_r * 2 {
         state.press_nav_btn(1);
@@ -1136,6 +1339,7 @@ fn render_ui(
                 }
                 None => {}
             }
+            draw_download_status(fb, state, font);
         }
     }
 
@@ -1240,6 +1444,9 @@ fn draw_chrome_row(fb: &mut Framebuffer, state: &BrowserState, font: &FontManage
     draw_nav_btn(fb, state, 70,  cy, NavBtn::Forward, can_forward);
     draw_nav_btn(fb, state, 112, cy, NavBtn::Reload,  true);
     draw_address_bar(fb, state, font);
+    if state.find_open {
+        draw_find_bar(fb, state, font);
+    }
     draw::draw_icon_menu(fb, FB_WIDTH - 28, cy, state.theme.icon_fg);
 }
 
@@ -1317,6 +1524,72 @@ fn draw_address_bar(fb: &mut Framebuffer, state: &BrowserState, font: &FontManag
         let star_col = if tab.is_bookmarked { theme.accent } else { theme.icon_fg };
         draw::draw_icon_star(fb, star_x, icon_y, 11, star_col, tab.is_bookmarked);
     }
+}
+
+fn draw_find_bar(fb: &mut Framebuffer, state: &BrowserState, font: &FontManager) {
+    let theme = state.theme;
+    let w = 380;
+    let h = 28;
+    let x = FB_WIDTH.saturating_sub(w + 48);
+    let y = TAB_BAR_HEIGHT + (CHROME_BAR_HEIGHT - h) / 2;
+
+    draw::draw_rounded_rect(fb, x.saturating_sub(1), y.saturating_sub(1), w + 2, h + 2, 8, theme.address_bar_border_focused);
+    draw::draw_rounded_rect(fb, x, y, w, h, 8, theme.address_bar_bg_focused);
+
+    let label = if state.find_input.is_empty() {
+        "Find in page"
+    } else {
+        &state.find_input
+    };
+    let fg = if state.find_input.is_empty() { theme.placeholder } else { theme.address_bar_fg };
+    draw::draw_text(fb, font, x + 12, y + 7, label, 13.0, fg, 210);
+    if (state.frame_count / 28) % 2 == 0 {
+        let cw = font.text_width(&state.find_input, 13.0);
+        let cx = (x + 12 + cw + 1).min(x + 220);
+        fb.fill_rect(cx, y + 7, 2, 14, theme.accent);
+    }
+
+    let count = match state.find_match_count {
+        Some(0) => "0".to_string(),
+        Some(n) => n.to_string(),
+        None => "-".to_string(),
+    };
+    draw::draw_text(fb, font, x + 232, y + 7, &count, 13.0, theme.fg_secondary, 36);
+    draw::draw_text(fb, font, x + 270, y + 7, "Enter next", 12.0, theme.fg_secondary, 86);
+    draw::draw_text(fb, font, x + w - 20, y + 7, "x", 13.0, theme.fg_secondary, 14);
+}
+
+fn draw_download_status(fb: &mut Framebuffer, state: &BrowserState, font: &FontManager) {
+    if state.downloads.is_empty() {
+        return;
+    }
+    let theme = state.theme;
+    let item = state.downloads.last().unwrap();
+    let w = 420;
+    let h = 58;
+    let x = FB_WIDTH.saturating_sub(w + 24);
+    let y = TOP_BAR_HEIGHT + 20;
+
+    draw::draw_rounded_rect(fb, x.saturating_sub(1), y.saturating_sub(1), w + 2, h + 2, 10, theme.border);
+    draw::draw_rounded_rect(fb, x, y, w, h, 10, theme.surface);
+
+    let (label, color) = match &item.status {
+        DownloadStatus::Active => ("Downloading", theme.accent),
+        DownloadStatus::Complete => ("Downloaded", theme.security_ok),
+        DownloadStatus::Failed(_) => ("Download failed", theme.security_err),
+    };
+    draw::draw_text(fb, font, x + 14, y + 10, label, 13.0, color, 130);
+    draw::draw_text(fb, font, x + 118, y + 10, &item.filename, 13.0, theme.fg, w - 132);
+
+    let detail = match &item.status {
+        DownloadStatus::Active => {
+            let pct = (item.progress * 100.0).round().clamp(0.0, 100.0) as u32;
+            format!("{pct}%  {} KB", item.received / 1024)
+        }
+        DownloadStatus::Complete => item.path.clone(),
+        DownloadStatus::Failed(reason) => reason.clone(),
+    };
+    draw::draw_text(fb, font, x + 14, y + 34, &detail, 12.0, theme.fg_secondary, w - 28);
 }
 
 // ── Overlay panel (history / bookmarks) ──────────────────────────────────────

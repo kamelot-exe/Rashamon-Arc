@@ -122,6 +122,23 @@ pub struct GlobalHistoryEntry {
     pub when:  u64,
 }
 
+#[derive(Debug, Clone)]
+pub enum DownloadStatus {
+    Active,
+    Complete,
+    Failed(String),
+}
+
+#[derive(Debug, Clone)]
+pub struct DownloadItem {
+    pub id:       u64,
+    pub filename: String,
+    pub path:     String,
+    pub received: u64,
+    pub progress: f64,
+    pub status:   DownloadStatus,
+}
+
 // ── NavigationEntry ───────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone)]
@@ -309,11 +326,15 @@ pub struct BrowserState {
 
     pub address_bar_focused: bool,
     pub address_bar_input:   String,
+    pub find_open:           bool,
+    pub find_input:          String,
+    pub find_match_count:    Option<u32>,
 
     pub bookmarks: Vec<QuickLink>,
 
     /// Cross-tab global visit history (excludes private tab visits).
     pub global_history: Vec<GlobalHistoryEntry>,
+    pub downloads:      Vec<DownloadItem>,
 
     /// Which content overlay (history / bookmarks) is currently shown.
     pub overlay:        OverlayKind,
@@ -348,6 +369,9 @@ impl BrowserState {
             theme:         get_theme(palette),
             address_bar_focused: true,
             address_bar_input:   String::new(),
+            find_open:           false,
+            find_input:          String::new(),
+            find_match_count:    None,
             bookmarks: vec![
                 QuickLink::new("GitHub",      "https://github.com"),
                 QuickLink::new("Hacker News", "https://news.ycombinator.com"),
@@ -357,6 +381,7 @@ impl BrowserState {
                 QuickLink::new("Crates.io",   "https://crates.io"),
             ],
             global_history:  Vec::new(),
+            downloads:       Vec::new(),
             overlay:         OverlayKind::None,
             overlay_scroll:  0,
             overlay_hover:   None,
@@ -407,6 +432,60 @@ impl BrowserState {
         if self.is_on_new_tab() {
             self.dirty.content = true;
         }
+    }
+
+    pub fn dirty_find_bar(&mut self) {
+        self.dirty.chrome = true;
+        self.dirty.content = true;
+    }
+
+    pub fn upsert_download_started(&mut self, id: u64, filename: String, path: String) {
+        self.downloads.retain(|d| d.id != id);
+        self.downloads.push(DownloadItem {
+            id,
+            filename,
+            path,
+            received: 0,
+            progress: 0.0,
+            status: DownloadStatus::Active,
+        });
+        if self.downloads.len() > 6 {
+            self.downloads.remove(0);
+        }
+        self.dirty.content = true;
+    }
+
+    pub fn update_download_progress(&mut self, id: u64, received: u64, progress: f64) {
+        if let Some(item) = self.downloads.iter_mut().find(|d| d.id == id) {
+            item.received = received;
+            item.progress = progress;
+            self.dirty.content = true;
+        }
+    }
+
+    pub fn finish_download(&mut self, id: u64, path: String) {
+        if let Some(item) = self.downloads.iter_mut().find(|d| d.id == id) {
+            item.path = path;
+            item.progress = 1.0;
+            item.status = DownloadStatus::Complete;
+            self.dirty.content = true;
+        }
+    }
+
+    pub fn fail_download(&mut self, id: u64, reason: String) {
+        if let Some(item) = self.downloads.iter_mut().find(|d| d.id == id) {
+            item.status = DownloadStatus::Failed(reason);
+        } else {
+            self.downloads.push(DownloadItem {
+                id,
+                filename: "download".to_string(),
+                path: String::new(),
+                received: 0,
+                progress: 0.0,
+                status: DownloadStatus::Failed(reason),
+            });
+        }
+        self.dirty.content = true;
     }
 
     fn compute_hover_region(&self, x: u32, y: u32) -> HoveredRegion {
@@ -993,6 +1072,7 @@ impl BrowserState {
 
     pub fn focus_address_bar(&mut self) {
         self.close_overlay();
+        self.find_open = false;
         self.address_bar_focused = true;
         self.dirty_address_bar();
     }

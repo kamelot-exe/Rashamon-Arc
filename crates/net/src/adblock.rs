@@ -1,7 +1,8 @@
-//! Network-level ad/tracker blocking engine.
+//! Minimal built-in ad/tracker blocking engine.
 //!
-//! Uses rule-based matching (EasyList-compatible format).
-//! Rules are loaded at startup and evaluated per-request.
+//! This is intentionally not an EasyList/uBlock implementation yet. The v0.2
+//! foundation supports fast domain matching, per-domain allowlisting, and simple
+//! URL substring rules for patterns that include a path.
 
 use std::collections::HashSet;
 
@@ -19,21 +20,18 @@ pub struct Rule {
 
 #[derive(Debug, Clone)]
 pub enum RuleKind {
-    /// URL substring match.
-    Contains(String),
-    /// Exact domain match.
-    #[allow(dead_code)]
+    /// Host equals the domain, or is a subdomain of it.
     Domain(String),
-    /// Regex match.
-    #[allow(dead_code)]
-    Regex(String),
+    /// URL substring match, used for path-sensitive starter rules.
+    Substring(String),
 }
 
 /// The adblock engine — holds all rules and evaluates requests.
 pub struct AdblockEngine {
     rules: Vec<Rule>,
-    /// Domains that are always allowed (whitelist).
-    whitelist: HashSet<String>,
+    /// Domains that are always allowed.
+    allowlist: HashSet<String>,
+    enabled: bool,
     /// Stats.
     blocked_count: u64,
     total_count: u64,
@@ -43,7 +41,8 @@ impl AdblockEngine {
     pub fn new() -> Self {
         let mut engine = Self {
             rules: Vec::new(),
-            whitelist: HashSet::new(),
+            allowlist: HashSet::new(),
+            enabled: true,
             blocked_count: 0,
             total_count: 0,
         };
@@ -53,83 +52,66 @@ impl AdblockEngine {
 
     /// Load built-in default rules (common ad/tracker domains).
     fn load_default_rules(&mut self) {
-        // Built-in minimal rule set — common ad/tracker domains.
-        let default_domains = [
+        let default_rules = [
             "doubleclick.net",
-            "googleadservices.com",
             "googlesyndication.com",
-            "adservice.google.com",
-            "pagead2.googlesyndication.com",
-            "adsystem.com",
-            "amazon-adsystem.com",
-            "facebook.com/tr/",
-            "facebook.net",
-            "connect.facebook.net",
-            "analytics.google.com",
             "google-analytics.com",
-            "statcounter.com",
+            "googletagmanager.com",
+            "facebook.net",
+            "facebook.com/tr",
+            "adsystem.com",
+            "adservice.google.com",
             "scorecardresearch.com",
-            "quantserve.com",
-            "ads-twitter.com",
-            "syndication.twitter.com",
-            "ads.linkedin.com",
-            "bat.bing.com",
-            "ads.yahoo.com",
-            "analytics.yahoo.com",
-            "pixel.redditmedia.com",
-            "events.redditmedia.com",
         ];
 
-        for domain in &default_domains {
-            self.rules.push(Rule {
-                text: domain.to_string(),
-                third_party: true,
-                kind: RuleKind::Contains(domain.to_string()),
-            });
-        }
-
-        if std::env::var_os("RASHAMON_DEBUG").is_some() {
-            eprintln!("[adblock] Loaded {} default rules", default_domains.len());
+        for rule in &default_rules {
+            self.add_block_rule(rule);
         }
     }
 
-    /// Load additional rules from a text file (EasyList format).
+    /// Load additional lightweight rules from text.
+    ///
+    /// Supported syntax:
+    /// - blank lines and `!` comments are ignored
+    /// - `@@domain.tld` adds a domain allowlist rule
+    /// - lines without `/` are domain rules
+    /// - lines with `/` are URL substring rules
     pub fn load_rules_from_text(&mut self, text: &str) {
         for line in text.lines() {
             let line = line.trim();
-            if line.is_empty() || line.starts_with('!') || line.starts_with('[') {
+            if line.is_empty() || line.starts_with('!') {
                 continue;
             }
             if line.starts_with("@@") {
-                // Whitelist rule.
-                let domain = line.trim_start_matches("@@");
-                self.whitelist.insert(domain.to_string());
+                self.allowlist_domain(line.trim_start_matches("@@"));
                 continue;
             }
-            self.rules.push(Rule {
-                text: line.to_string(),
-                third_party: line.contains("$third-party"),
-                kind: RuleKind::Contains(line.to_string()),
-            });
+            self.add_block_rule(line);
         }
     }
 
     /// Check if a request should be blocked.
     pub fn should_block(&mut self, url: &str, origin: &str) -> (bool, Option<String>) {
         self.total_count += 1;
+        if !self.enabled {
+            return (false, None);
+        }
 
-        // Check whitelist first.
-        if self.whitelist.iter().any(|d| url.contains(d) || origin.contains(d)) {
+        let url_lc = url.to_ascii_lowercase();
+        let origin_lc = origin.to_ascii_lowercase();
+        let url_host = extract_host(&url_lc);
+        let origin_host = extract_host(&origin_lc);
+        if self.allowlist.iter().any(|domain| {
+            host_matches_domain(url_host.as_deref(), domain)
+                || host_matches_domain(origin_host.as_deref(), domain)
+        }) {
             return (false, None);
         }
 
         for rule in &self.rules {
             let matches = match &rule.kind {
-                RuleKind::Contains(pattern) => url.contains(pattern),
-                RuleKind::Domain(domain) => url.contains(domain),
-                RuleKind::Regex(pat) => {
-                    regex::Regex::new(pat).map(|r| r.is_match(url)).unwrap_or(false)
-                }
+                RuleKind::Domain(domain) => host_matches_domain(url_host.as_deref(), domain),
+                RuleKind::Substring(pattern) => url_lc.contains(pattern),
             };
             if matches {
                 self.blocked_count += 1;
@@ -140,16 +122,41 @@ impl AdblockEngine {
         (false, None)
     }
 
-    /// Toggle a specific rule.
+    pub fn add_block_rule(&mut self, rule_text: &str) {
+        let text = rule_text.trim().to_ascii_lowercase();
+        if text.is_empty() {
+            return;
+        }
+        let kind = if text.contains('/') {
+            RuleKind::Substring(text.clone())
+        } else {
+            RuleKind::Domain(normalize_domain(&text))
+        };
+        self.rules.push(Rule { text, third_party: true, kind });
+    }
+
+    pub fn allowlist_domain(&mut self, domain: &str) {
+        let domain = normalize_domain(domain);
+        if !domain.is_empty() {
+            self.allowlist.insert(domain);
+        }
+    }
+
+    pub fn remove_allowlist_domain(&mut self, domain: &str) {
+        self.allowlist.remove(&normalize_domain(domain));
+    }
+
+    pub fn set_enabled(&mut self, enabled: bool) {
+        self.enabled = enabled;
+    }
+
+    /// Backward-compatible helper for the text fallback client.
     pub fn toggle_rule(&mut self, rule_text: &str) {
-        if let Some(pos) = self.rules.iter().position(|r| r.text == rule_text) {
+        let normalized = rule_text.trim().to_ascii_lowercase();
+        if let Some(pos) = self.rules.iter().position(|rule| rule.text == normalized) {
             self.rules.remove(pos);
         } else {
-            self.rules.push(Rule {
-                text: rule_text.to_string(),
-                third_party: true,
-                kind: RuleKind::Contains(rule_text.to_string()),
-            });
+            self.add_block_rule(&normalized);
         }
     }
 
@@ -159,5 +166,72 @@ impl AdblockEngine {
 
     pub fn total_count(&self) -> u64 {
         self.total_count
+    }
+}
+
+fn host_matches_domain(host: Option<&str>, domain: &str) -> bool {
+    let Some(host) = host else { return false; };
+    host == domain || host.ends_with(&format!(".{domain}"))
+}
+
+fn normalize_domain(input: &str) -> String {
+    let mut host = extract_host(input).unwrap_or_else(|| input.to_ascii_lowercase());
+    if let Some((before_path, _)) = host.split_once('/') {
+        host = before_path.to_string();
+    }
+    if let Some((before_port, port)) = host.rsplit_once(':') {
+        if port.chars().all(|c| c.is_ascii_digit()) {
+            host = before_port.to_string();
+        }
+    }
+    host.trim_start_matches('.').to_string()
+}
+
+fn extract_host(input: &str) -> Option<String> {
+    let input = input.trim().to_ascii_lowercase();
+    if input.is_empty() {
+        return None;
+    }
+    let after_scheme = input
+        .split_once("://")
+        .map(|(_, rest)| rest)
+        .unwrap_or(input.as_str());
+    let after_user = after_scheme.rsplit_once('@').map(|(_, rest)| rest).unwrap_or(after_scheme);
+    let host_port = after_user.split(['/', '?', '#']).next().unwrap_or_default();
+    let host = host_port
+        .rsplit_once(':')
+        .filter(|(_, port)| port.chars().all(|c| c.is_ascii_digit()))
+        .map(|(host, _)| host)
+        .unwrap_or(host_port)
+        .trim_matches('.');
+    if host.is_empty() { None } else { Some(host.to_string()) }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::AdblockEngine;
+
+    #[test]
+    fn blocks_default_domain_and_subdomain() {
+        let mut engine = AdblockEngine::new();
+        let (blocked, reason) = engine.should_block("https://ad.doubleclick.net/page", "");
+        assert!(blocked);
+        assert_eq!(reason.as_deref(), Some("doubleclick.net"));
+    }
+
+    #[test]
+    fn supports_path_substring_rule() {
+        let mut engine = AdblockEngine::new();
+        let (blocked, reason) = engine.should_block("https://www.facebook.com/tr?id=1", "");
+        assert!(blocked);
+        assert_eq!(reason.as_deref(), Some("facebook.com/tr"));
+    }
+
+    #[test]
+    fn allowlist_domain_overrides_block_rule() {
+        let mut engine = AdblockEngine::new();
+        engine.allowlist_domain("doubleclick.net");
+        let (blocked, _) = engine.should_block("https://ad.doubleclick.net/page", "");
+        assert!(!blocked);
     }
 }

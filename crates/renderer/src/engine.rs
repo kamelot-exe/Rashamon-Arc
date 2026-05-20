@@ -124,6 +124,17 @@ impl RenderEngine {
     pub fn zoom_in(&mut self)    { self.inner.zoom_in(); }
     pub fn zoom_out(&mut self)   { self.inner.zoom_out(); }
     pub fn zoom_reset(&mut self) { self.inner.zoom_reset(); }
+    pub fn adblock_allow_domain(&mut self, domain: &str) {
+        self.inner.adblock_allow_domain(domain);
+    }
+    pub fn adblock_remove_allow_domain(&mut self, domain: &str) {
+        self.inner.adblock_remove_allow_domain(domain);
+    }
+    pub fn find_text(&mut self, query: &str) { self.inner.find_text(query); }
+    pub fn find_next(&mut self) { self.inner.find_next(); }
+    pub fn find_previous(&mut self) { self.inner.find_previous(); }
+    pub fn find_clear(&mut self) { self.inner.find_clear(); }
+    pub fn download_url(&mut self, url: &str) { self.inner.download_url(url); }
 
     pub fn can_go_back(&self)    -> bool { self.inner.can_go_back() }
     pub fn can_go_forward(&self) -> bool { self.inner.can_go_forward() }

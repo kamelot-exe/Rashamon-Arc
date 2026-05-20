@@ -17,3 +17,5 @@ mod webkit_engine;
 pub use engine::RenderEngine;
 pub use engine_trait::{ContentEngine, EngineEvent, EngineFrame};
 pub use framebuffer::Framebuffer;
+#[cfg(feature = "webkit")]
+pub use webkit_engine::download_destination_for_test;

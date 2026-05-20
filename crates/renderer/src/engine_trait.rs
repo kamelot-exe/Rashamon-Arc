@@ -18,6 +18,12 @@ pub enum EngineEvent {
     ContentHeightChanged(u32),
     /// WebKit reports whether native back/forward history is available.
     NavStateChanged { can_back: bool, can_forward: bool },
+    /// WebKit find-in-page reported a match count for the active query.
+    FindMatchCount(u32),
+    DownloadStarted { id: u64, filename: String, path: String },
+    DownloadProgress { id: u64, received: u64, progress: f64 },
+    DownloadFinished { id: u64, path: String },
+    DownloadFailed { id: u64, reason: String },
 }
 
 /// Whether the engine wrote real pixels into the framebuffer.
@@ -58,6 +64,13 @@ pub trait ContentEngine: Send {
     fn zoom_in(&mut self) {}
     fn zoom_out(&mut self) {}
     fn zoom_reset(&mut self) {}
+    fn adblock_allow_domain(&mut self, _domain: &str) {}
+    fn adblock_remove_allow_domain(&mut self, _domain: &str) {}
+    fn find_text(&mut self, _query: &str) {}
+    fn find_next(&mut self) {}
+    fn find_previous(&mut self) {}
+    fn find_clear(&mut self) {}
+    fn download_url(&mut self, _url: &str) {}
 
     /// Whether the active tab's WebView has native back/forward history.
     /// Returns false on stub engines — shell history is used instead.

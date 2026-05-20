@@ -88,6 +88,7 @@ impl InputHandler {
                         Scancode::P if self.ctrl_pressed => Some(Key::Char('p')),
                         Scancode::H if self.ctrl_pressed => Some(Key::Char('h')),
                         Scancode::B if self.ctrl_pressed => Some(Key::Char('b')),
+                        Scancode::F if self.ctrl_pressed => Some(Key::Char('f')),
                         Scancode::I if self.ctrl_pressed => Some(Key::Char('i')),
                         Scancode::L if self.ctrl_pressed => Some(Key::Char('l')),
                         Scancode::N if self.ctrl_pressed => Some(Key::Char('n')),

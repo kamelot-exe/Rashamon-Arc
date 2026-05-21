@@ -38,6 +38,7 @@ pub struct RenderEngine {
 }
 
 impl RenderEngine {
+    #[allow(unused_variables)]
     pub fn new(content_w: u32, content_h: u32) -> Result<Self, Box<dyn std::error::Error>> {
         #[cfg(feature = "servo")]
         match ServoHost::new(content_w, content_h) {

@@ -9,6 +9,7 @@ edition.workspace = true
 # Disable with: --no-default-features
 default = ["webkit"]
 webkit = ["dep:webkit2gtk", "dep:gtk", "dep:glib", "dep:gio", "dep:cairo-rs"]
+kamelot = []
 
 # Servo integration — requires building SpiderMonkey C++ (~45 min first build).
 # System deps: libssl-dev pkg-config python3 libfontconfig1-dev

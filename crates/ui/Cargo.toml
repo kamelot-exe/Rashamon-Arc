@@ -3,14 +3,24 @@ name = "rashamon-ui"
 version.workspace = true
 edition.workspace = true
 
+[features]
+default = ["linux-desktop"]
+linux-desktop = [
+    "dep:drm-fourcc",
+    "dep:libc",
+    "dep:sdl2",
+    "rashamon-renderer/webkit",
+]
+kamelot = ["rashamon-renderer/kamelot"]
+
 [dependencies]
 rashamon-ipc.workspace = true
-rashamon-renderer.workspace = true
+rashamon-renderer = { workspace = true, default-features = false }
 rashamon-net.workspace = true
 memmap2.workspace = true
-libc = "0.2"
-drm-fourcc = "2"
-sdl2 = "0.35"
+libc = { version = "0.2", optional = true }
+drm-fourcc = { version = "2", optional = true }
+sdl2 = { version = "0.35", optional = true }
 rusttype = "0.9"
 ab_glyph = "0.2"
 

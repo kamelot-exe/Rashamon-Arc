@@ -9,14 +9,14 @@ members = [
 resolver = "2"
 
 [workspace.package]
-version = "0.4.0"
+version = "0.5.0"
 edition = "2021"
 license = "MIT"
 
 [workspace.dependencies]
 rashamon-ipc = { path = "crates/ipc" }
 rashamon-sandbox = { path = "crates/sandbox" }
-rashamon-renderer = { path = "crates/renderer" }
+rashamon-renderer = { path = "crates/renderer", default-features = false }
 rashamon-net = { path = "crates/net" }
 memmap2 = "0.9"
 bincode = "1.3"

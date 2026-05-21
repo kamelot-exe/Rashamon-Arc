@@ -29,6 +29,7 @@ use crate::framebuffer::{Framebuffer, Pixel};
 use crate::permissions::{
     origin_from_url, DecisionSource, PermissionDecision, PermissionKind, PermissionStore,
 };
+use crate::platform;
 use glib::Cast;
 use rashamon_net::AdblockEngine;
 
@@ -1608,16 +1609,7 @@ fn send_site_info(
 }
 
 fn rashamon_data_dir() -> PathBuf {
-    let base = std::env::var("XDG_DATA_HOME")
-        .ok()
-        .map(PathBuf::from)
-        .or_else(|| {
-            std::env::var("HOME")
-                .ok()
-                .map(|h| PathBuf::from(h).join(".local").join("share"))
-        })
-        .unwrap_or_else(|| PathBuf::from("."));
-    base.join("rashamon-arc")
+    platform::default_data_dir()
 }
 
 // ── Snapshot helper ───────────────────────────────────────────────────────────
@@ -1928,11 +1920,7 @@ fn download_destination_for_suggested_filename(suggested: &str) -> PathBuf {
 }
 
 fn default_download_dir() -> PathBuf {
-    std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join("Downloads")
-        .join("RashamonArc")
+    platform::default_downloads_dir()
 }
 
 fn safe_download_filename(suggested: &str) -> String {

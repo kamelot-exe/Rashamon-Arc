@@ -7,6 +7,7 @@ mod engine;
 mod engine_trait;
 pub mod framebuffer;
 mod permissions;
+mod platform;
 #[cfg(feature = "servo")]
 mod servo_embedder;
 #[cfg(not(feature = "servo"))]
@@ -23,3 +24,7 @@ pub use permissions::{
 };
 #[cfg(feature = "webkit")]
 pub use webkit_engine::download_destination_for_test;
+#[cfg(not(feature = "webkit"))]
+pub fn download_destination_for_test(filename: &str) -> std::path::PathBuf {
+    std::path::PathBuf::from(filename)
+}

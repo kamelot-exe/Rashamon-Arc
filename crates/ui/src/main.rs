@@ -1,18 +1,30 @@
 //! Rashamon Arc — main browser UI process.
+#![cfg_attr(
+    all(feature = "kamelot", not(feature = "linux-desktop")),
+    allow(dead_code, unused_imports)
+)]
+mod core_driver;
 mod display;
 mod draw;
 mod font;
+mod hit_test;
 mod input;
 mod layout;
 mod omnibox;
 mod page;
+mod platform;
 mod persist;
 mod theme;
 mod ui_state;
 
 use crate::font::FontManager;
+use crate::hit_test::{
+    permission_kinds_ui, permission_prompt_hit_rects, permission_prompt_rect,
+    site_info_adblock_rect, site_info_permission_rects, site_info_rect, Rect,
+};
 use crate::layout::*;
 use crate::page::{PageNode, parse_html, is_low_content};
+use core_driver::{BrowserAction, BrowserCoreDriver};
 use rashamon_net::{AdblockEngine, HttpClient};
 use rashamon_renderer::{
     download_destination_for_test, origin_from_url, DecisionSource, EngineEvent, EngineFrame,
@@ -26,15 +38,13 @@ use std::time::{Duration, Instant};
 
 // Loading timing (at 60 fps)
 const LOAD_MIN_FRAMES:     u64 = 60;   // 1 s minimum visible loading state
-const LOAD_TIMEOUT_FRAMES: u64 = 360;  // 6 s → show error
 
 // Page layout constants (shared between render and measure)
 const MARGIN:  u32 = 120;
 const MAX_W:   u32 = 880;
 const PAD_TOP: u32 = 28;
 
-// Scroll speeds
-const SCROLL_LINE:  i32 = 40;
+// Smoke-test scroll step; runtime wheel handling lives in BrowserCoreDriver.
 const SCROLL_WHEEL: i32 = 80;
 
 // Private tab accent colour (purple stripe)
@@ -56,111 +66,31 @@ fn scale(v: i32, factor: f32, max: u32) -> u32 {
     ((v.max(0) as f32 * factor) as u32).min(max - 1)
 }
 
-/// Run the omnibox pipeline and trigger navigation or an overlay as needed.
-fn omnibox_navigate(
-    raw:    &str,
-    state:  &mut BrowserState,
-    engine: &mut RenderEngine,
-) {
-    use omnibox::{resolve, MatchEntry, OmniboxResult, InternalRoute, DEFAULT_PROVIDER};
-
-    let bm_iter = state.bookmarks.iter()
-        .map(|b| MatchEntry { url: &b.url, title: &b.title });
-    let hist_iter = state.global_history.iter().rev()
-        .map(|e| MatchEntry { url: &e.url, title: &e.title });
-
-    match resolve(raw, bm_iter, hist_iter, &DEFAULT_PROVIDER) {
-        OmniboxResult::Navigate(url) => {
-            if let Some(url) = state.begin_navigate(&url) {
-                let nav_id = state.active_tab().map_or(0, |t| t.nav_id);
-                engine.navigate(&url, nav_id).ok();
-            }
-        }
-        OmniboxResult::OpenOverlay(InternalRoute::History)   => {
-            state.toggle_overlay(OverlayKind::History);
-        }
-        OmniboxResult::OpenOverlay(InternalRoute::Bookmarks) => {
-            state.toggle_overlay(OverlayKind::Bookmarks);
-        }
-        OmniboxResult::OpenOverlay(InternalRoute::Blank) => {
-            state.open_new_tab();
-            let id = state.active_tab_id;
-            engine.create_tab(id.raw(), false);
-            engine.set_active_tab(id.raw());
-        }
-        OmniboxResult::Nothing => {
-            state.cancel_address_bar_edit();
-        }
+fn scale_platform_event(
+    event: input::PlatformEvent,
+    scale_x: f32,
+    scale_y: f32,
+) -> input::PlatformEvent {
+    match event {
+        input::PlatformEvent::MouseMove { x, y } => input::PlatformEvent::MouseMove {
+            x: scale(x, scale_x, FB_WIDTH) as i32,
+            y: scale(y, scale_y, FB_HEIGHT) as i32,
+        },
+        input::PlatformEvent::MouseDown { x, y, button } => input::PlatformEvent::MouseDown {
+            x: scale(x, scale_x, FB_WIDTH) as i32,
+            y: scale(y, scale_y, FB_HEIGHT) as i32,
+            button,
+        },
+        input::PlatformEvent::MouseUp { x, y, button } => input::PlatformEvent::MouseUp {
+            x: scale(x, scale_x, FB_WIDTH) as i32,
+            y: scale(y, scale_y, FB_HEIGHT) as i32,
+            button,
+        },
+        other => other,
     }
 }
 
 // ── Persistence helpers ───────────────────────────────────────────────────────
-
-#[derive(Default)]
-struct SaveDirty {
-    bookmarks: bool,
-    history:   bool,
-    prefs:     bool,
-}
-
-impl SaveDirty {
-    fn any(&self) -> bool { self.bookmarks || self.history || self.prefs }
-}
-
-/// Load persisted data into browser state on startup.
-fn load_user_data(state: &mut BrowserState) {
-    use crate::theme::ColorPalette;
-
-    // Theme preference — applied first so the initial render uses the right theme.
-    if let Some(theme_str) = persist::load_theme() {
-        if let Some(palette) = ColorPalette::from_str(&theme_str) {
-            state.apply_palette(palette);
-        }
-    }
-
-    // Bookmarks — replace the built-in defaults if user has saved bookmarks.
-    let stored_bm = persist::load_bookmarks();
-    if !stored_bm.is_empty() {
-        state.bookmarks = stored_bm.into_iter()
-            .map(|b| ui_state::QuickLink::new(b.title, b.url))
-            .collect();
-    }
-
-    // History — loaded oldest-first, same as storage order.
-    let stored_hist = persist::load_history();
-    for e in stored_hist {
-        state.global_history.push(ui_state::GlobalHistoryEntry {
-            url:   e.url,
-            title: e.title,
-            when:  0, // wall-clock unknown; ordering preserved by position
-        });
-    }
-}
-
-/// Flush any dirty saves in background threads (fire-and-forget).
-fn flush_saves(state: &BrowserState, dirty: &mut SaveDirty) {
-    if dirty.bookmarks {
-        let bm: Vec<persist::StoredBookmark> = state.bookmarks.iter()
-            .map(|b| persist::StoredBookmark { title: b.title.clone(), url: b.url.clone() })
-            .collect();
-        std::thread::spawn(move || persist::save_bookmarks(&bm));
-        dirty.bookmarks = false;
-    }
-
-    if dirty.history {
-        let hist: Vec<persist::StoredHistory> = state.global_history.iter()
-            .map(|e| persist::StoredHistory { url: e.url.clone(), title: e.title.clone() })
-            .collect();
-        std::thread::spawn(move || persist::save_history(&hist));
-        dirty.history = false;
-    }
-
-    if dirty.prefs {
-        let name = state.palette.as_str().to_string();
-        std::thread::spawn(move || persist::save_theme(&name));
-        dirty.prefs = false;
-    }
-}
 
 // ── Fetch / parse pipeline ────────────────────────────────────────────────────
 
@@ -778,8 +708,28 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         return run_webkit_smoke_test();
     }
 
+    #[cfg(feature = "linux-desktop")]
+    {
+        return run_linux_desktop();
+    }
+
+    #[cfg(all(feature = "kamelot", not(feature = "linux-desktop")))]
+    {
+        platform::KamelotBackend::new().report_unimplemented();
+        return Ok(());
+    }
+
+    #[cfg(not(any(feature = "linux-desktop", feature = "kamelot")))]
+    {
+        eprintln!("Platform: no backend selected; enable linux-desktop or kamelot");
+        return Ok(());
+    }
+}
+
+#[cfg(feature = "linux-desktop")]
+fn run_linux_desktop() -> Result<(), Box<dyn std::error::Error>> {
     let content_h  = FB_HEIGHT.saturating_sub(TOP_BAR_HEIGHT);
-    let mut engine = RenderEngine::new(FB_WIDTH, content_h)?;
+    let mut driver = BrowserCoreDriver::new(FB_WIDTH, content_h)?;
 
     let sdl   = sdl2::init()?;
     let video = sdl.video()?;
@@ -799,22 +749,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let font       = FontManager::new(font_data)?;
     let mut fb      = Framebuffer::new(FB_WIDTH, FB_HEIGHT);
     let _http       = HttpClient::new();
-    let mut state   = BrowserState::new();
-    load_user_data(&mut state);
     let mut display = display::Display::new(&video, win_w, win_h, FB_WIDTH, FB_HEIGHT)?;
     let mut input   = input::InputHandler::new(event_pump)?;
 
-    // Register the initial tab with the engine so it gets its own WebView.
-    {
-        let id         = state.active_tab_id;
-        let is_private = state.active_tab().map_or(false, |t| t.is_private);
-        engine.create_tab(id.raw(), is_private);
-        engine.set_active_tab(id.raw());
-    }
-
     let mut pending_fetch:    Option<PendingFetch>          = None;
     let mut buffered_outcome: Option<(TabId, FetchOutcome)> = None;
-    let mut save_dirty = SaveDirty::default();
 
     let startup_input = std::env::args()
         .skip(1)
@@ -822,27 +761,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .collect::<Vec<_>>()
         .join(" ");
     if !startup_input.trim().is_empty() {
-        use omnibox::{classify_input, InputKind};
-        let nav_url = match classify_input(startup_input.trim()) {
-            InputKind::Url(u)    => Some(u),
-            InputKind::Search(q) => Some(omnibox::DEFAULT_PROVIDER.build_url(&q)),
-            _                    => None,
-        };
-        if let Some(url) = nav_url {
-            if let Some(url) = state.begin_navigate(&url) {
-                let nav_id = state.active_tab().map_or(0, |t| t.nav_id);
-                engine.navigate(&url, nav_id).ok();
-                // Text-fetch fallback only when no real engine is active
-                if !engine.is_real_engine() {
-                    pending_fetch = Some(spawn_fetch(state.active_tab_id, url));
-                }
-            }
-        }
+        driver.dispatch(BrowserAction::Navigate(startup_input.trim().to_string()));
     }
 
     render_ui(
         &mut fb,
-        &state,
+        &driver.state,
         &font,
         DirtyFlags { tabs: true, chrome: true, content: true },
         ContentRenderMode::Text,
@@ -853,50 +777,25 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut last_blink_phase = 0u64;
 
     while running {
-        state.frame_count += 1;
-        state.tick_nav_btn();
+        driver.state.frame_count += 1;
+        driver.state.tick_nav_btn();
 
         // Pump GTK/GLib events so WebKitGTK can process network responses,
         // fire load-changed signals, and complete snapshots. No-op on stub.
-        engine.pump_gtk();
+        driver.pump_engine();
 
         // ── Events ────────────────────────────────────────────────────────────
         while let Some(ev) = input.poll_event()? {
-            match ev {
-                input::Event::Quit => { running = false; break; }
-
-                input::Event::KeyPress(k) =>
-                    on_key(&mut state, &mut engine, &mut running, k, &input, &mut save_dirty)?,
-
-                input::Event::MouseMove { x, y } => {
-                    let fx = scale(x, scale_x, FB_WIDTH);
-                    let fy = scale(y, scale_y, FB_HEIGHT);
-                    state.set_mouse_pos(fx, fy);
-                }
-
-                input::Event::MouseDown { x, y, button } if button == 1 => {
-                    let fx = scale(x, scale_x, FB_WIDTH);
-                    let fy = scale(y, scale_y, FB_HEIGHT);
-                    on_click(&mut state, &mut engine, fx, fy, &mut save_dirty);
-                }
-
-                input::Event::MouseWheel { delta } => {
-                    if state.overlay != OverlayKind::None {
-                        state.overlay_scroll_by(-delta);
-                    } else {
-                        let px = -delta * SCROLL_WHEEL;
-                        state.scroll_by(px);
-                        engine.scroll(px);
-                    }
-                }
-
-                _ => {}
+            let ev = scale_platform_event(ev, scale_x, scale_y);
+            if driver.handle_platform_event(ev, (FB_HEIGHT - TOP_BAR_HEIGHT) as i32) {
+                running = false;
+                break;
             }
         }
 
         // ── Spawn fetch (text renderer fallback — skipped when real engine active) ──
-        if !engine.is_real_engine() {
-            if let Some(tab) = state.active_tab() {
+        if !driver.engine.is_real_engine() {
+            if let Some(tab) = driver.state.active_tab() {
                 if tab.page_state.is_loading() {
                     let already = pending_fetch.as_ref().map_or(false, |pf| pf.tab_id == tab.id)
                         || buffered_outcome.as_ref().map_or(false, |(id, _)| *id == tab.id);
@@ -920,8 +819,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 Err(mpsc::TryRecvError::Disconnected) => {
                     let tab_id = pf.tab_id;
                     pending_fetch = None;
-                    if state.active_tab().map_or(false, |t| t.id == tab_id && t.page_state.is_loading()) {
-                        state.fail_loading("Connection lost");
+                    if driver.state.active_tab().map_or(false, |t| t.id == tab_id && t.page_state.is_loading()) {
+                        driver.state.fail_loading("Connection lost");
                     }
                 }
                 Err(mpsc::TryRecvError::Empty) => {}
@@ -931,174 +830,73 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // ── Apply buffered result (after min visual loading time) ─────────────
         if let Some((tab_id, _)) = &buffered_outcome {
             let tab_id = *tab_id;
-            let ready = state.active_tab()
+            let ready = driver.state.active_tab()
                 .filter(|t| t.id == tab_id && t.page_state.is_loading())
                 .map_or(false, |t| {
-                    state.frame_count.saturating_sub(t.load_start_frame) >= LOAD_MIN_FRAMES
+                    driver.state.frame_count.saturating_sub(t.load_start_frame) >= LOAD_MIN_FRAMES
                 });
             if ready {
                 let (_, outcome) = buffered_outcome.take().unwrap();
                 match outcome {
                     FetchOutcome::Success { title, nodes, meta_description, noscript } => {
                         let h = measure_content_height(&nodes, &font);
-                        state.resolve_loading(title.unwrap_or_default(), nodes, meta_description, noscript);
-                        state.set_content_height(h);
-                        save_dirty.history = true;
+                        driver.state.resolve_loading(title.unwrap_or_default(), nodes, meta_description, noscript);
+                        driver.state.set_content_height(h);
+                        driver.save_dirty.history = true;
                     }
-                    FetchOutcome::Failure(reason) => { state.fail_loading(&reason); }
+                    FetchOutcome::Failure(reason) => { driver.state.fail_loading(&reason); }
                 }
             }
         }
 
         // ── Loading timeout ───────────────────────────────────────────────────
-        tick_loading(&mut state, &mut engine);
+        driver.tick_loading();
 
         // ── Continuous-animation dirty ────────────────────────────────────────
-        if state.active_tab().map_or(false, |t| t.page_state.is_loading()) {
-            state.dirty.tabs    = true;
-            state.dirty.chrome  = true;
-            state.dirty.content = true;
+        if driver.state.active_tab().map_or(false, |t| t.page_state.is_loading()) {
+            driver.state.dirty.tabs    = true;
+            driver.state.dirty.chrome  = true;
+            driver.state.dirty.content = true;
         }
-        if state.address_bar_focused {
-            let blink = state.frame_count / 28;
+        if driver.state.address_bar_focused {
+            let blink = driver.state.frame_count / 28;
             if blink != last_blink_phase {
                 last_blink_phase = blink;
-                state.dirty_address_bar();
+                driver.state.dirty_address_bar();
             }
         }
 
         // ── Lazy content height (after back/forward) ──────────────────────────
-        if state.dirty.content && state.overlay == OverlayKind::None {
-            if let Some(tab) = state.active_tab() {
+        if driver.state.dirty.content && driver.state.overlay == OverlayKind::None {
+            if let Some(tab) = driver.state.active_tab() {
                 if matches!(tab.page_state, PageState::Loaded) && tab.content_height == 0 {
                     let nodes: Vec<PageNode> = tab.current_nodes().to_vec();
                     if !nodes.is_empty() {
                         let h = measure_content_height(&nodes, &font);
-                        state.set_content_height(h);
+                        driver.state.set_content_height(h);
                     }
                 }
             }
         }
 
-        // ── Engine events — routed to the owning tab by tab_id ───────────────
-        for (tab_id, ev) in engine.poll_events() {
-            // tab_id == 0 means "active tab" (stub / text-renderer path).
-            let target_raw: u64 = if tab_id == 0 {
-                state.active_tab_id.raw()
-            } else {
-                tab_id
-            };
-            let is_active = target_raw == state.active_tab_id.raw();
-
-            match ev {
-                EngineEvent::TitleChanged(t) => {
-                    if let Some(tab) = state.tabs.iter_mut()
-                        .find(|t| t.id.raw() == target_raw)
-                    { tab.title = t; }
-                    if is_active { state.dirty.chrome = true; }
-                    else { state.dirty.tabs = true; }
-                }
-                EngineEvent::UrlChanged(u) => {
-                    if let Some(tab) = state.tabs.iter_mut()
-                        .find(|t| t.id.raw() == target_raw)
-                    { tab.url = u.clone(); }
-                    if is_active {
-                        if !state.address_bar_focused {
-                            state.address_bar_input = u;
-                        }
-                        state.dirty.chrome = true;
-                    }
-                }
-                EngineEvent::LoadComplete => {
-                    state.resolve_engine_loading_for(target_raw);
-                    if is_active {
-                        if !state.address_bar_focused { state.sync_address_bar(); }
-                        state.dirty.content = true;
-                        save_dirty.history  = true;
-                    }
-                }
-                EngineEvent::LoadFailed(reason) => {
-                    state.fail_loading_for(target_raw, &reason);
-                }
-                EngineEvent::ContentHeightChanged(h) => {
-                    state.set_content_height_for(target_raw, h);
-                }
-                EngineEvent::NavStateChanged { can_back, can_forward } => {
-                    if let Some(tab) = state.tabs.iter_mut()
-                        .find(|t| t.id.raw() == target_raw)
-                    {
-                        tab.webkit_can_back    = can_back;
-                        tab.webkit_can_forward = can_forward;
-                    }
-                    if is_active { state.dirty.chrome = true; }
-                }
-                EngineEvent::FindMatchCount(count) => {
-                    if is_active {
-                        state.find_match_count = Some(count);
-                        state.dirty_find_bar();
-                    }
-                }
-                EngineEvent::DownloadStarted { id, filename, path } => {
-                    state.upsert_download_started(id, filename, path);
-                }
-                EngineEvent::DownloadProgress { id, received, progress } => {
-                    state.update_download_progress(id, received, progress);
-                }
-                EngineEvent::DownloadFinished { id, path } => {
-                    state.finish_download(id, path);
-                }
-                EngineEvent::DownloadFailed { id, reason } => {
-                    state.fail_download(id, reason);
-                }
-                EngineEvent::PermissionPrompt { id, origin, kind, nav_id } => {
-                    state.show_permission_prompt(id, target_raw, nav_id, origin, kind);
-                }
-                EngineEvent::PermissionResolved { id } => {
-                    state.clear_permission_prompt(id);
-                }
-                EngineEvent::SitePermissions {
-                    origin,
-                    decisions,
-                    adblock_enabled,
-                    adblock_allowlisted,
-                    blocked_count,
-                } => {
-                    state.set_site_permissions(
-                        origin,
-                        decisions,
-                        adblock_enabled,
-                        adblock_allowlisted,
-                        blocked_count,
-                    );
-                }
-                EngineEvent::LoadStarted => {
-                    let frame = state.frame_count;
-                    if let Some(tab) = state.tabs.iter_mut().find(|t| t.id.raw() == target_raw) {
-                        tab.page_state = PageState::Loading;
-                        tab.load_start_frame = frame;
-                    }
-                    if is_active {
-                        state.dirty.content = true;
-                    }
-                }
-            }
-        }
+        // ── Engine events — routed by BrowserCoreDriver ──────────────────────
+        driver.poll_engine_events();
 
         // ── Render ────────────────────────────────────────────────────────────
-        if state.dirty.any() {
-            let dirty = state.dirty;
-            state.dirty.clear();
+        if driver.state.dirty.any() {
+            let dirty = driver.state.dirty;
+            driver.state.dirty.clear();
 
             // Ask the engine to composite content pixels first. While a real
             // engine is waiting on a fresh snapshot, keep the shell in an
             // intentional pending state instead of showing text fallback.
             let content_mode = if dirty.content
-                && state.overlay == OverlayKind::None
-                && state.active_tab().map_or(false, |t| matches!(t.page_state, PageState::Loaded))
+                && driver.state.overlay == OverlayKind::None
+                && driver.state.active_tab().map_or(false, |t| matches!(t.page_state, PageState::Loaded))
             {
-                match engine.render_into(&mut fb, 0, TOP_BAR_HEIGHT, FB_WIDTH, FB_HEIGHT - TOP_BAR_HEIGHT) {
+                match driver.engine.render_into(&mut fb, 0, TOP_BAR_HEIGHT, FB_WIDTH, FB_HEIGHT - TOP_BAR_HEIGHT) {
                     Ok(EngineFrame::Ready) => ContentRenderMode::Engine,
-                    Ok(_) if engine.is_real_engine() => ContentRenderMode::EnginePending,
+                    Ok(_) if driver.engine.is_real_engine() => ContentRenderMode::EnginePending,
                     Ok(_) => ContentRenderMode::Text,
                     Err(e) => {
                         if std::env::var_os("RASHAMON_DEBUG").is_some() {
@@ -1111,523 +909,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 ContentRenderMode::Text
             };
 
-            render_ui(&mut fb, &state, &font, dirty, content_mode);
+            render_ui(&mut fb, &driver.state, &font, dirty, content_mode);
             display.present(&fb)?;
         }
 
         // ── Persist (fire-and-forget after render) ────────────────────────────
-        if save_dirty.any() {
-            flush_saves(&state, &mut save_dirty);
+        if driver.save_dirty.any() {
+            driver.flush_saves();
         }
 
         std::thread::sleep(std::time::Duration::from_millis(16));
     }
     Ok(())
-}
-
-// ── Loading state machine ─────────────────────────────────────────────────────
-
-fn tick_loading(state: &mut BrowserState, engine: &mut RenderEngine) {
-    let Some(tab) = state.active_tab() else { return };
-    if !tab.page_state.is_loading() { return; }
-    // Real engines (WebKit) need more time for JS-heavy pages.
-    let timeout = if engine.is_real_engine() { LOAD_TIMEOUT_FRAMES * 5 } else { LOAD_TIMEOUT_FRAMES };
-    if state.frame_count.saturating_sub(tab.load_start_frame) >= timeout {
-        state.fail_loading("Request timed out");
-    }
-}
-
-fn active_origin(state: &BrowserState) -> Option<String> {
-    state
-        .active_tab()
-        .and_then(|tab| origin_from_url(&tab.url))
-}
-
-fn open_site_info_panel(state: &mut BrowserState, engine: &mut RenderEngine) {
-    let origin = active_origin(state);
-    let private = state.active_tab().map_or(false, |tab| tab.is_private);
-    state.close_overlay();
-    state.open_site_info(origin.clone());
-    state.address_bar_focused = false;
-    if let Some(origin) = origin {
-        engine.query_site_permissions(&origin, private);
-    }
-}
-
-// ── Keyboard ──────────────────────────────────────────────────────────────────
-
-fn on_key(
-    state:      &mut BrowserState,
-    engine:     &mut RenderEngine,
-    running:    &mut bool,
-    key:        input::Key,
-    input:      &input::InputHandler,
-    save_dirty: &mut SaveDirty,
-) -> Result<(), Box<dyn std::error::Error>> {
-
-    if let Some(prompt) = state.permission_prompt.clone() {
-        if matches!(key, input::Key::Escape) {
-            engine.resolve_permission(prompt.id, false, prompt.remember);
-            state.clear_permission_prompt(prompt.id);
-            return Ok(());
-        }
-    }
-
-    if state.find_open {
-        match key {
-            input::Key::Escape => {
-                state.find_open = false;
-                state.find_match_count = None;
-                state.dirty_find_bar();
-                engine.find_clear();
-                return Ok(());
-            }
-            input::Key::Enter if input.is_shift_pressed() => {
-                engine.find_previous();
-                return Ok(());
-            }
-            input::Key::Enter => {
-                engine.find_next();
-                return Ok(());
-            }
-            input::Key::Backspace => {
-                if state.find_input.pop().is_some() {
-                    state.find_match_count = None;
-                    state.dirty_find_bar();
-                    engine.find_text(&state.find_input);
-                }
-                return Ok(());
-            }
-            input::Key::Char('f') if input.is_ctrl_pressed() => {
-                state.find_input.clear();
-                state.find_match_count = None;
-                state.dirty_find_bar();
-                engine.find_clear();
-                return Ok(());
-            }
-            input::Key::Char(c) if !input.is_ctrl_pressed() => {
-                state.find_input.push(c);
-                state.find_match_count = None;
-                state.dirty_find_bar();
-                engine.find_text(&state.find_input);
-                return Ok(());
-            }
-            _ => return Ok(()),
-        }
-    }
-
-    // ── Overlay-active keys (intercept before normal flow) ────────────────────
-    if state.overlay != OverlayKind::None {
-        match key {
-            input::Key::Escape => { state.close_overlay(); return Ok(()); }
-            input::Key::Enter  => {
-                if let Some(url) = state.activate_overlay_item() {
-                    if let Some(url) = state.begin_navigate(&url) {
-                        let nav_id = state.active_tab().map_or(0, |t| t.nav_id);
-                        engine.navigate(&url, nav_id).ok();
-                    }
-                }
-                return Ok(());
-            }
-            input::Key::Up   => { state.overlay_move_selection(-1); return Ok(()); }
-            input::Key::Down => { state.overlay_move_selection( 1); return Ok(()); }
-            input::Key::PageUp   => { state.overlay_scroll_by(-(OVERLAY_VISIBLE as i32)); return Ok(()); }
-            input::Key::PageDown => { state.overlay_scroll_by( OVERLAY_VISIBLE as i32);  return Ok(()); }
-            // Let Ctrl+shortcuts fall through so user can still open new tab etc.
-            input::Key::Char(_) if input.is_ctrl_pressed() => {}
-            _ => return Ok(()), // discard non-special keys while overlay is open
-        }
-    }
-
-    match key {
-        input::Key::Escape => {
-            if state.site_info.is_some() {
-                state.close_site_info();
-            } else if state.address_bar_focused {
-                state.cancel_address_bar_edit();
-            } else {
-                *running = false;
-            }
-        }
-
-        input::Key::Char('p') if input.is_ctrl_pressed() => {
-            state.cycle_theme();
-            save_dirty.prefs = true;
-        }
-
-        input::Key::Char('t') if input.is_ctrl_pressed() => {
-            state.open_new_tab();
-            let id = state.active_tab_id;
-            engine.create_tab(id.raw(), false);
-            engine.set_active_tab(id.raw());
-        }
-
-        input::Key::Char('n') if input.is_ctrl_pressed() && input.is_shift_pressed() => {
-            state.open_private_tab();
-            let id = state.active_tab_id;
-            engine.create_tab(id.raw(), true);
-            engine.set_active_tab(id.raw());
-        }
-
-        input::Key::Char('i') if input.is_ctrl_pressed() => {
-            state.open_private_tab();
-            let id = state.active_tab_id;
-            engine.create_tab(id.raw(), true);
-            engine.set_active_tab(id.raw());
-        }
-
-        input::Key::Char('w') if input.is_ctrl_pressed() => {
-            let old_id = state.active_tab_id;
-            let was_last = state.tabs.len() == 1;
-            engine.close_tab(old_id.raw());
-            state.close_tab(old_id);
-            if was_last {
-                let id = state.active_tab_id;
-                engine.create_tab(id.raw(), false);
-            }
-            // Switch to newly-active tab (no reload needed — it keeps its WebView).
-            if engine.is_real_engine() {
-                engine.set_active_tab(state.active_tab_id.raw());
-            } else if let Some(url) = state.active_tab().map(|t| t.url.clone()).filter(|u| !u.is_empty()) {
-                engine.navigate(&url, 0).ok();
-            }
-        }
-
-        input::Key::Char('r') if input.is_ctrl_pressed() => {
-            state.press_nav_btn(3);
-            if let Some(url) = state.reload() {
-                let nav_id = state.active_tab().map_or(0, |t| t.nav_id);
-                engine.navigate(&url, nav_id).ok();
-            }
-        }
-
-        input::Key::Char('h') if input.is_ctrl_pressed() => {
-            state.toggle_overlay(OverlayKind::History);
-        }
-
-        input::Key::Char('b') if input.is_ctrl_pressed() => {
-            state.toggle_overlay(OverlayKind::Bookmarks);
-        }
-
-        input::Key::Char('f') if input.is_ctrl_pressed() => {
-            state.close_overlay();
-            state.address_bar_focused = false;
-            state.find_open = true;
-            state.find_input.clear();
-            state.find_match_count = None;
-            state.dirty_find_bar();
-            engine.find_clear();
-        }
-
-        input::Key::Char('l') if input.is_ctrl_pressed() => {
-            if state.find_open {
-                state.find_open = false;
-                state.find_match_count = None;
-                engine.find_clear();
-            }
-            state.focus_address_bar();
-        }
-
-        input::Key::ZoomIn if input.is_ctrl_pressed() => engine.zoom_in(),
-        input::Key::ZoomOut if input.is_ctrl_pressed() => engine.zoom_out(),
-        input::Key::ZoomReset if input.is_ctrl_pressed() => engine.zoom_reset(),
-
-        input::Key::Enter if state.address_bar_focused => {
-            let raw = state.address_bar_input.trim().to_string();
-            state.cancel_address_bar_edit();
-            if !raw.is_empty() {
-                omnibox_navigate(&raw, state, engine);
-            }
-        }
-
-        input::Key::Backspace if state.address_bar_focused => state.type_backspace(),
-        input::Key::Char(c)   if state.address_bar_focused => state.type_char(c),
-
-        // Scroll keys — only when not editing the address bar.
-        input::Key::Up   if !state.address_bar_focused => {
-            state.scroll_by(-SCROLL_LINE);
-            engine.scroll(-SCROLL_LINE);
-        }
-        input::Key::Down if !state.address_bar_focused => {
-            state.scroll_by(SCROLL_LINE);
-            engine.scroll(SCROLL_LINE);
-        }
-        input::Key::PageUp   if !state.address_bar_focused => {
-            let px = -((FB_HEIGHT - TOP_BAR_HEIGHT) as i32);
-            state.scroll_by(px);
-            engine.scroll(px);
-        }
-        input::Key::PageDown if !state.address_bar_focused => {
-            let px = (FB_HEIGHT - TOP_BAR_HEIGHT) as i32;
-            state.scroll_by(px);
-            engine.scroll(px);
-        }
-
-        _ => {}
-    }
-    Ok(())
-}
-
-// ── Mouse ─────────────────────────────────────────────────────────────────────
-
-fn on_click(state: &mut BrowserState, engine: &mut RenderEngine, x: u32, y: u32,
-            save_dirty: &mut SaveDirty)
-{
-    if click_permission_prompt(state, engine, x, y) {
-        return;
-    } else if click_site_info_panel(state, engine, x, y) {
-        return;
-    } else if y < TAB_BAR_HEIGHT {
-        click_tab_bar(state, engine, x);
-    } else if y < TOP_BAR_HEIGHT {
-        click_chrome_bar(state, engine, x, y, save_dirty);
-    } else if state.overlay != OverlayKind::None {
-        click_overlay(state, engine);
-    } else {
-        click_content(state, engine, x, y);
-    }
-}
-
-fn click_site_info_panel(state: &mut BrowserState, engine: &mut RenderEngine, x: u32, y: u32) -> bool {
-    if state.site_info.is_none() {
-        return false;
-    }
-    if !in_rect(x, y, site_info_rect()) {
-        state.close_site_info();
-        return false;
-    }
-
-    let Some(origin) = state.site_info.as_ref().and_then(|p| p.origin.clone()) else {
-        return true;
-    };
-    let private = state.active_tab().map_or(false, |tab| tab.is_private);
-    if in_rect(x, y, site_info_adblock_rect()) {
-        let next_allowlisted = !state
-            .site_info
-            .as_ref()
-            .map_or(false, |panel| panel.adblock_allowlisted);
-        engine.set_site_adblock_allowlisted(&origin, next_allowlisted, private);
-        if let Some(panel) = state.site_info.as_mut() {
-            panel.adblock_allowlisted = next_allowlisted;
-        }
-        state.dirty.content = true;
-        return true;
-    }
-    for (idx, kind) in permission_kinds_ui().iter().enumerate() {
-        for (decision, rect) in site_info_permission_rects(idx) {
-            if in_rect(x, y, rect) {
-                engine.set_site_permission(&origin, *kind, decision, private);
-                if let Some(panel) = state.site_info.as_mut() {
-                    if let Some((_, current)) = panel.permissions.iter_mut().find(|(k, _)| k == kind) {
-                        *current = decision;
-                    }
-                }
-                state.dirty.content = true;
-                return true;
-            }
-        }
-    }
-    true
-}
-
-fn click_permission_prompt(state: &mut BrowserState, engine: &mut RenderEngine, x: u32, y: u32) -> bool {
-    let Some(prompt) = state.permission_prompt.clone() else { return false };
-    let prompt_current = state.tabs.iter().any(|t| {
-        t.id.raw() == prompt.tab_id && t.id == state.active_tab_id && t.nav_id == prompt.nav_id
-    });
-    if !prompt_current {
-        return false;
-    }
-    let (remember, deny, allow) = permission_prompt_hit_rects();
-
-    if in_rect(x, y, remember) {
-        if let Some(p) = state.permission_prompt.as_mut() {
-            p.remember = !p.remember;
-            state.dirty.content = true;
-        }
-        return true;
-    }
-    if in_rect(x, y, deny) {
-        engine.resolve_permission(prompt.id, false, prompt.remember);
-        state.clear_permission_prompt(prompt.id);
-        return true;
-    }
-    if in_rect(x, y, allow) {
-        engine.resolve_permission(prompt.id, true, prompt.remember);
-        state.clear_permission_prompt(prompt.id);
-        return true;
-    }
-    in_rect(x, y, permission_prompt_rect())
-}
-
-fn click_tab_bar(state: &mut BrowserState, engine: &mut RenderEngine, x: u32) {
-    let tw = state.tab_width;
-    for i in 0..state.tabs.len() {
-        let lx = TAB_START_X + i as u32 * (tw + TAB_SEP);
-        let rx = lx + tw;
-        if x >= lx && x < rx {
-            let id = state.tabs[i].id;
-            if x >= lx + tw.saturating_sub(18) {
-                // ── Close tab ─────────────────────────────────────────────────
-                // Destroy the WebView first, then update shell state, then
-                // activate the new tab's existing WebView (no reload).
-                let was_last = state.tabs.len() == 1;
-                engine.close_tab(id.raw());
-                state.close_tab(id);
-                if was_last {
-                    let new_id = state.active_tab_id;
-                    engine.create_tab(new_id.raw(), false);
-                }
-                if engine.is_real_engine() {
-                    engine.set_active_tab(state.active_tab_id.raw());
-                } else if let Some(url) = state.active_tab()
-                    .map(|t| t.url.clone()).filter(|u| !u.is_empty())
-                {
-                    engine.navigate(&url, 0).ok();
-                }
-            } else if id != state.active_tab_id {
-                // ── Switch tab — no reload ────────────────────────────────────
-                state.activate_tab(id);
-                if engine.is_real_engine() {
-                    // set_active_tab triggers a fresh snapshot; the WebView
-                    // already has its page loaded and scroll position intact.
-                    engine.set_active_tab(id.raw());
-                } else if let Some(url) = state.active_tab()
-                    .map(|t| t.url.clone()).filter(|u| !u.is_empty())
-                {
-                    engine.navigate(&url, 0).ok();
-                }
-            }
-            return;
-        }
-    }
-    let next_x = TAB_START_X + state.tabs.len() as u32 * (tw + TAB_SEP);
-    if x >= next_x && x < next_x + TAB_NEW_BTN_W {
-        state.open_new_tab();
-        let id = state.active_tab_id;
-        engine.create_tab(id.raw(), false);
-        engine.set_active_tab(id.raw());
-    }
-}
-
-fn click_chrome_bar(state: &mut BrowserState, engine: &mut RenderEngine, x: u32, y: u32,
-                    save_dirty: &mut SaveDirty)
-{
-    if state.find_open {
-        let fx = FB_WIDTH.saturating_sub(380 + 48);
-        let fy = TAB_BAR_HEIGHT + (CHROME_BAR_HEIGHT - 28) / 2;
-        if x >= fx + 356 && x < fx + 380 && y >= fy && y < fy + 28 {
-            state.find_open = false;
-            state.find_match_count = None;
-            state.dirty_find_bar();
-            engine.find_clear();
-            return;
-        }
-    }
-
-    let btn_r: u32 = 16;
-    if x >= 12 && x < 12 + btn_r * 2 {
-        state.press_nav_btn(1);
-        if engine.is_real_engine() && engine.can_go_back() {
-            // Native WebKit back: no reload, JS/scroll state preserved.
-            engine.go_back().ok();
-        } else if let Some(url) = state.go_back() {
-            let nav_id = state.active_tab().map_or(0, |t| t.nav_id);
-            engine.navigate(&url, nav_id).ok();
-        }
-        return;
-    }
-    if x >= 54 && x < 54 + btn_r * 2 {
-        state.press_nav_btn(2);
-        if engine.is_real_engine() && engine.can_go_forward() {
-            // Native WebKit forward: no reload, JS/scroll state preserved.
-            engine.go_forward().ok();
-        } else if let Some(url) = state.go_forward() {
-            let nav_id = state.active_tab().map_or(0, |t| t.nav_id);
-            engine.navigate(&url, nav_id).ok();
-        }
-        return;
-    }
-    if x >= 96 && x < 96 + btn_r * 2 {
-        state.press_nav_btn(3);
-        if let Some(url) = state.reload() {
-            let nav_id = state.active_tab().map_or(0, |t| t.nav_id);
-            engine.navigate(&url, nav_id).ok();
-        }
-        return;
-    }
-    let bar_x = (FB_WIDTH - ADDR_BAR_W) / 2;
-    let bar_y = TAB_BAR_HEIGHT + (CHROME_BAR_HEIGHT - ADDR_BAR_H) / 2;
-    if x >= bar_x && x < bar_x + 30 && y >= bar_y && y < bar_y + ADDR_BAR_H {
-        open_site_info_panel(state, engine);
-        return;
-    }
-    if x >= bar_x + ADDR_BAR_W - 26 && x < bar_x + ADDR_BAR_W
-        && y >= bar_y && y < bar_y + ADDR_BAR_H
-    {
-        state.toggle_bookmark();
-        save_dirty.bookmarks = true;
-        return;
-    }
-    if x >= bar_x && x < bar_x + ADDR_BAR_W && y >= bar_y && y < bar_y + ADDR_BAR_H {
-        state.focus_address_bar();
-        return;
-    }
-    state.cancel_address_bar_edit();
-}
-
-fn click_overlay(state: &mut BrowserState, engine: &mut RenderEngine) {
-    if let Some(url) = state.activate_overlay_item() {
-        if let Some(url) = state.begin_navigate(&url) {
-            let nav_id = state.active_tab().map_or(0, |t| t.nav_id);
-            engine.navigate(&url, nav_id).ok();
-        }
-    }
-}
-
-fn click_content(state: &mut BrowserState, engine: &mut RenderEngine, x: u32, y: u32) {
-    match state.active_tab().map(|t| t.page_state.clone()) {
-        Some(PageState::Error(_)) => {
-            let (bx, by) = layout::retry_btn_pos();
-            if x >= bx && x < bx + RETRY_BTN_W && y >= by && y < by + RETRY_BTN_H {
-                if let Some(url) = state.reload() {
-                    let nav_id = state.active_tab().map_or(0, |t| t.nav_id);
-                    engine.navigate(&url, nav_id).ok();
-                }
-                return;
-            }
-        }
-        Some(PageState::NewTab) => {
-            let cx = FB_WIDTH / 2;
-            let cy = TOP_BAR_HEIGHT + (FB_HEIGHT - TOP_BAR_HEIGHT) / 2;
-            let sw: u32 = 600; let sh: u32 = 48;
-            let sx = cx.saturating_sub(sw / 2);
-            let sy = cy.saturating_sub(90);
-            if x >= sx && x < sx + sw && y >= sy && y < sy + sh {
-                state.focus_address_bar();
-                return;
-            }
-            let num = state.bookmarks.len().min(6) as u32;
-            if num > 0 {
-                let row_w = num * QUICK_LINK_W + (num - 1) * QUICK_LINK_GAP;
-                let mut lx = cx.saturating_sub(row_w / 2);
-                let ly = cy + 46;
-                let urls: Vec<String> = state.bookmarks.iter().take(6).map(|b| b.url.clone()).collect();
-                for url in urls {
-                    if x >= lx && x < lx + QUICK_LINK_W && y >= ly && y < ly + QUICK_LINK_H {
-                        if let Some(url) = state.begin_navigate(&url) {
-                            let nav_id = state.active_tab().map_or(0, |t| t.nav_id);
-                            engine.navigate(&url, nav_id).ok();
-                        }
-                        return;
-                    }
-                    lx += QUICK_LINK_W + QUICK_LINK_GAP;
-                }
-            }
-        }
-        _ => {}
-    }
-    state.cancel_address_bar_edit();
 }
 
 // ── Top-level render ──────────────────────────────────────────────────────────
@@ -1928,26 +1221,6 @@ fn draw_download_status(fb: &mut Framebuffer, state: &BrowserState, font: &FontM
     draw::draw_text(fb, font, x + 14, y + 34, &detail, 12.0, theme.fg_secondary, w - 28);
 }
 
-type Rect = (u32, u32, u32, u32);
-
-fn in_rect(x: u32, y: u32, rect: Rect) -> bool {
-    let (rx, ry, rw, rh) = rect;
-    x >= rx && x < rx + rw && y >= ry && y < ry + rh
-}
-
-fn permission_prompt_rect() -> Rect {
-    (24, TOP_BAR_HEIGHT + 20, 560, 88)
-}
-
-fn permission_prompt_hit_rects() -> (Rect, Rect, Rect) {
-    let (x, y, w, _) = permission_prompt_rect();
-    (
-        (x + 18, y + 56, 150, 22),
-        (x + w - 180, y + 52, 72, 26),
-        (x + w - 96, y + 52, 72, 26),
-    )
-}
-
 fn draw_permission_prompt(fb: &mut Framebuffer, state: &BrowserState, font: &FontManager) {
     let Some(prompt) = &state.permission_prompt else { return };
     let Some(tab) = state.tabs.iter().find(|t| t.id.raw() == prompt.tab_id) else { return };
@@ -1996,36 +1269,6 @@ fn draw_prompt_button(
 ) {
     draw::draw_rounded_rect(fb, rect.0, rect.1, rect.2, rect.3, 8, bg);
     draw::draw_text(fb, font, rect.0 + 15, rect.1 + 7, label, 12.0, fg, rect.2 - 20);
-}
-
-fn site_info_rect() -> Rect {
-    let bar_x = (FB_WIDTH - ADDR_BAR_W) / 2;
-    (bar_x, TOP_BAR_HEIGHT + 8, 560, 292)
-}
-
-fn permission_kinds_ui() -> [PermissionKind; 5] {
-    [
-        PermissionKind::Notifications,
-        PermissionKind::Geolocation,
-        PermissionKind::Camera,
-        PermissionKind::Microphone,
-        PermissionKind::Clipboard,
-    ]
-}
-
-fn site_info_permission_rects(row: usize) -> [(PermissionDecision, Rect); 3] {
-    let (x, y, _, _) = site_info_rect();
-    let row_y = y + 108 + row as u32 * 30;
-    [
-        (PermissionDecision::Ask,   (x + 300, row_y, 52, 22)),
-        (PermissionDecision::Allow, (x + 360, row_y, 62, 22)),
-        (PermissionDecision::Deny,  (x + 430, row_y, 56, 22)),
-    ]
-}
-
-fn site_info_adblock_rect() -> Rect {
-    let (x, y, w, h) = site_info_rect();
-    (x + w - 190, y + h - 34, 166, 24)
 }
 
 fn permission_decision_for(

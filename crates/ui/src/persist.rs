@@ -4,22 +4,14 @@
 //! Format: hand-written JSON, no external crate.
 //! All I/O is best-effort — failures are logged to stderr but never crash the browser.
 
+use crate::platform;
 use std::fs;
 use std::path::PathBuf;
 
 // ── Data directory ────────────────────────────────────────────────────────────
 
 fn data_dir() -> PathBuf {
-    let base = std::env::var("XDG_DATA_HOME")
-        .ok()
-        .map(PathBuf::from)
-        .or_else(|| {
-            std::env::var("HOME")
-                .ok()
-                .map(|h| PathBuf::from(h).join(".local").join("share"))
-        })
-        .unwrap_or_else(|| PathBuf::from("."));
-    base.join("rashamon-arc")
+    platform::default_data_dir()
 }
 
 fn ensure_dir(dir: &PathBuf) {

@@ -59,7 +59,7 @@ pub enum PlatformEvent {
     },
 }
 
-#[derive(Debug)]
+#[derive(Clone, Copy, Debug)]
 pub enum BrowserKey {
     Escape,
     Enter,

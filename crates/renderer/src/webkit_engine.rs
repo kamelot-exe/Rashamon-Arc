@@ -24,7 +24,7 @@
 //! a packed Vec<u8> (ARGB32 little-endian = [B,G,R,A] per pixel), and sends it
 //! as `Reply::FrameReady`.  `render_into` blits the latest cached frame.
 
-use crate::engine_trait::{ContentEngine, EngineEvent, EngineFrame};
+use crate::engine_trait::{ContentEngine, CursorKind, EngineEvent, EngineFrame};
 use crate::framebuffer::{Framebuffer, Pixel};
 use crate::permissions::{
     origin_from_url, DecisionSource, PermissionDecision, PermissionKind, PermissionStore,
@@ -61,6 +61,12 @@ enum Cmd {
     Navigate   { tab_id: u64, url: String, nav_id: u64 },
     /// Scroll by delta pixels and re-snapshot the specified tab.
     ScrollBy   { tab_id: u64, delta: i32 },
+    /// Dispatch a click in content-area coordinates.
+    Click      { tab_id: u64, x: u32, y: u32 },
+    RightClick { tab_id: u64, x: u32, y: u32 },
+    MouseMove  { tab_id: u64, x: u32, y: u32 },
+    TextInput  { tab_id: u64, text: String },
+    KeyPress   { tab_id: u64, key: String },
     /// Native WebKit back/forward — no URL re-load.
     GoBack     { tab_id: u64 },
     GoForward  { tab_id: u64 },
@@ -112,6 +118,7 @@ enum Reply {
         adblock_allowlisted: bool,
         blocked_count: u64,
     },
+    CursorChanged { tab_id: u64, cursor: CursorKind },
     TabSuspended { tab_id: u64 },
     TabWaking { tab_id: u64 },
 }
@@ -359,6 +366,37 @@ impl ContentEngine for WebKitEngine {
         let _ = self.cmd_tx.try_send(Cmd::Zoom { tab_id, step: 0 });
     }
 
+    fn click(&mut self, x: u32, y: u32) {
+        let tab_id = self.active_tab_id;
+        let _ = self.cmd_tx.try_send(Cmd::Click { tab_id, x, y });
+    }
+
+    fn right_click(&mut self, x: u32, y: u32) {
+        let tab_id = self.active_tab_id;
+        let _ = self.cmd_tx.try_send(Cmd::RightClick { tab_id, x, y });
+    }
+
+    fn mouse_move(&mut self, x: u32, y: u32) {
+        let tab_id = self.active_tab_id;
+        let _ = self.cmd_tx.try_send(Cmd::MouseMove { tab_id, x, y });
+    }
+
+    fn text_input(&mut self, text: &str) {
+        let tab_id = self.active_tab_id;
+        let _ = self.cmd_tx.try_send(Cmd::TextInput {
+            tab_id,
+            text: text.to_string(),
+        });
+    }
+
+    fn key_press(&mut self, key: &str) {
+        let tab_id = self.active_tab_id;
+        let _ = self.cmd_tx.try_send(Cmd::KeyPress {
+            tab_id,
+            key: key.to_string(),
+        });
+    }
+
     fn adblock_allow_domain(&mut self, domain: &str) {
         let _ = self.cmd_tx.try_send(Cmd::AdblockAllowDomain {
             domain: domain.to_string(),
@@ -589,6 +627,9 @@ impl ContentEngine for WebKitEngine {
                         blocked_count,
                     }));
                 }
+                Ok(Reply::CursorChanged { tab_id, cursor }) => {
+                    self.pending_events.push((tab_id, EngineEvent::CursorChanged(cursor)));
+                }
                 Ok(Reply::TabSuspended { tab_id }) => {
                     trace!("[webkit] tab suspended event tab={tab_id}");
                 }
@@ -745,6 +786,216 @@ impl WebKitDriver {
                             Rc::clone(&entry.frame_gen), Rc::clone(&entry.schedule_gen),
                             Rc::clone(&entry.alive), token, "scroll-settle",
                             Duration::from_millis(72),
+                        );
+                    }
+                }
+
+                Ok(Cmd::Click { tab_id, x, y }) => {
+                    if let Some(entry) = self.tabs.get_mut(&tab_id) {
+                        entry.last_active = Instant::now();
+                        use webkit2gtk::WebViewExt;
+                        let script = format!(
+                            r#"(function() {{
+                                var x = {x};
+                                var y = {y};
+                                var el = document.elementFromPoint(x, y);
+                                if (!el) return false;
+                                var down = {{ view: window, bubbles: true, cancelable: true,
+                                    clientX: x, clientY: y, button: 0, buttons: 1 }};
+                                var up = {{ view: window, bubbles: true, cancelable: true,
+                                    clientX: x, clientY: y, button: 0, buttons: 0 }};
+                                el.dispatchEvent(new MouseEvent('mousemove', down));
+                                el.dispatchEvent(new MouseEvent('mousedown', down));
+                                if (typeof el.focus === 'function') {{
+                                    try {{ el.focus({{ preventScroll: true }}); }} catch (_) {{ el.focus(); }}
+                                }}
+                                el.dispatchEvent(new MouseEvent('mouseup', up));
+                                el.dispatchEvent(new MouseEvent('click', up));
+                                return true;
+                            }})()"#
+                        );
+                        #[allow(deprecated)]
+                        entry.webview.run_javascript(
+                            &script, None::<&gio::Cancellable>, |_| {},
+                        );
+                        let token = next_cell_generation(&entry.schedule_gen);
+                        schedule_view_state_sync(
+                            &entry.webview, tab_id, self.reply_tx.clone(),
+                            Rc::clone(&entry.nav_id_cell), Rc::clone(&entry.alive),
+                            "click-state", Duration::from_millis(80),
+                        );
+                        schedule_snapshot(
+                            &entry.webview, self.w, self.h, tab_id,
+                            self.reply_tx.clone(), Rc::clone(&entry.nav_id_cell),
+                            Rc::clone(&entry.frame_gen), Rc::clone(&entry.schedule_gen),
+                            Rc::clone(&entry.alive), token, "click-fast",
+                            Duration::from_millis(80),
+                        );
+                        schedule_snapshot(
+                            &entry.webview, self.w, self.h, tab_id,
+                            self.reply_tx.clone(), Rc::clone(&entry.nav_id_cell),
+                            Rc::clone(&entry.frame_gen), Rc::clone(&entry.schedule_gen),
+                            Rc::clone(&entry.alive), token, "click-settle",
+                            Duration::from_millis(220),
+                        );
+                    }
+                }
+
+                Ok(Cmd::RightClick { tab_id, x, y }) => {
+                    if let Some(entry) = self.tabs.get_mut(&tab_id) {
+                        entry.last_active = Instant::now();
+                        use webkit2gtk::WebViewExt;
+                        let script = format!(
+                            r#"(function() {{
+                                var x = {x};
+                                var y = {y};
+                                var el = document.elementFromPoint(x, y);
+                                if (!el) return false;
+                                var ev = {{ view: window, bubbles: true, cancelable: true,
+                                    clientX: x, clientY: y, button: 2, buttons: 2 }};
+                                el.dispatchEvent(new MouseEvent('mousedown', ev));
+                                el.dispatchEvent(new MouseEvent('contextmenu', ev));
+                                el.dispatchEvent(new MouseEvent('mouseup',
+                                    {{ view: window, bubbles: true, cancelable: true,
+                                       clientX: x, clientY: y, button: 2, buttons: 0 }}));
+                                return true;
+                            }})()"#
+                        );
+                        #[allow(deprecated)]
+                        entry.webview.run_javascript(
+                            &script, None::<&gio::Cancellable>, |_| {},
+                        );
+                    }
+                }
+
+                Ok(Cmd::MouseMove { tab_id, x, y }) => {
+                    if let Some(entry) = self.tabs.get_mut(&tab_id) {
+                        entry.last_active = Instant::now();
+                        use webkit2gtk::WebViewExt;
+                        let script = format!(
+                            r#"(function() {{
+                                var x = {x};
+                                var y = {y};
+                                var el = document.elementFromPoint(x, y);
+                                if (!el) return 'default';
+                                el.dispatchEvent(new MouseEvent('mousemove',
+                                    {{ view: window, bubbles: true, cancelable: true,
+                                       clientX: x, clientY: y, button: 0, buttons: 0 }}));
+                                var clickable = el.closest &&
+                                    el.closest('a,button,[role="button"],input[type=button],input[type=submit],summary,label');
+                                var editable = el.closest &&
+                                    el.closest('input:not([type=button]):not([type=submit]):not([type=checkbox]):not([type=radio]),textarea,[contenteditable=true]');
+                                var cursor = window.getComputedStyle(el).cursor || '';
+                                if (editable || cursor === 'text') return 'text';
+                                if (clickable || cursor === 'pointer') return 'pointer';
+                                if (cursor === 'wait' || cursor === 'progress') return 'wait';
+                                return 'default';
+                            }})()"#
+                        );
+                        let tx = self.reply_tx.clone();
+                        #[allow(deprecated)]
+                        entry.webview.run_javascript(
+                            &script, None::<&gio::Cancellable>, move |result| {
+                                let cursor = result
+                                    .ok()
+                                    .and_then(|js| js.js_value())
+                                    .map(|value| cursor_from_js(&value.to_string()))
+                                    .unwrap_or(CursorKind::Default);
+                                let _ = tx.try_send(Reply::CursorChanged { tab_id, cursor });
+                            },
+                        );
+                    }
+                }
+
+                Ok(Cmd::TextInput { tab_id, text }) => {
+                    if let Some(entry) = self.tabs.get_mut(&tab_id) {
+                        entry.last_active = Instant::now();
+                        use webkit2gtk::WebViewExt;
+                        let text = js_string_literal(&text);
+                        let script = format!(
+                            r#"(function(text) {{
+                                var el = document.activeElement;
+                                if (!el) return false;
+                                var tag = (el.tagName || '').toLowerCase();
+                                var editable = el.isContentEditable || tag === 'textarea' ||
+                                    (tag === 'input' && !/^(button|submit|checkbox|radio|file|reset|image)$/i.test(el.type || ''));
+                                if (!editable) return false;
+                                el.dispatchEvent(new InputEvent('beforeinput',
+                                    {{ bubbles: true, cancelable: true, inputType: 'insertText', data: text }}));
+                                if (tag === 'textarea' || tag === 'input') {{
+                                    var start = el.selectionStart == null ? el.value.length : el.selectionStart;
+                                    var end = el.selectionEnd == null ? el.value.length : el.selectionEnd;
+                                    el.value = el.value.slice(0, start) + text + el.value.slice(end);
+                                    el.selectionStart = el.selectionEnd = start + text.length;
+                                }} else {{
+                                    document.execCommand('insertText', false, text);
+                                }}
+                                el.dispatchEvent(new InputEvent('input',
+                                    {{ bubbles: true, cancelable: false, inputType: 'insertText', data: text }}));
+                                return true;
+                            }})({text})"#
+                        );
+                        #[allow(deprecated)]
+                        entry.webview.run_javascript(
+                            &script, None::<&gio::Cancellable>, |_| {},
+                        );
+                        let token = next_cell_generation(&entry.schedule_gen);
+                        schedule_snapshot(
+                            &entry.webview, self.w, self.h, tab_id,
+                            self.reply_tx.clone(), Rc::clone(&entry.nav_id_cell),
+                            Rc::clone(&entry.frame_gen), Rc::clone(&entry.schedule_gen),
+                            Rc::clone(&entry.alive), token, "text-input",
+                            Duration::from_millis(40),
+                        );
+                    }
+                }
+
+                Ok(Cmd::KeyPress { tab_id, key }) => {
+                    if let Some(entry) = self.tabs.get_mut(&tab_id) {
+                        entry.last_active = Instant::now();
+                        use webkit2gtk::WebViewExt;
+                        let key = js_string_literal(&key);
+                        let script = format!(
+                            r#"(function(key) {{
+                                var el = document.activeElement || document.body;
+                                var init = {{ key: key, bubbles: true, cancelable: true }};
+                                var cancelled = !el.dispatchEvent(new KeyboardEvent('keydown', init));
+                                if (!cancelled) {{
+                                    var tag = (el.tagName || '').toLowerCase();
+                                    var editable = el && (el.isContentEditable || tag === 'textarea' ||
+                                        (tag === 'input' && !/^(button|submit|checkbox|radio|file|reset|image)$/i.test(el.type || '')));
+                                    if (editable && (tag === 'textarea' || tag === 'input')) {{
+                                        var start = el.selectionStart == null ? el.value.length : el.selectionStart;
+                                        var end = el.selectionEnd == null ? el.value.length : el.selectionEnd;
+                                        if (key === 'Backspace' && (start > 0 || end > start)) {{
+                                            var delStart = end > start ? start : start - 1;
+                                            el.value = el.value.slice(0, delStart) + el.value.slice(end);
+                                            el.selectionStart = el.selectionEnd = delStart;
+                                            el.dispatchEvent(new InputEvent('input',
+                                                {{ bubbles: true, inputType: 'deleteContentBackward', data: null }}));
+                                        }} else if (key === 'Enter' && tag === 'textarea') {{
+                                            el.value = el.value.slice(0, start) + '\n' + el.value.slice(end);
+                                            el.selectionStart = el.selectionEnd = start + 1;
+                                            el.dispatchEvent(new InputEvent('input',
+                                                {{ bubbles: true, inputType: 'insertLineBreak', data: null }}));
+                                        }}
+                                    }}
+                                }}
+                                el.dispatchEvent(new KeyboardEvent('keyup', init));
+                                return true;
+                            }})({key})"#
+                        );
+                        #[allow(deprecated)]
+                        entry.webview.run_javascript(
+                            &script, None::<&gio::Cancellable>, |_| {},
+                        );
+                        let token = next_cell_generation(&entry.schedule_gen);
+                        schedule_snapshot(
+                            &entry.webview, self.w, self.h, tab_id,
+                            self.reply_tx.clone(), Rc::clone(&entry.nav_id_cell),
+                            Rc::clone(&entry.frame_gen), Rc::clone(&entry.schedule_gen),
+                            Rc::clone(&entry.alive), token, "key-input",
+                            Duration::from_millis(40),
                         );
                     }
                 }
@@ -2020,4 +2271,34 @@ fn wv_title(wv: &webkit2gtk::WebView) -> String {
 fn wv_url(wv: &webkit2gtk::WebView) -> String {
     use webkit2gtk::WebViewExt;
     wv.uri().map(|s| s.to_string()).unwrap_or_default()
+}
+
+fn js_string_literal(value: &str) -> String {
+    let mut out = String::with_capacity(value.len() + 2);
+    out.push('\'');
+    for ch in value.chars() {
+        match ch {
+            '\\' => out.push_str("\\\\"),
+            '\'' => out.push_str("\\'"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if c.is_control() => {
+                use std::fmt::Write;
+                let _ = write!(out, "\\u{:04x}", c as u32);
+            }
+            c => out.push(c),
+        }
+    }
+    out.push('\'');
+    out
+}
+
+fn cursor_from_js(value: &str) -> CursorKind {
+    match value.trim_matches('"').trim_matches('\'') {
+        "pointer" => CursorKind::Pointer,
+        "text" => CursorKind::Text,
+        "wait" => CursorKind::Wait,
+        _ => CursorKind::Default,
+    }
 }

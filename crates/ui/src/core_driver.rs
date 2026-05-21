@@ -7,12 +7,14 @@
 
 use crate::input::{BrowserKey, MouseButton, PlatformEvent};
 use crate::hit_test::UiHitTarget;
-use crate::layout::OVERLAY_VISIBLE;
+use crate::layout::{OVERLAY_VISIBLE, TOP_BAR_HEIGHT};
 use crate::omnibox::{self, InternalRoute, MatchEntry, OmniboxResult};
 use crate::persist;
 use crate::theme::ColorPalette;
-use crate::ui_state::{self, BrowserState, OverlayKind, PageState, TabId};
-use rashamon_renderer::{origin_from_url, EngineEvent, PermissionDecision, PermissionKind, RenderEngine};
+use crate::ui_state::{self, BrowserState, HoveredRegion, OverlayKind, PageState, TabId};
+use rashamon_renderer::{
+    origin_from_url, CursorKind, EngineEvent, PermissionDecision, PermissionKind, RenderEngine,
+};
 
 const LOAD_TIMEOUT_FRAMES: u64 = 360;
 const SCROLL_LINE_PIXELS: i32 = 40;
@@ -78,6 +80,7 @@ pub(crate) struct BrowserCoreDriver {
     pub(crate) state: BrowserState,
     pub(crate) engine: RenderEngine,
     pub(crate) save_dirty: SaveDirty,
+    pub(crate) cursor: CursorKind,
 }
 
 impl BrowserCoreDriver {
@@ -87,6 +90,7 @@ impl BrowserCoreDriver {
             state: BrowserState::new(),
             engine,
             save_dirty: SaveDirty::default(),
+            cursor: CursorKind::Default,
         };
         driver.load_user_data();
         driver.register_initial_tab();
@@ -208,6 +212,56 @@ impl BrowserCoreDriver {
         }
     }
 
+    fn click_content(&mut self, x: u32, y: u32) {
+        self.state.cancel_address_bar_edit();
+        self.engine.click(x, y.saturating_sub(TOP_BAR_HEIGHT));
+    }
+
+    fn content_key_name(key: BrowserKey) -> Option<&'static str> {
+        match key {
+            BrowserKey::Enter => Some("Enter"),
+            BrowserKey::Backspace => Some("Backspace"),
+            BrowserKey::Left => Some("ArrowLeft"),
+            BrowserKey::Right => Some("ArrowRight"),
+            BrowserKey::Up => Some("ArrowUp"),
+            BrowserKey::Down => Some("ArrowDown"),
+            BrowserKey::PageUp => Some("PageUp"),
+            BrowserKey::PageDown => Some("PageDown"),
+            _ => None,
+        }
+    }
+
+    fn update_shell_cursor(&mut self, target: &UiHitTarget) {
+        if self.state.active_tab().map_or(false, |tab| tab.page_state.is_loading()) {
+            self.cursor = CursorKind::Wait;
+            return;
+        }
+        self.cursor = match target {
+            UiHitTarget::BackButton
+            | UiHitTarget::ForwardButton
+            | UiHitTarget::ReloadButton
+            | UiHitTarget::BookmarkButton
+            | UiHitTarget::SiteInfoButton
+            | UiHitTarget::NewTabButton
+            | UiHitTarget::Tab(_)
+            | UiHitTarget::CloseTab(_)
+            | UiHitTarget::QuickLink(_)
+            | UiHitTarget::OverlayActivate
+            | UiHitTarget::PermissionAllow
+            | UiHitTarget::PermissionDeny
+            | UiHitTarget::PermissionRememberToggle
+            | UiHitTarget::SitePermission { .. }
+            | UiHitTarget::SiteAdblockToggle
+            | UiHitTarget::FindClose
+            | UiHitTarget::ErrorRetry => CursorKind::Pointer,
+            UiHitTarget::AddressBar | UiHitTarget::NewTabSearch => CursorKind::Text,
+            UiHitTarget::Content
+            | UiHitTarget::None
+            | UiHitTarget::PermissionPrompt
+            | UiHitTarget::SiteInfoPanel => CursorKind::Default,
+        };
+    }
+
     pub(crate) fn handle_platform_event(
         &mut self,
         event: PlatformEvent,
@@ -217,32 +271,64 @@ impl BrowserCoreDriver {
             PlatformEvent::Quit => self.dispatch(BrowserAction::Quit),
             PlatformEvent::Tick | PlatformEvent::MouseUp { .. } | PlatformEvent::WindowResized { .. } => false,
             PlatformEvent::KeyDown { key, modifiers } => {
-                self.dispatch_key(key, modifiers.ctrl, modifiers.shift, page_scroll_px)
-            }
-            PlatformEvent::TextInput(text) => {
-                for ch in text.chars() {
-                    if self.state.find_open {
-                        self.dispatch(BrowserAction::FindChar(ch));
-                    } else if self.state.address_bar_focused {
-                        self.dispatch(BrowserAction::AddressBarChar(ch));
+                let should_send_to_content = !modifiers.ctrl
+                    && !self.state.address_bar_focused
+                    && !self.state.find_open
+                    && self.state.overlay == OverlayKind::None;
+                let quit = self.dispatch_key(key, modifiers.ctrl, modifiers.shift, page_scroll_px);
+                if quit {
+                    return true;
+                }
+                if should_send_to_content {
+                    if let Some(key_name) = Self::content_key_name(key) {
+                        self.engine.key_press(key_name);
                     }
                 }
                 false
             }
+            PlatformEvent::TextInput(text) => {
+                if self.state.find_open || self.state.address_bar_focused {
+                    for ch in text.chars() {
+                        if self.state.find_open {
+                            self.dispatch(BrowserAction::FindChar(ch));
+                        } else if self.state.address_bar_focused {
+                            self.dispatch(BrowserAction::AddressBarChar(ch));
+                        }
+                    }
+                } else if self.state.overlay == OverlayKind::None {
+                    self.engine.text_input(&text);
+                }
+                false
+            }
             PlatformEvent::MouseMove { x, y } => {
-                self.state.set_mouse_pos(x.max(0) as u32, y.max(0) as u32);
+                let x = x.max(0) as u32;
+                let y = y.max(0) as u32;
+                self.state.set_mouse_pos(x, y);
+                let target = crate::hit_test::hit_test_ui(&self.state, x, y);
+                self.update_shell_cursor(&target);
+                if matches!(target, UiHitTarget::Content) {
+                    self.engine.mouse_move(x, y.saturating_sub(TOP_BAR_HEIGHT));
+                }
                 false
             }
             PlatformEvent::MouseDown { x, y, button } => {
-                if matches!(button, MouseButton::Left) {
-                    let target = crate::hit_test::hit_test_ui(
-                        &self.state,
-                        x.max(0) as u32,
-                        y.max(0) as u32,
-                    );
-                    self.dispatch_hit(target)
-                } else {
-                    false
+                let x = x.max(0) as u32;
+                let y = y.max(0) as u32;
+                let target = crate::hit_test::hit_test_ui(&self.state, x, y);
+                match button {
+                    MouseButton::Left => {
+                        if matches!(target, UiHitTarget::Content) {
+                            self.click_content(x, y);
+                            false
+                        } else {
+                            self.dispatch_hit(target)
+                        }
+                    }
+                    MouseButton::Right if matches!(target, UiHitTarget::Content) => {
+                        self.engine.right_click(x, y.saturating_sub(TOP_BAR_HEIGHT));
+                        false
+                    }
+                    _ => false,
                 }
             }
             PlatformEvent::Scroll { delta } => {
@@ -711,6 +797,11 @@ impl BrowserCoreDriver {
                     adblock_allowlisted,
                     blocked_count,
                 );
+            }
+            EngineEvent::CursorChanged(cursor) => {
+                if matches!(self.state.hovered_region, HoveredRegion::ContentArea) {
+                    self.cursor = cursor;
+                }
             }
             EngineEvent::LoadStarted => {
                 let frame = self.state.frame_count;

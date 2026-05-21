@@ -3,6 +3,14 @@
 use crate::framebuffer::Framebuffer;
 use crate::permissions::{PermissionDecision, PermissionKind};
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CursorKind {
+    Default,
+    Pointer,
+    Text,
+    Wait,
+}
+
 /// Events the engine pushes up to the browser shell.
 /// Drained once per frame via `ContentEngine::poll_events`.
 /// Each event is tagged with the `tab_id` of the WebView that produced it.
@@ -39,6 +47,7 @@ pub enum EngineEvent {
         adblock_allowlisted: bool,
         blocked_count: u64,
     },
+    CursorChanged(CursorKind),
 }
 
 /// Whether the engine wrote real pixels into the framebuffer.
@@ -105,6 +114,13 @@ pub trait ContentEngine: Send {
 
     /// Scroll the active tab's viewport by `delta_y` pixels (positive = down).
     fn scroll(&mut self, delta_y: i32);
+
+    /// Send a content-area click to the active tab.
+    fn click(&mut self, _x: u32, _y: u32) {}
+    fn right_click(&mut self, _x: u32, _y: u32) {}
+    fn mouse_move(&mut self, _x: u32, _y: u32) {}
+    fn text_input(&mut self, _text: &str) {}
+    fn key_press(&mut self, _key: &str) {}
 
     /// Composite the active tab's current page into `fb` at the content rect.
     fn render_into(

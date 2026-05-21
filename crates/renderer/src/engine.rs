@@ -169,6 +169,11 @@ impl RenderEngine {
     pub fn can_go_forward(&self) -> bool { self.inner.can_go_forward() }
 
     pub fn scroll(&mut self, delta_y: i32) { self.inner.scroll(delta_y); }
+    pub fn click(&mut self, x: u32, y: u32) { self.inner.click(x, y); }
+    pub fn right_click(&mut self, x: u32, y: u32) { self.inner.right_click(x, y); }
+    pub fn mouse_move(&mut self, x: u32, y: u32) { self.inner.mouse_move(x, y); }
+    pub fn text_input(&mut self, text: &str) { self.inner.text_input(text); }
+    pub fn key_press(&mut self, key: &str) { self.inner.key_press(key); }
 
     // ── Frame ─────────────────────────────────────────────────────────────────
 

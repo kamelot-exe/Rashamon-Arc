@@ -14,6 +14,7 @@ mod omnibox;
 mod page;
 mod platform;
 mod persist;
+mod runtime;
 mod theme;
 mod ui_state;
 
@@ -25,9 +26,12 @@ use crate::hit_test::{
 use crate::layout::*;
 use crate::page::{PageNode, parse_html, is_low_content};
 use core_driver::{BrowserAction, BrowserCoreDriver};
+#[cfg(feature = "linux-desktop")]
+use runtime::LinuxDesktopRuntime;
+use runtime::PlatformRuntime;
 use rashamon_net::{AdblockEngine, HttpClient};
 use rashamon_renderer::{
-    download_destination_for_test, origin_from_url, DecisionSource, EngineEvent, EngineFrame,
+    download_destination_for_test, origin_from_url, CursorKind, DecisionSource, EngineEvent, EngineFrame,
     Framebuffer, PermissionDecision, PermissionKind, PermissionStore, RenderEngine,
 };
 use rashamon_renderer::framebuffer::Pixel;
@@ -57,37 +61,6 @@ enum ContentRenderMode {
     Text,
     Engine,
     EnginePending,
-}
-
-// ── Helpers ───────────────────────────────────────────────────────────────────
-
-#[inline]
-fn scale(v: i32, factor: f32, max: u32) -> u32 {
-    ((v.max(0) as f32 * factor) as u32).min(max - 1)
-}
-
-fn scale_platform_event(
-    event: input::PlatformEvent,
-    scale_x: f32,
-    scale_y: f32,
-) -> input::PlatformEvent {
-    match event {
-        input::PlatformEvent::MouseMove { x, y } => input::PlatformEvent::MouseMove {
-            x: scale(x, scale_x, FB_WIDTH) as i32,
-            y: scale(y, scale_y, FB_HEIGHT) as i32,
-        },
-        input::PlatformEvent::MouseDown { x, y, button } => input::PlatformEvent::MouseDown {
-            x: scale(x, scale_x, FB_WIDTH) as i32,
-            y: scale(y, scale_y, FB_HEIGHT) as i32,
-            button,
-        },
-        input::PlatformEvent::MouseUp { x, y, button } => input::PlatformEvent::MouseUp {
-            x: scale(x, scale_x, FB_WIDTH) as i32,
-            y: scale(y, scale_y, FB_HEIGHT) as i32,
-            button,
-        },
-        other => other,
-    }
 }
 
 // ── Persistence helpers ───────────────────────────────────────────────────────
@@ -225,6 +198,7 @@ fn smoke_apply_engine_events(
                     *blocked_count,
                 );
             }
+            EngineEvent::CursorChanged(_) => {}
             EngineEvent::LoadStarted => {
                 let frame = state.frame_count;
                 if let Some(tab) = state.tabs.iter_mut().find(|t2| t2.id.raw() == target_raw) {
@@ -710,13 +684,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     #[cfg(feature = "linux-desktop")]
     {
-        return run_linux_desktop();
+        return run_browser_runtime(LinuxDesktopRuntime::new()?);
     }
 
     #[cfg(all(feature = "kamelot", not(feature = "linux-desktop")))]
     {
-        platform::KamelotBackend::new().report_unimplemented();
-        return Ok(());
+        return run_browser_runtime(runtime::KamelotRuntime::new()?);
     }
 
     #[cfg(not(any(feature = "linux-desktop", feature = "kamelot")))]
@@ -726,31 +699,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 }
 
-#[cfg(feature = "linux-desktop")]
-fn run_linux_desktop() -> Result<(), Box<dyn std::error::Error>> {
+fn run_browser_runtime<R: PlatformRuntime>(
+    mut runtime: R,
+) -> Result<(), Box<dyn std::error::Error>> {
     let content_h  = FB_HEIGHT.saturating_sub(TOP_BAR_HEIGHT);
     let mut driver = BrowserCoreDriver::new(FB_WIDTH, content_h)?;
-
-    let sdl   = sdl2::init()?;
-    let video = sdl.video()?;
-    let _     = sdl.mouse().show_cursor(true);
-    video.text_input().start();
-
-    let (win_w, win_h) = video.current_display_mode(0)
-        .map(|m| (m.w as u32, m.h as u32))
-        .unwrap_or((FB_WIDTH, FB_HEIGHT));
-    let win_w   = win_w.min(FB_WIDTH);
-    let win_h   = win_h.min(FB_HEIGHT);
-    let scale_x = FB_WIDTH  as f32 / win_w as f32;
-    let scale_y = FB_HEIGHT as f32 / win_h as f32;
-
-    let event_pump = sdl.event_pump()?;
-    let font_data  = include_bytes!("../assets/DejaVuSansMono.ttf");
-    let font       = FontManager::new(font_data)?;
-    let mut fb      = Framebuffer::new(FB_WIDTH, FB_HEIGHT);
     let _http       = HttpClient::new();
-    let mut display = display::Display::new(&video, win_w, win_h, FB_WIDTH, FB_HEIGHT)?;
-    let mut input   = input::InputHandler::new(event_pump)?;
+    let font_data = include_bytes!("../assets/DejaVuSansMono.ttf");
+    let font = FontManager::new(font_data)?;
 
     let mut pending_fetch:    Option<PendingFetch>          = None;
     let mut buffered_outcome: Option<(TabId, FetchOutcome)> = None;
@@ -764,19 +720,20 @@ fn run_linux_desktop() -> Result<(), Box<dyn std::error::Error>> {
         driver.dispatch(BrowserAction::Navigate(startup_input.trim().to_string()));
     }
 
+    let initial_dirty = DirtyFlags { tabs: true, chrome: true, content: true };
     render_ui(
-        &mut fb,
+        runtime.framebuffer_mut(),
         &driver.state,
         &font,
-        DirtyFlags { tabs: true, chrome: true, content: true },
+        initial_dirty,
         ContentRenderMode::Text,
     );
-    display.present(&fb)?;
+    runtime.present_frame()?;
 
     let mut running          = true;
     let mut last_blink_phase = 0u64;
 
-    while running {
+    while running && !runtime.should_exit() {
         driver.state.frame_count += 1;
         driver.state.tick_nav_btn();
 
@@ -785,13 +742,18 @@ fn run_linux_desktop() -> Result<(), Box<dyn std::error::Error>> {
         driver.pump_engine();
 
         // ── Events ────────────────────────────────────────────────────────────
-        while let Some(ev) = input.poll_event()? {
-            let ev = scale_platform_event(ev, scale_x, scale_y);
+        for ev in runtime.poll_events()? {
             if driver.handle_platform_event(ev, (FB_HEIGHT - TOP_BAR_HEIGHT) as i32) {
                 running = false;
                 break;
             }
         }
+        let effective_cursor = if driver.state.active_tab().map_or(false, |t| t.page_state.is_loading()) {
+            CursorKind::Wait
+        } else {
+            driver.cursor
+        };
+        runtime.set_cursor(effective_cursor);
 
         // ── Spawn fetch (text renderer fallback — skipped when real engine active) ──
         if !driver.engine.is_real_engine() {
@@ -894,7 +856,7 @@ fn run_linux_desktop() -> Result<(), Box<dyn std::error::Error>> {
                 && driver.state.overlay == OverlayKind::None
                 && driver.state.active_tab().map_or(false, |t| matches!(t.page_state, PageState::Loaded))
             {
-                match driver.engine.render_into(&mut fb, 0, TOP_BAR_HEIGHT, FB_WIDTH, FB_HEIGHT - TOP_BAR_HEIGHT) {
+                match driver.engine.render_into(runtime.framebuffer_mut(), 0, TOP_BAR_HEIGHT, FB_WIDTH, FB_HEIGHT - TOP_BAR_HEIGHT) {
                     Ok(EngineFrame::Ready) => ContentRenderMode::Engine,
                     Ok(_) if driver.engine.is_real_engine() => ContentRenderMode::EnginePending,
                     Ok(_) => ContentRenderMode::Text,
@@ -909,8 +871,8 @@ fn run_linux_desktop() -> Result<(), Box<dyn std::error::Error>> {
                 ContentRenderMode::Text
             };
 
-            render_ui(&mut fb, &driver.state, &font, dirty, content_mode);
-            display.present(&fb)?;
+            render_ui(runtime.framebuffer_mut(), &driver.state, &font, dirty, content_mode);
+            runtime.present_frame()?;
         }
 
         // ── Persist (fire-and-forget after render) ────────────────────────────
@@ -918,7 +880,7 @@ fn run_linux_desktop() -> Result<(), Box<dyn std::error::Error>> {
             driver.flush_saves();
         }
 
-        std::thread::sleep(std::time::Duration::from_millis(16));
+        runtime.tick();
     }
     Ok(())
 }

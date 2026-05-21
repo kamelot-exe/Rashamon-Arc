@@ -5,12 +5,16 @@
 //! already-rendered framebuffer.
 
 use crate::input::PlatformEvent;
+#[cfg(all(feature = "kamelot", not(feature = "linux-desktop")))]
+use crate::input::{BrowserKey, Modifiers, MouseButton};
 use crate::layout::{FB_HEIGHT, FB_WIDTH};
 use rashamon_renderer::{CursorKind, Framebuffer};
 #[cfg(all(feature = "kamelot", not(feature = "linux-desktop")))]
 use std::collections::VecDeque;
 use std::io;
 use std::time::Duration;
+#[cfg(all(feature = "kamelot", not(feature = "linux-desktop")))]
+use std::time::Instant;
 
 #[allow(dead_code)]
 pub(crate) trait PlatformRuntime {
@@ -19,7 +23,9 @@ pub(crate) trait PlatformRuntime {
     fn present_frame(&mut self) -> io::Result<()>;
     fn window_size(&self) -> (u32, u32);
     fn request_redraw(&mut self) {}
-    fn should_exit(&self) -> bool { false }
+    fn should_exit(&self) -> bool {
+        false
+    }
     fn tick(&mut self) {
         std::thread::sleep(Duration::from_millis(16));
     }
@@ -137,22 +143,27 @@ impl PlatformRuntime for LinuxDesktopRuntime {
 #[cfg(all(feature = "kamelot", not(feature = "linux-desktop")))]
 pub(crate) struct KamelotRuntime {
     framebuffer: Framebuffer,
-    front_buffer: Vec<u8>,
+    scanout: KamelotScanout,
+    input: KamelotSyscallInputSource,
     event_queue: VecDeque<PlatformEvent>,
+    mouse_x: i32,
+    mouse_y: i32,
     width: u32,
     height: u32,
-    frame_count: u64,
     redraw_requested: bool,
+    debug: bool,
 }
 
 #[cfg(all(feature = "kamelot", not(feature = "linux-desktop")))]
 impl KamelotRuntime {
     pub(crate) fn new() -> Result<Self, Box<dyn std::error::Error>> {
         let framebuffer = Framebuffer::new(FB_WIDTH, FB_HEIGHT);
-        let front_buffer = vec![0u8; framebuffer.data.len()];
-        if std::env::var_os("RASHAMON_DEBUG").is_some() {
+        let debug = std::env::var_os("RASHAMON_DEBUG").is_some();
+        let scanout =
+            KamelotScanout::new(framebuffer.width, framebuffer.height, framebuffer.stride);
+        if debug {
             eprintln!(
-                "[runtime:kamelot] framebuffer {}x{} stride={} bytes={}",
+                "[runtime:kamelot] selected framebuffer={}x{} stride={} bytes={}",
                 framebuffer.width,
                 framebuffer.height,
                 framebuffer.stride,
@@ -161,12 +172,15 @@ impl KamelotRuntime {
         }
         Ok(Self {
             framebuffer,
-            front_buffer,
+            scanout,
+            input: KamelotSyscallInputSource::new(debug),
             event_queue: VecDeque::new(),
+            mouse_x: 0,
+            mouse_y: 0,
             width: FB_WIDTH,
             height: FB_HEIGHT,
-            frame_count: 0,
             redraw_requested: true,
+            debug,
         })
     }
 
@@ -177,18 +191,78 @@ impl KamelotRuntime {
 
     #[allow(dead_code)]
     pub(crate) fn presented_frame(&self) -> &[u8] {
-        &self.front_buffer
+        self.scanout.front_buffer()
     }
 
     #[allow(dead_code)]
     pub(crate) fn frame_count(&self) -> u64 {
-        self.frame_count
+        self.scanout.present_count()
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn inject_input_event(&mut self, event: KamelotInputEvent) {
+        self.input.inject_event(event);
+    }
+
+    fn poll_input_source(&mut self) -> io::Result<()> {
+        for event in self.input.poll_input()? {
+            if self.debug {
+                eprintln!("[runtime:kamelot] input {:?}", event);
+            }
+            if let Some(platform_event) = self.map_input_event(event) {
+                self.event_queue.push_back(platform_event);
+            }
+        }
+        Ok(())
+    }
+
+    fn map_input_event(&mut self, event: KamelotInputEvent) -> Option<PlatformEvent> {
+        match event {
+            KamelotInputEvent::Quit => Some(PlatformEvent::Quit),
+            KamelotInputEvent::KeyDown { key, modifiers } => {
+                Some(PlatformEvent::KeyDown { key, modifiers })
+            }
+            KamelotInputEvent::Text(text) => Some(PlatformEvent::TextInput(text)),
+            KamelotInputEvent::MouseMove { dx, dy } => {
+                self.mouse_x = (self.mouse_x + dx).clamp(0, self.width.saturating_sub(1) as i32);
+                self.mouse_y = (self.mouse_y + dy).clamp(0, self.height.saturating_sub(1) as i32);
+                Some(PlatformEvent::MouseMove {
+                    x: self.mouse_x,
+                    y: self.mouse_y,
+                })
+            }
+            KamelotInputEvent::MousePosition { x, y } => {
+                self.mouse_x = x.clamp(0, self.width.saturating_sub(1) as i32);
+                self.mouse_y = y.clamp(0, self.height.saturating_sub(1) as i32);
+                Some(PlatformEvent::MouseMove {
+                    x: self.mouse_x,
+                    y: self.mouse_y,
+                })
+            }
+            KamelotInputEvent::MouseButton { button, pressed } => {
+                if pressed {
+                    Some(PlatformEvent::MouseDown {
+                        x: self.mouse_x,
+                        y: self.mouse_y,
+                        button,
+                    })
+                } else {
+                    Some(PlatformEvent::MouseUp {
+                        x: self.mouse_x,
+                        y: self.mouse_y,
+                        button,
+                    })
+                }
+            }
+            KamelotInputEvent::Scroll { delta } => Some(PlatformEvent::Scroll { delta }),
+        }
     }
 }
 
 #[cfg(all(feature = "kamelot", not(feature = "linux-desktop")))]
 impl PlatformRuntime for KamelotRuntime {
     fn poll_events(&mut self) -> io::Result<Vec<PlatformEvent>> {
+        self.poll_input_source()?;
         Ok(self.event_queue.drain(..).collect())
     }
 
@@ -197,14 +271,14 @@ impl PlatformRuntime for KamelotRuntime {
     }
 
     fn present_frame(&mut self) -> io::Result<()> {
-        self.front_buffer.copy_from_slice(&self.framebuffer.data);
-        self.frame_count = self.frame_count.saturating_add(1);
+        self.scanout.present(&self.framebuffer);
         self.redraw_requested = false;
-        if std::env::var_os("RASHAMON_DEBUG").is_some() && self.frame_count == 1 {
+        if self.debug && self.scanout.present_count() == 1 {
             eprintln!(
-                "[runtime:kamelot] present frame={} bytes={}",
-                self.frame_count,
-                self.front_buffer.len()
+                "[runtime:kamelot] present frame={} bytes={} elapsed_ms={}",
+                self.scanout.present_count(),
+                self.scanout.front_buffer().len(),
+                self.scanout.last_present_elapsed_ms().unwrap_or(0)
             );
         }
         Ok(())
@@ -219,13 +293,149 @@ impl PlatformRuntime for KamelotRuntime {
     }
 
     fn should_exit(&self) -> bool {
-        self.frame_count > 0 && self.event_queue.is_empty() && !self.redraw_requested
+        self.scanout.present_count() > 0 && self.event_queue.is_empty() && !self.redraw_requested
     }
 
     fn tick(&mut self) {
         // Future Kamelot syscall timer hook. Host simulation yields a stable
         // 60-ish Hz cadence without depending on SDL or window APIs.
         std::thread::sleep(Duration::from_millis(16));
+    }
+}
+
+#[cfg(all(feature = "kamelot", not(feature = "linux-desktop")))]
+#[derive(Debug)]
+pub(crate) enum KamelotInputEvent {
+    Quit,
+    KeyDown {
+        key: BrowserKey,
+        modifiers: Modifiers,
+    },
+    Text(String),
+    MouseMove {
+        dx: i32,
+        dy: i32,
+    },
+    MousePosition {
+        x: i32,
+        y: i32,
+    },
+    MouseButton {
+        button: MouseButton,
+        pressed: bool,
+    },
+    Scroll {
+        delta: i32,
+    },
+}
+
+#[cfg(all(feature = "kamelot", not(feature = "linux-desktop")))]
+struct KamelotSyscallInputSource {
+    pending: VecDeque<KamelotInputEvent>,
+    debug: bool,
+}
+
+#[cfg(all(feature = "kamelot", not(feature = "linux-desktop")))]
+impl KamelotSyscallInputSource {
+    fn new(debug: bool) -> Self {
+        Self {
+            pending: VecDeque::new(),
+            debug,
+        }
+    }
+
+    fn poll_input(&mut self) -> io::Result<Vec<KamelotInputEvent>> {
+        self.poll_syscalls()?;
+        Ok(self.pending.drain(..).collect())
+    }
+
+    #[allow(dead_code)]
+    fn inject_event(&mut self, event: KamelotInputEvent) {
+        self.pending.push_back(event);
+    }
+
+    fn poll_syscalls(&mut self) -> io::Result<()> {
+        // Future Kamelot syscall hook:
+        // - read keyboard packets
+        // - read mouse packets
+        // - translate them into KamelotInputEvent
+        //
+        // Host builds keep this empty so the Kamelot feature remains
+        // compile-only without depending on SDL, GTK, WebKitGTK, or Linux
+        // device APIs.
+        if self.debug {
+            // Keep diagnostics opt-in and low-volume.
+        }
+        Ok(())
+    }
+}
+
+#[cfg(all(feature = "kamelot", not(feature = "linux-desktop")))]
+struct KamelotScanout {
+    memory: KamelotFramebufferMemory,
+    present_count: u64,
+    last_present: Option<Instant>,
+    last_present_elapsed: Option<Duration>,
+}
+
+#[cfg(all(feature = "kamelot", not(feature = "linux-desktop")))]
+impl KamelotScanout {
+    fn new(width: u32, height: u32, stride: u32) -> Self {
+        Self {
+            memory: KamelotFramebufferMemory::owned(width, height, stride),
+            present_count: 0,
+            last_present: None,
+            last_present_elapsed: None,
+        }
+    }
+
+    fn present(&mut self, source: &Framebuffer) {
+        self.memory.copy_from(source);
+        self.present_count = self.present_count.saturating_add(1);
+        let now = Instant::now();
+        self.last_present_elapsed = self
+            .last_present
+            .map(|last| now.saturating_duration_since(last));
+        self.last_present = Some(now);
+    }
+
+    fn front_buffer(&self) -> &[u8] {
+        &self.memory.bytes
+    }
+
+    fn present_count(&self) -> u64 {
+        self.present_count
+    }
+
+    fn last_present_elapsed_ms(&self) -> Option<u128> {
+        self.last_present_elapsed.map(|elapsed| elapsed.as_millis())
+    }
+}
+
+#[cfg(all(feature = "kamelot", not(feature = "linux-desktop")))]
+struct KamelotFramebufferMemory {
+    width: u32,
+    height: u32,
+    stride: u32,
+    bytes: Vec<u8>,
+}
+
+#[cfg(all(feature = "kamelot", not(feature = "linux-desktop")))]
+impl KamelotFramebufferMemory {
+    fn owned(width: u32, height: u32, stride: u32) -> Self {
+        Self {
+            width,
+            height,
+            stride,
+            bytes: vec![0u8; (stride * height) as usize],
+        }
+    }
+
+    fn copy_from(&mut self, source: &Framebuffer) {
+        debug_assert_eq!(self.width, source.width);
+        debug_assert_eq!(self.height, source.height);
+        debug_assert_eq!(self.stride, source.stride);
+        self.bytes.copy_from_slice(&source.data);
     }
 }
 

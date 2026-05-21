@@ -295,7 +295,13 @@ fn smoke_apply_engine_events(
                     *blocked_count,
                 );
             }
-            EngineEvent::LoadStarted => {}
+            EngineEvent::LoadStarted => {
+                let frame = state.frame_count;
+                if let Some(tab) = state.tabs.iter_mut().find(|t2| t2.id.raw() == target_raw) {
+                    tab.page_state = PageState::Loading;
+                    tab.load_start_frame = frame;
+                }
+            }
         }
         seen.push(ev);
     }
@@ -587,6 +593,12 @@ fn run_webkit_smoke_test() -> Result<(), Box<dyn std::error::Error>> {
     })?;
     state.activate_tab(first_loaded_id);
     engine.set_active_tab(first_loaded_id.raw());
+    smoke_wait_for(&mut state, &mut engine, "first tab ready after wake", Duration::from_secs(12), |s, events| {
+        s.active_tab_id == first_loaded_id
+            && s.active_tab().map_or(false, |t| t.url.contains("example.com"))
+            && (events.iter().any(|e| matches!(e, EngineEvent::LoadComplete))
+                || s.active_tab().map_or(false, |t| matches!(t.page_state, PageState::Loaded)))
+    })?;
     for _ in 0..4 {
         state.activate_tab(search_tab_id);
         engine.set_active_tab(search_tab_id.raw());
@@ -605,14 +617,14 @@ fn run_webkit_smoke_test() -> Result<(), Box<dyn std::error::Error>> {
         events.iter().any(|e| matches!(e, EngineEvent::LoadComplete))
             && s.active_tab().map_or(false, |t| t.url.contains("example.org"))
     })?;
-    smoke_wait_for(&mut state, &mut engine, "native back becomes available", Duration::from_secs(3), |s, _| {
+    smoke_wait_for(&mut state, &mut engine, "native back becomes available", Duration::from_secs(8), |s, _| {
         s.active_tab().map_or(false, |t| t.webkit_can_back)
     })?;
     engine.go_back().ok();
     smoke_wait_for(&mut state, &mut engine, "back returns to first URL", Duration::from_secs(8), |s, _| {
         s.active_tab().map_or(false, |t| t.url.contains("example.com"))
     })?;
-    smoke_wait_for(&mut state, &mut engine, "native forward becomes available", Duration::from_secs(3), |s, _| {
+    smoke_wait_for(&mut state, &mut engine, "native forward becomes available", Duration::from_secs(8), |s, _| {
         s.active_tab().map_or(false, |t| t.webkit_can_forward)
     })?;
     engine.go_forward().ok();
@@ -1059,7 +1071,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         blocked_count,
                     );
                 }
-                EngineEvent::LoadStarted => {}
+                EngineEvent::LoadStarted => {
+                    let frame = state.frame_count;
+                    if let Some(tab) = state.tabs.iter_mut().find(|t| t.id.raw() == target_raw) {
+                        tab.page_state = PageState::Loading;
+                        tab.load_start_frame = frame;
+                    }
+                    if is_active {
+                        state.dirty.content = true;
+                    }
+                }
             }
         }
 

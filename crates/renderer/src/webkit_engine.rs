@@ -183,9 +183,11 @@ pub struct WebKitDriver {
     permission_seq: Rc<Cell<u64>>,
     normal_context: webkit2gtk::WebContext,
     download_seq: Rc<Cell<u64>>,
+    active_downloads: Rc<Cell<u32>>,
     w:        u32,
     h:        u32,
     suspend_after: Duration,
+    suspend_disabled: bool,
 }
 
 // ── Construction ──────────────────────────────────────────────────────────────
@@ -207,6 +209,7 @@ impl WebKitEngine {
         let (cmd_tx, cmd_rx)     = mpsc::sync_channel::<Cmd>(32);
         let (reply_tx, reply_rx) = mpsc::sync_channel::<Reply>(32);
         let download_seq = Rc::new(Cell::new(0));
+        let active_downloads = Rc::new(Cell::new(0));
         let pending_permission = Rc::new(RefCell::new(None));
         let permission_seq = Rc::new(Cell::new(0));
         let adblock_allowlist_path = rashamon_data_dir().join("adblock_allowlist.json");
@@ -217,12 +220,14 @@ impl WebKitEngine {
             .and_then(|value| value.parse::<u64>().ok())
             .map(Duration::from_millis)
             .unwrap_or_else(|| Duration::from_secs(120));
+        let suspend_disabled = std::env::var_os("RASHAMON_DISABLE_TAB_SUSPEND").is_some();
         let normal_context = webkit2gtk::WebContext::default()
             .unwrap_or_else(webkit2gtk::WebContext::new);
         connect_downloads_for_context(
             &normal_context,
             reply_tx.clone(),
             Rc::clone(&download_seq),
+            Rc::clone(&active_downloads),
         );
 
         trace!("[webkit] Engine created ({}×{})", content_w, content_h);
@@ -248,9 +253,11 @@ impl WebKitEngine {
             permission_seq,
             normal_context,
             download_seq,
+            active_downloads,
             w:    content_w,
             h:    content_h,
             suspend_after,
+            suspend_disabled,
         };
 
         Ok((engine, driver))
@@ -586,6 +593,7 @@ impl ContentEngine for WebKitEngine {
                 }
                 Ok(Reply::TabWaking { tab_id }) => {
                     trace!("[webkit] tab waking event tab={tab_id}");
+                    self.pending_events.push((tab_id, EngineEvent::LoadStarted));
                 }
                 Err(mpsc::TryRecvError::Empty | mpsc::TryRecvError::Disconnected) => break,
             }
@@ -625,6 +633,7 @@ impl WebKitDriver {
                         Rc::clone(&self.permission_seq),
                         &self.normal_context,
                         Rc::clone(&self.download_seq),
+                        Rc::clone(&self.active_downloads),
                     );
                     self.tabs.insert(tab_id, entry);
                     trace!("[webkit-driver] created WebView for tab {tab_id}");
@@ -960,15 +969,35 @@ impl WebKitDriver {
     }
 
     fn suspend_inactive_tabs(&mut self, force: bool) {
+        if self.suspend_disabled && !force {
+            trace!(
+                "[webkit-driver] skip suspend reason=disabled live={} suspended={} downloads={}",
+                self.tabs.len(),
+                self.suspended_tabs.len(),
+                self.active_downloads.get(),
+            );
+            return;
+        }
+        if self.active_downloads.get() > 0 {
+            trace!(
+                "[webkit-driver] skip suspend reason=active-downloads live={} suspended={} downloads={}",
+                self.tabs.len(),
+                self.suspended_tabs.len(),
+                self.active_downloads.get(),
+            );
+            return;
+        }
         let now = Instant::now();
         let active = self.active_tab_id;
         let ids = self.tabs
             .iter()
             .filter_map(|(tab_id, entry)| {
                 if *tab_id == active {
+                    trace!("[webkit-driver] skip suspend tab={tab_id} reason=active");
                     return None;
                 }
                 if entry.last_url.is_empty() {
+                    trace!("[webkit-driver] skip suspend tab={tab_id} reason=no-url");
                     return None;
                 }
                 if force || now.saturating_duration_since(entry.last_active) >= self.suspend_after {
@@ -1007,7 +1036,13 @@ impl WebKitDriver {
                 url: url.clone(),
                 nav_id: entry.nav_id_cell.get(),
             });
-            trace!("[webkit-driver] suspended tab={tab_id} url={url}");
+            trace!(
+                "[webkit-driver] suspended tab={} url={} live={} suspended={}",
+                tab_id,
+                url,
+                self.tabs.len(),
+                self.suspended_tabs.len(),
+            );
             let _ = self.reply_tx.try_send(Reply::TabSuspended { tab_id });
         }
     }
@@ -1026,11 +1061,18 @@ impl WebKitDriver {
             Rc::clone(&self.permission_seq),
             &self.normal_context,
             Rc::clone(&self.download_seq),
+            Rc::clone(&self.active_downloads),
         );
         use webkit2gtk::WebViewExt;
         entry.nav_id_cell.set(suspended.nav_id);
         entry.last_url = suspended.url.clone();
-        trace!("[webkit-driver] resumed tab={tab_id} url={}", suspended.url);
+        trace!(
+            "[webkit-driver] resumed tab={} url={} live={} suspended={}",
+            tab_id,
+            suspended.url,
+            self.tabs.len() + 1,
+            self.suspended_tabs.len(),
+        );
         entry.webview.load_uri(&suspended.url);
         self.tabs.insert(tab_id, entry);
         let _ = self.reply_tx.try_send(Reply::TabWaking { tab_id });
@@ -1051,6 +1093,7 @@ fn make_tab_entry(
     permission_seq: Rc<Cell<u64>>,
     normal_context: &webkit2gtk::WebContext,
     download_seq: Rc<Cell<u64>>,
+    active_downloads: Rc<Cell<u32>>,
 ) -> TabEntry {
     use gtk::prelude::{ContainerExt, GtkWindowExt, WidgetExt};
     use webkit2gtk::{
@@ -1072,6 +1115,7 @@ fn make_tab_entry(
             &ctx,
             reply_tx.clone(),
             Rc::clone(&download_seq),
+            Rc::clone(&active_downloads),
         );
         let wv  = WebView::with_context(&ctx);
         wv.set_settings(&settings);
@@ -1808,10 +1852,12 @@ fn connect_downloads_for_context(
     context: &webkit2gtk::WebContext,
     tx: mpsc::SyncSender<Reply>,
     download_seq: Rc<Cell<u64>>,
+    active_downloads: Rc<Cell<u32>>,
 ) {
     use webkit2gtk::{DownloadExt, URIRequestExt, WebContextExt};
     context.connect_download_started(move |_ctx, download| {
         let id = next_cell_generation(&download_seq);
+        active_downloads.set(active_downloads.get().saturating_add(1));
         let tx_decide = tx.clone();
         download.connect_decide_destination(move |dl, suggested| {
             let dest = download_destination_for_suggested_filename(suggested);
@@ -1841,7 +1887,9 @@ fn connect_downloads_for_context(
         });
 
         let tx_finished = tx.clone();
+        let active_finished = Rc::clone(&active_downloads);
         download.connect_finished(move |dl| {
+            active_finished.set(active_finished.get().saturating_sub(1));
             let path = dl.destination()
                 .and_then(|uri| glib::filename_from_uri(&uri).ok().map(|(p, _)| p))
                 .map(|p| p.to_string_lossy().to_string())
@@ -1851,7 +1899,9 @@ fn connect_downloads_for_context(
         });
 
         let tx_failed = tx.clone();
+        let active_failed = Rc::clone(&active_downloads);
         download.connect_failed(move |_dl, err| {
+            active_failed.set(active_failed.get().saturating_sub(1));
             trace!("[webkit-download] failed id={id}: {err}");
             let _ = tx_failed.try_send(Reply::DownloadFailed {
                 id,

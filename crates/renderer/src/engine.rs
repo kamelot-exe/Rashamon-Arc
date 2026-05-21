@@ -160,6 +160,9 @@ impl RenderEngine {
         self.inner
             .set_site_adblock_allowlisted(origin, allowlisted, private);
     }
+    pub fn force_suspend_inactive_tabs(&mut self) {
+        self.inner.force_suspend_inactive_tabs();
+    }
 
     pub fn can_go_back(&self)    -> bool { self.inner.can_go_back() }
     pub fn can_go_forward(&self) -> bool { self.inner.can_go_forward() }

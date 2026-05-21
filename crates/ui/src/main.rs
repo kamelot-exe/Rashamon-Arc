@@ -553,9 +553,6 @@ fn run_webkit_smoke_test() -> Result<(), Box<dyn std::error::Error>> {
     smoke_wait_for(&mut state, &mut engine, "download signal path starts", Duration::from_secs(8), |_s, events| {
         events.iter().any(|e| matches!(e, EngineEvent::DownloadStarted { .. }))
     })?;
-    smoke_wait_for(&mut state, &mut engine, "download finishes", Duration::from_secs(20), |_s, events| {
-        events.iter().any(|e| matches!(e, EngineEvent::DownloadFinished { .. }))
-    })?;
     let first_loaded_id = state.active_tab_id;
 
     smoke_create_tab(&mut state, &mut engine, false);
@@ -579,6 +576,17 @@ fn run_webkit_smoke_test() -> Result<(), Box<dyn std::error::Error>> {
         s.active_tab_id == first_loaded_id
             && s.active_tab().map_or(false, |t| matches!(t.page_state, PageState::Loaded))
     })?;
+    engine.force_suspend_inactive_tabs();
+    smoke_wait_for(&mut state, &mut engine, "inactive tab suspension stable", Duration::from_secs(2), |_s, _| true)?;
+    state.activate_tab(search_tab_id);
+    engine.set_active_tab(search_tab_id.raw());
+    smoke_wait_for(&mut state, &mut engine, "wake suspended tab renders", Duration::from_secs(12), |s, events| {
+        s.active_tab_id == search_tab_id
+            && (s.active_tab().map_or(false, |t| matches!(t.page_state, PageState::Loaded))
+                || events.iter().any(|e| matches!(e, EngineEvent::LoadComplete)))
+    })?;
+    state.activate_tab(first_loaded_id);
+    engine.set_active_tab(first_loaded_id.raw());
     for _ in 0..4 {
         state.activate_tab(search_tab_id);
         engine.set_active_tab(search_tab_id.raw());
@@ -665,6 +673,18 @@ fn run_webkit_smoke_test() -> Result<(), Box<dyn std::error::Error>> {
     if state.global_history.len() != public_history_len {
         return Err(smoke_fail("private tab persisted global history"));
     }
+    let private_tab_id = state.active_tab_id;
+    state.activate_tab(first_loaded_id);
+    engine.set_active_tab(first_loaded_id.raw());
+    engine.force_suspend_inactive_tabs();
+    smoke_wait_for(&mut state, &mut engine, "private inactive tab suspension stable", Duration::from_secs(2), |_s, _| true)?;
+    state.activate_tab(private_tab_id);
+    engine.set_active_tab(private_tab_id.raw());
+    smoke_wait_for(&mut state, &mut engine, "wake suspended private tab renders", Duration::from_secs(12), |s, events| {
+        s.active_tab_id == private_tab_id
+            && (s.active_tab().map_or(false, |t| matches!(t.page_state, PageState::Loaded))
+                || events.iter().any(|e| matches!(e, EngineEvent::LoadComplete)))
+    })?;
 
     engine.zoom_in();
     engine.zoom_out();

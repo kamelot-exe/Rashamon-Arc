@@ -75,6 +75,7 @@ enum Cmd {
     QuerySitePermissions { origin: String, private: bool },
     SetSitePermission { origin: String, kind: PermissionKind, decision: PermissionDecision, private: bool },
     SetSiteAdblock { origin: String, allowlisted: bool, private: bool },
+    ForceSuspendInactive,
     Shutdown,
 }
 
@@ -110,6 +111,8 @@ enum Reply {
         adblock_allowlisted: bool,
         blocked_count: u64,
     },
+    TabSuspended { tab_id: u64 },
+    TabWaking { tab_id: u64 },
 }
 
 // ── Per-tab engine state ──────────────────────────────────────────────────────
@@ -147,6 +150,14 @@ struct TabEntry {
     frame_gen:   Rc<Cell<u64>>,
     schedule_gen: Rc<Cell<u64>>,
     alive:       Rc<Cell<bool>>,
+    last_active: Instant,
+    last_url:    String,
+}
+
+struct SuspendedTab {
+    is_private: bool,
+    url:        String,
+    nav_id:     u64,
 }
 
 struct PendingPermission {
@@ -163,6 +174,8 @@ pub struct WebKitDriver {
     cmd_rx:   mpsc::Receiver<Cmd>,
     reply_tx: mpsc::SyncSender<Reply>,
     tabs:     HashMap<u64, TabEntry>,
+    suspended_tabs: HashMap<u64, SuspendedTab>,
+    active_tab_id: u64,
     adblock:  Rc<RefCell<AdblockEngine>>,
     adblock_allowlist_path: PathBuf,
     permissions: Rc<RefCell<PermissionStore>>,
@@ -172,6 +185,7 @@ pub struct WebKitDriver {
     download_seq: Rc<Cell<u64>>,
     w:        u32,
     h:        u32,
+    suspend_after: Duration,
 }
 
 // ── Construction ──────────────────────────────────────────────────────────────
@@ -198,6 +212,11 @@ impl WebKitEngine {
         let adblock_allowlist_path = rashamon_data_dir().join("adblock_allowlist.json");
         let mut adblock = AdblockEngine::new();
         adblock.load_allowlist_from_path(&adblock_allowlist_path);
+        let suspend_after = std::env::var("RASHAMON_SUSPEND_AFTER_MS")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .map(Duration::from_millis)
+            .unwrap_or_else(|| Duration::from_secs(120));
         let normal_context = webkit2gtk::WebContext::default()
             .unwrap_or_else(webkit2gtk::WebContext::new);
         connect_downloads_for_context(
@@ -220,6 +239,8 @@ impl WebKitEngine {
             cmd_rx,
             reply_tx,
             tabs: HashMap::new(),
+            suspended_tabs: HashMap::new(),
+            active_tab_id: 0,
             adblock: Rc::new(RefCell::new(adblock)),
             adblock_allowlist_path,
             permissions: Rc::new(RefCell::new(PermissionStore::load_default())),
@@ -229,6 +250,7 @@ impl WebKitEngine {
             download_seq,
             w:    content_w,
             h:    content_h,
+            suspend_after,
         };
 
         Ok((engine, driver))
@@ -406,6 +428,10 @@ impl ContentEngine for WebKitEngine {
         });
     }
 
+    fn force_suspend_inactive_tabs(&mut self) {
+        let _ = self.cmd_tx.try_send(Cmd::ForceSuspendInactive);
+    }
+
     fn scroll(&mut self, delta_y: i32) {
         let tab_id = self.active_tab_id;
         let _ = self.cmd_tx.try_send(Cmd::ScrollBy { tab_id, delta: delta_y });
@@ -555,6 +581,12 @@ impl ContentEngine for WebKitEngine {
                         blocked_count,
                     }));
                 }
+                Ok(Reply::TabSuspended { tab_id }) => {
+                    trace!("[webkit] tab suspended event tab={tab_id}");
+                }
+                Ok(Reply::TabWaking { tab_id }) => {
+                    trace!("[webkit] tab waking event tab={tab_id}");
+                }
                 Err(mpsc::TryRecvError::Empty | mpsc::TryRecvError::Disconnected) => break,
             }
         }
@@ -584,7 +616,7 @@ impl WebKitDriver {
         loop {
             match self.cmd_rx.try_recv() {
                 Ok(Cmd::CreateTab { tab_id, is_private }) => {
-                    if self.tabs.contains_key(&tab_id) { continue; }
+                    if self.tabs.contains_key(&tab_id) || self.suspended_tabs.contains_key(&tab_id) { continue; }
                     let entry = make_tab_entry(
                         tab_id, is_private, self.w, self.h, self.reply_tx.clone(),
                         Rc::clone(&self.adblock),
@@ -612,11 +644,17 @@ impl WebKitDriver {
                         next_cell_generation(&entry.frame_gen);
                         entry.webview.stop_loading();
                     }
+                    self.suspended_tabs.remove(&tab_id);
                     trace!("[webkit-driver] dropped WebView for tab {tab_id}");
                 }
 
                 Ok(Cmd::SwitchTab { tab_id }) => {
-                    if let Some(entry) = self.tabs.get(&tab_id) {
+                    self.active_tab_id = tab_id;
+                    if !self.tabs.contains_key(&tab_id) {
+                        self.resume_tab(tab_id);
+                    }
+                    if let Some(entry) = self.tabs.get_mut(&tab_id) {
+                        entry.last_active = Instant::now();
                         let nav_id = entry.nav_id_cell.get();
                         trace!("[webkit-driver] SwitchTab {tab_id} -> snapshot nav={nav_id}");
                         send_view_state(&entry.webview, tab_id, 0, &self.reply_tx);
@@ -638,7 +676,10 @@ impl WebKitDriver {
                 }
 
                 Ok(Cmd::Navigate { tab_id, url, nav_id }) => {
-                    if let Some(entry) = self.tabs.get(&tab_id) {
+                    if !self.tabs.contains_key(&tab_id) {
+                        self.resume_tab(tab_id);
+                    }
+                    if let Some(entry) = self.tabs.get_mut(&tab_id) {
                         use webkit2gtk::WebViewExt;
                         trace!("[webkit-driver] Navigate tab={tab_id} nav={nav_id}: {url}");
                         deny_pending_permission_for_tab(
@@ -650,6 +691,8 @@ impl WebKitDriver {
                         // Update shared cell BEFORE load_uri so synchronous signals
                         // fire with the correct nav_id.
                         entry.nav_id_cell.set(nav_id);
+                        entry.last_active = Instant::now();
+                        entry.last_url = url.clone();
                         next_cell_generation(&entry.schedule_gen);
                         next_cell_generation(&entry.frame_gen);
                         if let Some(reason) = adblock_block_reason(
@@ -670,7 +713,8 @@ impl WebKitDriver {
                 }
 
                 Ok(Cmd::ScrollBy { tab_id, delta }) => {
-                    if let Some(entry) = self.tabs.get(&tab_id) {
+                    if let Some(entry) = self.tabs.get_mut(&tab_id) {
+                        entry.last_active = Instant::now();
                         use webkit2gtk::WebViewExt;
                         let script = format!("window.scrollBy(0, {delta})");
                         #[allow(deprecated)]
@@ -696,7 +740,8 @@ impl WebKitDriver {
                 }
 
                 Ok(Cmd::GoBack { tab_id }) => {
-                    if let Some(entry) = self.tabs.get(&tab_id) {
+                    if let Some(entry) = self.tabs.get_mut(&tab_id) {
+                        entry.last_active = Instant::now();
                         use webkit2gtk::WebViewExt;
                         if entry.webview.can_go_back() {
                             // nav_id 0 means "native navigation, no shell nav_id"
@@ -728,7 +773,8 @@ impl WebKitDriver {
                 }
 
                 Ok(Cmd::GoForward { tab_id }) => {
-                    if let Some(entry) = self.tabs.get(&tab_id) {
+                    if let Some(entry) = self.tabs.get_mut(&tab_id) {
+                        entry.last_active = Instant::now();
                         use webkit2gtk::WebViewExt;
                         if entry.webview.can_go_forward() {
                             entry.nav_id_cell.set(0);
@@ -756,7 +802,8 @@ impl WebKitDriver {
                 }
 
                 Ok(Cmd::Zoom { tab_id, step }) => {
-                    if let Some(entry) = self.tabs.get(&tab_id) {
+                    if let Some(entry) = self.tabs.get_mut(&tab_id) {
+                        entry.last_active = Instant::now();
                         use webkit2gtk::WebViewExt;
                         let next = if step == 0 {
                             1.0
@@ -900,10 +947,93 @@ impl WebKitDriver {
                     );
                 }
 
+                Ok(Cmd::ForceSuspendInactive) => {
+                    self.suspend_inactive_tabs(true);
+                }
+
                 Ok(Cmd::Shutdown) | Err(mpsc::TryRecvError::Disconnected) => break,
                 Err(mpsc::TryRecvError::Empty) => break,
             }
         }
+
+        self.suspend_inactive_tabs(false);
+    }
+
+    fn suspend_inactive_tabs(&mut self, force: bool) {
+        let now = Instant::now();
+        let active = self.active_tab_id;
+        let ids = self.tabs
+            .iter()
+            .filter_map(|(tab_id, entry)| {
+                if *tab_id == active {
+                    return None;
+                }
+                if entry.last_url.is_empty() {
+                    return None;
+                }
+                if force || now.saturating_duration_since(entry.last_active) >= self.suspend_after {
+                    Some(*tab_id)
+                } else {
+                    None
+                }
+            })
+            .collect::<Vec<_>>();
+        for tab_id in ids {
+            self.suspend_tab(tab_id);
+        }
+    }
+
+    fn suspend_tab(&mut self, tab_id: u64) {
+        deny_pending_permission_for_tab(
+            &self.pending_permission,
+            tab_id,
+            &self.reply_tx,
+            "tab-suspend",
+        );
+        let Some(entry) = self.tabs.remove(&tab_id) else { return };
+        use webkit2gtk::WebViewExt;
+        let url = if entry.last_url.is_empty() {
+            wv_url(&entry.webview)
+        } else {
+            entry.last_url.clone()
+        };
+        entry.alive.set(false);
+        next_cell_generation(&entry.schedule_gen);
+        next_cell_generation(&entry.frame_gen);
+        entry.webview.stop_loading();
+        if !url.is_empty() {
+            self.suspended_tabs.insert(tab_id, SuspendedTab {
+                is_private: entry.is_private,
+                url: url.clone(),
+                nav_id: entry.nav_id_cell.get(),
+            });
+            trace!("[webkit-driver] suspended tab={tab_id} url={url}");
+            let _ = self.reply_tx.try_send(Reply::TabSuspended { tab_id });
+        }
+    }
+
+    fn resume_tab(&mut self, tab_id: u64) {
+        let Some(suspended) = self.suspended_tabs.remove(&tab_id) else { return };
+        let mut entry = make_tab_entry(
+            tab_id,
+            suspended.is_private,
+            self.w,
+            self.h,
+            self.reply_tx.clone(),
+            Rc::clone(&self.adblock),
+            Rc::clone(&self.permissions),
+            Rc::clone(&self.pending_permission),
+            Rc::clone(&self.permission_seq),
+            &self.normal_context,
+            Rc::clone(&self.download_seq),
+        );
+        use webkit2gtk::WebViewExt;
+        entry.nav_id_cell.set(suspended.nav_id);
+        entry.last_url = suspended.url.clone();
+        trace!("[webkit-driver] resumed tab={tab_id} url={}", suspended.url);
+        entry.webview.load_uri(&suspended.url);
+        self.tabs.insert(tab_id, entry);
+        let _ = self.reply_tx.try_send(Reply::TabWaking { tab_id });
     }
 }
 
@@ -1118,7 +1248,17 @@ fn make_tab_entry(
         });
     }
 
-    TabEntry { webview, _window: window, is_private, nav_id_cell, frame_gen, schedule_gen, alive }
+    TabEntry {
+        webview,
+        _window: window,
+        is_private,
+        nav_id_cell,
+        frame_gen,
+        schedule_gen,
+        alive,
+        last_active: Instant::now(),
+        last_url: String::new(),
+    }
 }
 
 // ── Permission handling ──────────────────────────────────────────────────────

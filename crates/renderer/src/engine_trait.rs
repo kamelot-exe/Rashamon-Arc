@@ -96,6 +96,7 @@ pub trait ContentEngine: Send {
         _private: bool,
     ) {}
     fn set_site_adblock_allowlisted(&mut self, _origin: &str, _allowlisted: bool, _private: bool) {}
+    fn force_suspend_inactive_tabs(&mut self) {}
 
     /// Whether the active tab's WebView has native back/forward history.
     /// Returns false on stub engines — shell history is used instead.

@@ -204,6 +204,11 @@ impl KamelotRuntime {
         self.input.inject_event(event);
     }
 
+    #[allow(dead_code)]
+    pub(crate) fn inject_input_packet(&mut self, packet: KamelotInputPacket) {
+        self.input.enqueue_packet(packet);
+    }
+
     fn poll_input_source(&mut self) -> io::Result<()> {
         for event in self.input.poll_input()? {
             if self.debug {
@@ -330,8 +335,38 @@ pub(crate) enum KamelotInputEvent {
 }
 
 #[cfg(all(feature = "kamelot", not(feature = "linux-desktop")))]
+#[derive(Debug)]
+pub(crate) enum KamelotInputPacket {
+    Quit,
+    Keyboard {
+        key: BrowserKey,
+        pressed: bool,
+        modifiers: Modifiers,
+    },
+    Text {
+        text: String,
+    },
+    MouseMotion {
+        dx: i32,
+        dy: i32,
+    },
+    MousePosition {
+        x: i32,
+        y: i32,
+    },
+    MouseButton {
+        button: MouseButton,
+        pressed: bool,
+    },
+    Scroll {
+        delta: i32,
+    },
+}
+
+#[cfg(all(feature = "kamelot", not(feature = "linux-desktop")))]
 struct KamelotSyscallInputSource {
-    pending: VecDeque<KamelotInputEvent>,
+    packets: VecDeque<KamelotInputPacket>,
+    pending_events: VecDeque<KamelotInputEvent>,
     debug: bool,
 }
 
@@ -339,26 +374,92 @@ struct KamelotSyscallInputSource {
 impl KamelotSyscallInputSource {
     fn new(debug: bool) -> Self {
         Self {
-            pending: VecDeque::new(),
+            packets: VecDeque::new(),
+            pending_events: VecDeque::new(),
             debug,
         }
     }
 
     fn poll_input(&mut self) -> io::Result<Vec<KamelotInputEvent>> {
+        let started = Instant::now();
         self.poll_syscalls()?;
-        Ok(self.pending.drain(..).collect())
+        self.convert_packets();
+        let events: Vec<_> = self.pending_events.drain(..).collect();
+        if self.debug && (!events.is_empty() || !self.packets.is_empty()) {
+            eprintln!(
+                "[runtime:kamelot] input poll events={} packet_depth={} elapsed_us={}",
+                events.len(),
+                self.packets.len(),
+                started.elapsed().as_micros()
+            );
+        }
+        Ok(events)
     }
 
     #[allow(dead_code)]
     fn inject_event(&mut self, event: KamelotInputEvent) {
-        self.pending.push_back(event);
+        self.pending_events.push_back(event);
+    }
+
+    #[allow(dead_code)]
+    fn enqueue_packet(&mut self, packet: KamelotInputPacket) {
+        if self.debug {
+            eprintln!(
+                "[runtime:kamelot] packet queued {:?} depth={}",
+                packet,
+                self.packets.len() + 1
+            );
+        }
+        self.packets.push_back(packet);
+    }
+
+    fn convert_packets(&mut self) {
+        while let Some(packet) = self.packets.pop_front() {
+            if self.debug {
+                eprintln!("[runtime:kamelot] packet received {:?}", packet);
+            }
+            if let Some(event) = Self::packet_to_event(packet) {
+                if self.debug {
+                    eprintln!("[runtime:kamelot] packet converted {:?}", event);
+                }
+                self.pending_events.push_back(event);
+            }
+        }
+    }
+
+    fn packet_to_event(packet: KamelotInputPacket) -> Option<KamelotInputEvent> {
+        match packet {
+            KamelotInputPacket::Quit => Some(KamelotInputEvent::Quit),
+            KamelotInputPacket::Keyboard {
+                key,
+                pressed,
+                modifiers,
+            } => {
+                if pressed {
+                    Some(KamelotInputEvent::KeyDown { key, modifiers })
+                } else {
+                    None
+                }
+            }
+            KamelotInputPacket::Text { text } => Some(KamelotInputEvent::Text(text)),
+            KamelotInputPacket::MouseMotion { dx, dy } => {
+                Some(KamelotInputEvent::MouseMove { dx, dy })
+            }
+            KamelotInputPacket::MousePosition { x, y } => {
+                Some(KamelotInputEvent::MousePosition { x, y })
+            }
+            KamelotInputPacket::MouseButton { button, pressed } => {
+                Some(KamelotInputEvent::MouseButton { button, pressed })
+            }
+            KamelotInputPacket::Scroll { delta } => Some(KamelotInputEvent::Scroll { delta }),
+        }
     }
 
     fn poll_syscalls(&mut self) -> io::Result<()> {
         // Future Kamelot syscall hook:
-        // - read keyboard packets
-        // - read mouse packets
-        // - translate them into KamelotInputEvent
+        // - read keyboard/mouse/scroll packets
+        // - enqueue KamelotInputPacket values in self.packets
+        // - let convert_packets deterministically produce KamelotInputEvent
         //
         // Host builds keep this empty so the Kamelot feature remains
         // compile-only without depending on SDL, GTK, WebKitGTK, or Linux

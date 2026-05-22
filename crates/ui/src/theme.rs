@@ -78,32 +78,32 @@ pub struct Theme {
 }
 
 pub const KAMELOT_DARK: Theme = Theme {
-    bg:           Pixel { r: 10,  g: 10,  b: 10  }, // #0A0A0A
-    fg:           Pixel { r: 238, g: 238, b: 238 }, // #EEEEEE
-    fg_secondary: Pixel { r: 110, g: 110, b: 110 }, // #6E6E6E
-    border:       Pixel { r: 36,  g: 36,  b: 36  }, // #242424
-    surface:      Pixel { r: 18,  g: 18,  b: 18  }, // #121212
-    placeholder:  Pixel { r: 90,  g: 90,  b: 90  }, // #5A5A5A
+    bg:           Pixel { r: 13,  g: 15,  b: 19  }, // deep slate, not pure black
+    fg:           Pixel { r: 238, g: 241, b: 245 },
+    fg_secondary: Pixel { r: 132, g: 140, b: 150 },
+    border:       Pixel { r: 42,  g: 48,  b: 58  },
+    surface:      Pixel { r: 22,  g: 25,  b: 31  },
+    placeholder:  Pixel { r: 104, g: 112, b: 124 },
 
-    tab_bar_bg:        Pixel { r: 10,  g: 10,  b: 10  }, // #0A0A0A — darkest strip
-    tab_bg:            Pixel { r: 22,  g: 22,  b: 22  }, // #161616
-    tab_fg:            Pixel { r: 130, g: 130, b: 130 }, // muted
-    tab_active_bg:     Pixel { r: 18,  g: 18,  b: 18  }, // matches surface
+    tab_bar_bg:        Pixel { r: 16,  g: 18,  b: 23  },
+    tab_bg:            Pixel { r: 24,  g: 27,  b: 34  },
+    tab_fg:            Pixel { r: 146, g: 154, b: 164 },
+    tab_active_bg:     Pixel { r: 22,  g: 25,  b: 31  },
     tab_active_fg:     Pixel { r: 238, g: 238, b: 238 }, // full bright
-    tab_hover_bg:      Pixel { r: 32,  g: 32,  b: 32  }, // #202020
-    tab_close_hover:   Pixel { r: 50,  g: 50,  b: 50  }, // #323232
+    tab_hover_bg:      Pixel { r: 34,  g: 39,  b: 48  },
+    tab_close_hover:   Pixel { r: 58,  g: 65,  b: 78  },
 
-    address_bar_bg:            Pixel { r: 28,  g: 28,  b: 28  }, // #1C1C1C
-    address_bar_bg_focused:    Pixel { r: 24,  g: 24,  b: 24  }, // slightly different
+    address_bar_bg:            Pixel { r: 30,  g: 34,  b: 42  },
+    address_bar_bg_focused:    Pixel { r: 35,  g: 40,  b: 49  },
     address_bar_fg:            Pixel { r: 238, g: 238, b: 238 },
-    address_bar_border:        Pixel { r: 44,  g: 44,  b: 44  }, // #2C2C2C
-    address_bar_border_focused: Pixel { r: 200, g: 107, b: 60  }, // accent
+    address_bar_border:        Pixel { r: 50,  g: 57,  b: 69  },
+    address_bar_border_focused: Pixel { r: 223, g: 132, b: 83  },
 
-    icon_fg:          Pixel { r: 160, g: 160, b: 160 },
-    control_hover_bg: Pixel { r: 36,  g: 36,  b: 36  }, // #242424
+    icon_fg:          Pixel { r: 168, g: 176, b: 188 },
+    control_hover_bg: Pixel { r: 39,  g: 45,  b: 55  },
 
-    new_tab_card_bg:       Pixel { r: 22,  g: 22,  b: 22  },
-    new_tab_card_hover_bg: Pixel { r: 32,  g: 32,  b: 32  },
+    new_tab_card_bg:       Pixel { r: 24,  g: 28,  b: 35  },
+    new_tab_card_hover_bg: Pixel { r: 36,  g: 42,  b: 52  },
 
     accent:       Pixel { r: 200, g: 107, b: 60  }, // #C86B3C warm orange
     accent_fg:    Pixel { r: 255, g: 255, b: 255 },

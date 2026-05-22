@@ -56,6 +56,25 @@ const PRIVATE_ACCENT: Pixel = Pixel { r: 130, g: 70, b: 200 };
 
 const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
 
+const SHADOW_DARK: Pixel = Pixel { r: 6, g: 8, b: 12 };
+
+fn load_ui_font_data() -> &'static [u8] {
+    const FALLBACK: &[u8] = include_bytes!("../assets/DejaVuSansMono.ttf");
+    const CANDIDATES: &[&str] = &[
+        "/usr/share/fonts/truetype/noto/NotoSans-Regular.ttf",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        "/usr/share/fonts/truetype/liberation2/LiberationSans-Regular.ttf",
+        "/usr/share/fonts/truetype/ubuntu/Ubuntu-R.ttf",
+    ];
+
+    for path in CANDIDATES {
+        if let Ok(bytes) = std::fs::read(path) {
+            return Box::leak(bytes.into_boxed_slice());
+        }
+    }
+    FALLBACK
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum ContentRenderMode {
     Text,
@@ -705,7 +724,7 @@ fn run_browser_runtime<R: PlatformRuntime>(
     let content_h  = FB_HEIGHT.saturating_sub(TOP_BAR_HEIGHT);
     let mut driver = BrowserCoreDriver::new(FB_WIDTH, content_h)?;
     let _http       = HttpClient::new();
-    let font_data = include_bytes!("../assets/DejaVuSansMono.ttf");
+    let font_data = load_ui_font_data();
     let font = FontManager::new(font_data)?;
 
     let mut pending_fetch:    Option<PendingFetch>          = None;
@@ -968,7 +987,10 @@ fn draw_tab_row(fb: &mut Framebuffer, state: &BrowserState, font: &FontManager) 
                  else               { theme.tab_bg        };
         let fg = if is_active { theme.tab_active_fg } else { theme.tab_fg };
 
-        draw::draw_rounded_rect_top(fb, tx, TOP, tw, H, 6, bg);
+        if !is_active {
+            fb.fill_rect(tx + 8, TAB_BAR_HEIGHT - 2, tw.saturating_sub(16), 1, state.theme.border);
+        }
+        draw::draw_rounded_rect_top(fb, tx, TOP, tw, H, 8, bg);
 
         if is_active {
             fb.fill_rect(tx, TAB_BAR_HEIGHT - 2, tw, 3, theme.surface);
@@ -987,7 +1009,7 @@ fn draw_tab_row(fb: &mut Framebuffer, state: &BrowserState, font: &FontManager) 
         let close_reserve = if is_active || is_hovered { 24 } else { 8 };
         let max_title_w   = tw.saturating_sub(title_x - tx + close_reserve);
         let title_y       = TOP + (H / 2).saturating_sub(7);
-        draw::draw_text(fb, font, title_x, title_y, tab.tab_title(), 13.0, fg, max_title_w);
+        draw::draw_text(fb, font, title_x, title_y, tab.tab_title(), 12.5, fg, max_title_w);
 
         if is_active || is_hovered {
             let cx = tx + tw.saturating_sub(16);
@@ -1054,6 +1076,8 @@ fn draw_nav_btn(fb: &mut Framebuffer, state: &BrowserState, cx: u32, cy: u32, bt
         draw::draw_circle_filled(fb, cx, cy, r, theme.accent);
     } else if hovered && enabled {
         draw::draw_circle_filled(fb, cx, cy, r, theme.control_hover_bg);
+    } else if enabled {
+        draw::draw_circle_filled(fb, cx, cy, r, theme.surface);
     }
     let color = if pressed       { theme.accent_fg   }
                 else if !enabled { theme.fg_secondary }
@@ -1077,9 +1101,11 @@ fn draw_address_bar(fb: &mut Framebuffer, state: &BrowserState, font: &FontManag
     let border = if state.address_bar_focused { theme.address_bar_border_focused }
                  else if is_prv { PRIVATE_ACCENT }
                  else { theme.address_bar_border };
+    fb.fill_rect(bar_x + 12, bar_y + ADDR_BAR_H + 1, ADDR_BAR_W.saturating_sub(24), 2, SHADOW_DARK);
     draw::draw_rounded_rect(fb, bar_x.saturating_sub(1), bar_y.saturating_sub(1),
         ADDR_BAR_W + 2, ADDR_BAR_H + 2, ADDR_BAR_R + 1, border);
     draw::draw_rounded_rect(fb, bar_x, bar_y, ADDR_BAR_W, ADDR_BAR_H, ADDR_BAR_R, bg);
+    fb.fill_rect(bar_x + ADDR_BAR_R, bar_y + 1, ADDR_BAR_W.saturating_sub(2 * ADDR_BAR_R), 1, theme.control_hover_bg);
 
     let icon_x = bar_x + 14;
     let icon_y = bar_y + ADDR_BAR_H / 2;
@@ -1100,11 +1126,11 @@ fn draw_address_bar(fb: &mut Framebuffer, state: &BrowserState, font: &FontManag
 
     if state.address_bar_input.is_empty() && !state.address_bar_focused {
         let placeholder = if is_prv { "Private search or URL" } else { "Search or enter URL" };
-        draw::draw_text(fb, font, tx, ty, placeholder, 14.0, theme.placeholder, max_w);
+        draw::draw_text(fb, font, tx, ty, placeholder, 13.5, theme.placeholder, max_w);
     } else {
-        draw::draw_text(fb, font, tx, ty, &state.address_bar_input, 14.0, theme.address_bar_fg, max_w);
+        draw::draw_text(fb, font, tx, ty, &state.address_bar_input, 13.5, theme.address_bar_fg, max_w);
         if state.address_bar_focused && (state.frame_count / 28) % 2 == 0 {
-            let cw = font.text_width(&state.address_bar_input, 14.0);
+            let cw = font.text_width(&state.address_bar_input, 13.5);
             let cx = (tx + cw + 1).min(bar_x + ADDR_BAR_W - 34);
             fb.fill_rect(cx, ty, 2, 15, theme.accent);
         }
@@ -1124,8 +1150,9 @@ fn draw_find_bar(fb: &mut Framebuffer, state: &BrowserState, font: &FontManager)
     let x = FB_WIDTH.saturating_sub(w + 48);
     let y = TAB_BAR_HEIGHT + (CHROME_BAR_HEIGHT - h) / 2;
 
-    draw::draw_rounded_rect(fb, x.saturating_sub(1), y.saturating_sub(1), w + 2, h + 2, 8, theme.address_bar_border_focused);
-    draw::draw_rounded_rect(fb, x, y, w, h, 8, theme.address_bar_bg_focused);
+    fb.fill_rect(x + 10, y + h + 1, w.saturating_sub(20), 2, SHADOW_DARK);
+    draw::draw_rounded_rect(fb, x.saturating_sub(1), y.saturating_sub(1), w + 2, h + 2, 9, theme.address_bar_border_focused);
+    draw::draw_rounded_rect(fb, x, y, w, h, 9, theme.address_bar_bg_focused);
 
     let label = if state.find_input.is_empty() {
         "Find in page"
@@ -1133,9 +1160,9 @@ fn draw_find_bar(fb: &mut Framebuffer, state: &BrowserState, font: &FontManager)
         &state.find_input
     };
     let fg = if state.find_input.is_empty() { theme.placeholder } else { theme.address_bar_fg };
-    draw::draw_text(fb, font, x + 12, y + 7, label, 13.0, fg, 210);
+    draw::draw_text(fb, font, x + 12, y + 7, label, 12.5, fg, 210);
     if (state.frame_count / 28) % 2 == 0 {
-        let cw = font.text_width(&state.find_input, 13.0);
+        let cw = font.text_width(&state.find_input, 12.5);
         let cx = (x + 12 + cw + 1).min(x + 220);
         fb.fill_rect(cx, y + 7, 2, 14, theme.accent);
     }
@@ -1145,9 +1172,9 @@ fn draw_find_bar(fb: &mut Framebuffer, state: &BrowserState, font: &FontManager)
         Some(n) => n.to_string(),
         None => "-".to_string(),
     };
-    draw::draw_text(fb, font, x + 232, y + 7, &count, 13.0, theme.fg_secondary, 36);
-    draw::draw_text(fb, font, x + 270, y + 7, "Enter next", 12.0, theme.fg_secondary, 86);
-    draw::draw_text(fb, font, x + w - 20, y + 7, "x", 13.0, theme.fg_secondary, 14);
+    draw::draw_text(fb, font, x + 232, y + 7, &count, 12.5, theme.fg_secondary, 36);
+    draw::draw_text(fb, font, x + 270, y + 7, "Enter next", 11.5, theme.fg_secondary, 86);
+    draw::draw_text(fb, font, x + w - 20, y + 7, "x", 12.5, theme.fg_secondary, 14);
 }
 
 fn draw_download_status(fb: &mut Framebuffer, state: &BrowserState, font: &FontManager) {

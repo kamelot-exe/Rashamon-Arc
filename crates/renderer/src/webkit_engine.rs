@@ -58,6 +58,11 @@ fn perf_enabled() -> bool {
 static PERF_T0: OnceLock<Instant> = OnceLock::new();
 static PERF_FIRST_TAB: AtomicU64 = AtomicU64::new(0);
 static PERF_FIRST_FRAME_DONE: AtomicBool = AtomicBool::new(false);
+static WEBEXT_AVAILABLE: AtomicBool = AtomicBool::new(false);
+static WEBEXT_CONFIGURED: AtomicBool = AtomicBool::new(false);
+static WEBEXT_DISABLED: AtomicBool = AtomicBool::new(false);
+static WEBEXT_READY: AtomicBool = AtomicBool::new(false);
+static WEBEXT_BLOCKED_EVENTS: AtomicU64 = AtomicU64::new(0);
 
 fn perf_mark_global(stage: &'static str) {
     if !perf_enabled() {
@@ -93,6 +98,26 @@ fn perf_mark_tab(stage: &'static str, tab_id: u64) {
     if stage == "frame-ready-emitted" {
         PERF_FIRST_FRAME_DONE.store(true, Ordering::Relaxed);
     }
+}
+
+pub fn webext_is_configured_for_test() -> bool {
+    WEBEXT_CONFIGURED.load(Ordering::Relaxed)
+}
+
+pub fn webext_is_available_for_test() -> bool {
+    WEBEXT_AVAILABLE.load(Ordering::Relaxed)
+}
+
+pub fn webext_is_disabled_for_test() -> bool {
+    WEBEXT_DISABLED.load(Ordering::Relaxed)
+}
+
+pub fn webext_ready_for_test() -> bool {
+    WEBEXT_READY.load(Ordering::Relaxed)
+}
+
+pub fn webext_blocked_events_for_test() -> u64 {
+    WEBEXT_BLOCKED_EVENTS.load(Ordering::Relaxed)
 }
 
 // ── IPC ───────────────────────────────────────────────────────────────────────
@@ -255,6 +280,11 @@ impl WebKitEngine {
     pub fn create(content_w: u32, content_h: u32)
         -> Result<(Self, WebKitDriver), Box<dyn std::error::Error>>
     {
+        WEBEXT_AVAILABLE.store(false, Ordering::Relaxed);
+        WEBEXT_CONFIGURED.store(false, Ordering::Relaxed);
+        WEBEXT_DISABLED.store(false, Ordering::Relaxed);
+        WEBEXT_READY.store(false, Ordering::Relaxed);
+        WEBEXT_BLOCKED_EVENTS.store(0, Ordering::Relaxed);
         perf_mark_global("gtk-init-start");
         if std::env::var_os("GDK_BACKEND").is_none() {
             std::env::set_var("GDK_BACKEND", "x11,wayland");
@@ -1466,6 +1496,9 @@ fn make_tab_entry(
     window.add(&webview);
     window.show_all();
 
+    connect_webext_view_messages(tab_id, &webview, Rc::clone(&blocked_by_origin));
+    send_webext_ping_and_rules(tab_id, &webview, &adblock, is_private);
+
     let nav_id_cell: Rc<Cell<u64>> = Rc::new(Cell::new(0));
     let frame_gen: Rc<Cell<u64>> = Rc::new(Cell::new(0));
     let schedule_gen: Rc<Cell<u64>> = Rc::new(Cell::new(0));
@@ -2001,12 +2034,164 @@ fn create_normal_web_context() -> webkit2gtk::WebContext {
         .base_cache_directory(cache_dir.to_string_lossy().as_ref())
         .build();
     let context = WebContext::with_website_data_manager(&manager);
+    configure_web_extension(&context);
     trace!(
         "[webkit] profile normal data_dir={} cache_dir={}",
         data_dir.display(),
         cache_dir.display()
     );
     context
+}
+
+fn configure_web_extension(context: &webkit2gtk::WebContext) {
+    use webkit2gtk::{UserMessageExt, WebContextExt};
+
+    if std::env::var_os("RASHAMON_DISABLE_WEBEXT").is_some() {
+        trace!("[adblock-webext] disabled via RASHAMON_DISABLE_WEBEXT=1");
+        WEBEXT_DISABLED.store(true, Ordering::Relaxed);
+        WEBEXT_AVAILABLE.store(false, Ordering::Relaxed);
+        WEBEXT_CONFIGURED.store(false, Ordering::Relaxed);
+        return;
+    }
+    WEBEXT_DISABLED.store(false, Ordering::Relaxed);
+
+    let default_dir = option_env!("RASHAMON_WEBEXT_DIR")
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+    let ext_dir = std::env::var("RASHAMON_WEBEXT_DIR").ok().or(default_dir);
+    let Some(ext_dir) = ext_dir else {
+        trace!("[adblock-webext] no extension dir available, fallback to in-process");
+        WEBEXT_AVAILABLE.store(false, Ordering::Relaxed);
+        WEBEXT_CONFIGURED.store(false, Ordering::Relaxed);
+        return;
+    };
+
+    if !std::path::Path::new(&ext_dir).exists() {
+        trace!(
+            "[adblock-webext] extension dir missing ({}), fallback to in-process",
+            ext_dir
+        );
+        WEBEXT_AVAILABLE.store(false, Ordering::Relaxed);
+        WEBEXT_CONFIGURED.store(false, Ordering::Relaxed);
+        return;
+    }
+    WEBEXT_AVAILABLE.store(true, Ordering::Relaxed);
+
+    context.set_web_extensions_directory(&ext_dir);
+    context.set_web_extensions_initialization_user_data(&glib::Variant::from(
+        "doubleclick.net,googlesyndication.com",
+    ));
+    context.connect_initialize_web_extensions(|_| {
+        trace!("[adblock-webext] initialize_web_extensions signal");
+    });
+    context.connect_user_message_received(|_, message| {
+        if std::env::var_os("RASHAMON_DEBUG").is_some() {
+            trace!("[adblock-webext] user-message: {:?}", message.name());
+        }
+        false
+    });
+    WEBEXT_CONFIGURED.store(true, Ordering::Relaxed);
+    trace!("[adblock-webext] configured dir={ext_dir}");
+}
+
+fn connect_webext_view_messages(
+    tab_id: u64,
+    webview: &webkit2gtk::WebView,
+    blocked_by_origin: Rc<RefCell<HashMap<String, u64>>>,
+) {
+    use webkit2gtk::{UserMessageExt, WebViewExt};
+    webview.connect_user_message_received(move |wv, message| {
+        let Some(name) = message.name() else {
+            return false;
+        };
+        let name = name.to_string();
+        if name == "rashamon-webext-ready" || name == "rashamon-webext-pong" {
+            WEBEXT_READY.store(true, Ordering::Relaxed);
+            trace!("[webext] ready tab={tab_id}");
+            return true;
+        }
+        if name == "rashamon-webext-blocked" {
+            WEBEXT_BLOCKED_EVENTS.fetch_add(1, Ordering::Relaxed);
+            if let Some(params) = message.parameters() {
+                if let Some((url, page_url, kind)) = params.get::<(String, String, String)>() {
+                    trace!("[adblock-webext] blocked {url} kind={kind}");
+                    increment_origin_block_count(&blocked_by_origin, &page_url);
+                    return true;
+                }
+            }
+            increment_origin_block_count(&blocked_by_origin, &wv_url(wv));
+            trace!("[adblock-webext] blocked event (no params)");
+            return true;
+        }
+        false
+    });
+}
+
+fn send_webext_ping_and_rules(
+    tab_id: u64,
+    webview: &webkit2gtk::WebView,
+    adblock: &Rc<RefCell<AdblockEngine>>,
+    private: bool,
+) {
+    use webkit2gtk::{UserMessage, UserMessageExt, WebViewExt};
+
+    if !WEBEXT_CONFIGURED.load(Ordering::Relaxed) {
+        return;
+    }
+
+    let block_csv = "doubleclick.net,googlesyndication.com,google-analytics.com,googletagmanager.com,facebook.net,facebook.com/tr,adsystem.com,adservice.google.com,scorecardresearch.com".to_string();
+    let allow_csv = if private {
+        String::new()
+    } else {
+        adblock.borrow().allowlist_entries().join(",")
+    };
+    let rules = UserMessage::new(
+        "rashamon-webext-set-rules",
+        Some(&glib::Variant::from((block_csv, allow_csv))),
+    );
+    webview.send_message_to_page(&rules, None::<&gio::Cancellable>, move |result| {
+        if let Err(err) = result {
+            trace!("[adblock-webext] rules sync failed tab={tab_id}: {err}");
+        } else {
+            trace!("[adblock-webext] rules sync ok tab={tab_id}");
+        }
+    });
+
+    let ping = UserMessage::new(
+        "rashamon-webext-ping",
+        Some(&glib::Variant::from("ping")),
+    );
+    webview.send_message_to_page(&ping, None::<&gio::Cancellable>, move |result| {
+        match result {
+            Ok(reply) => {
+                let ready = reply
+                    .name()
+                    .as_ref()
+                    .map(|n| n.as_str() == "rashamon-webext-pong")
+                    .unwrap_or(false);
+                if ready {
+                    WEBEXT_READY.store(true, Ordering::Relaxed);
+                    trace!("[webext] ready tab={tab_id}");
+                } else {
+                    trace!("[webext] ping reply unexpected tab={tab_id}: {:?}", reply.name());
+                }
+            }
+            Err(err) => trace!("[webext] ping failed tab={tab_id}: {err}"),
+        }
+    });
+
+    if std::env::var_os("RASHAMON_WEBEXT_SMOKE_PROBE").is_some() {
+        let probe = UserMessage::new(
+            "rashamon-webext-probe-url",
+            Some(&glib::Variant::from(("https://doubleclick.net/pagead/probe",))),
+        );
+        webview.send_message_to_page(&probe, None::<&gio::Cancellable>, move |result| {
+            match result {
+                Ok(reply) => trace!("[webext] probe reply tab={tab_id}: {:?}", reply.name()),
+                Err(err) => trace!("[webext] probe failed tab={tab_id}: {err}"),
+            }
+        });
+    }
 }
 
 // ── Snapshot helper ───────────────────────────────────────────────────────────

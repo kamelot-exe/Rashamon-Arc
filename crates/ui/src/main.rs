@@ -33,6 +33,8 @@ use rashamon_net::{AdblockEngine, HttpClient};
 use rashamon_renderer::{
     download_destination_for_test, origin_from_url, CursorKind, DecisionSource, EngineEvent, EngineFrame,
     Framebuffer, PermissionDecision, PermissionKind, PermissionStore, RenderEngine,
+    webext_blocked_events_for_test, webext_is_available_for_test, webext_is_configured_for_test,
+    webext_is_disabled_for_test, webext_ready_for_test,
 };
 use rashamon_renderer::framebuffer::Pixel;
 use ui_state::{BrowserState, DirtyFlags, DownloadStatus, OverlayKind, PageState, TabId, derive_title};
@@ -973,12 +975,18 @@ struct SmokePerfMetrics {
     load_finished_ms: Option<u128>,
     snapshot_completed_ms: Option<u128>,
     libsoup_warning_count: u64,
+    webext_available: bool,
+    webext_loaded: bool,
+    webext_disabled: bool,
+    webext_handshake_ok: bool,
+    webext_blocked_event_seen: bool,
 }
 
 fn run_webkit_smoke_test() -> Result<SmokePerfMetrics, Box<dyn std::error::Error>> {
     let smoke_t0 = Instant::now();
     let perf = perf_mode_enabled();
     let mut perf_metrics = SmokePerfMetrics::default();
+    std::env::set_var("RASHAMON_WEBEXT_SMOKE_PROBE", "1");
     smoke_log("[smoke] starting WebKit smoke test");
     if std::env::var_os("RASHAMON_PERF").is_none() {
         smoke_adblock_model()?;
@@ -1004,12 +1012,63 @@ fn run_webkit_smoke_test() -> Result<SmokePerfMetrics, Box<dyn std::error::Error
     smoke_wait_for(&mut state, &mut engine, "startup no args", Duration::from_secs(2), |s, _| {
         s.tabs.len() == 1 && s.active_tab().map_or(false, |t| matches!(t.page_state, PageState::NewTab))
     })?;
+    perf_metrics.webext_available = webext_is_available_for_test();
+    perf_metrics.webext_loaded = webext_is_configured_for_test();
+    perf_metrics.webext_disabled = webext_is_disabled_for_test();
+    smoke_log(format!(
+        "[smoke] webext_available={} webext_loaded={} webext_disabled={}",
+        perf_metrics.webext_available, perf_metrics.webext_loaded, perf_metrics.webext_disabled
+    ));
 
+    if webext_is_configured_for_test() && std::env::var_os("RASHAMON_DISABLE_WEBEXT").is_none() {
+        let blocked_probe_before = webext_blocked_events_for_test();
+        match smoke_wait_for(
+            &mut state,
+            &mut engine,
+            "webext ready handshake",
+            Duration::from_secs(3),
+            |_s, _| webext_ready_for_test(),
+        ) {
+            Ok(()) => {
+                perf_metrics.webext_handshake_ok = true;
+                smoke_log("[smoke] PASS webext runtime handshake");
+                if smoke_wait_for(
+                    &mut state,
+                    &mut engine,
+                    "webext blocked-event probe",
+                    Duration::from_secs(3),
+                    |_s, _| webext_blocked_events_for_test() > blocked_probe_before,
+                )
+                .is_ok()
+                {
+                    perf_metrics.webext_blocked_event_seen = true;
+                    smoke_log("[smoke] PASS webext blocked event path");
+                } else {
+                    smoke_log("[smoke] SKIP webext blocked event path (not observed)");
+                }
+            }
+            Err(_) => {
+                smoke_log("[smoke] SKIP webext runtime handshake (not observed)");
+            }
+        }
+    } else {
+        smoke_log("[smoke] SKIP webext runtime handshake (webext disabled/unavailable)");
+        smoke_log("[smoke] SKIP webext blocked event path (webext disabled/unavailable)");
+    }
+
+    let blocked_before = webext_blocked_events_for_test();
     smoke_navigate(&mut state, &mut engine, "https://doubleclick.net/pagead/id")?;
     smoke_wait_for(&mut state, &mut engine, "adblock rejects blocked URL", Duration::from_secs(4), |s, events| {
         events.iter().any(|e| matches!(e, EngineEvent::LoadFailed(reason) if reason.contains("Blocked by adblock")))
             && s.active_tab().map_or(false, |t| matches!(t.page_state, PageState::Error(_)))
     })?;
+    if perf_metrics.webext_loaded && !perf_metrics.webext_disabled && !perf_metrics.webext_blocked_event_seen {
+        let blocked_seen = webext_blocked_events_for_test() > blocked_before;
+        perf_metrics.webext_blocked_event_seen = blocked_seen;
+        if blocked_seen {
+            smoke_log("[smoke] PASS webext blocked event path (navigation)");
+        }
+    }
 
     smoke_navigate(&mut state, &mut engine, "https://example.com")?;
     let first_webkit_t0 = Instant::now();

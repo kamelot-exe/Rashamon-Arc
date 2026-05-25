@@ -11,7 +11,7 @@
 //!   Call set_active_tab(tab_id) when the active tab changes (no reload issued).
 //!   navigate(url, nav_id) always operates on the currently active tab.
 
-use crate::engine_trait::{ContentEngine, EngineEvent, EngineFrame};
+use crate::engine_trait::{ContentEngine, EngineEvent, EngineFrame, EnginePerfStats};
 use crate::framebuffer::Framebuffer;
 use crate::permissions::{PermissionDecision, PermissionKind};
 
@@ -189,6 +189,9 @@ impl RenderEngine {
     /// `tab_id == 0` means "the active tab" (stub path).
     pub fn poll_events(&mut self) -> Vec<(u64, EngineEvent)> {
         self.inner.poll_events()
+    }
+    pub fn perf_stats(&self) -> EnginePerfStats {
+        self.inner.perf_stats()
     }
 
     pub fn current_nav_id(&self) -> u64 { self.inner.current_nav_id() }

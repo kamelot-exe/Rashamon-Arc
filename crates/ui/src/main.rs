@@ -39,6 +39,7 @@ use ui_state::{BrowserState, DirtyFlags, DownloadStatus, OverlayKind, PageState,
 
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
+use std::process::Command;
 
 // Loading timing (at 60 fps)
 const LOAD_MIN_FRAMES:     u64 = 60;   // 1 s minimum visible loading state
@@ -57,6 +58,493 @@ const PRIVATE_ACCENT: Pixel = Pixel { r: 130, g: 70, b: 200 };
 const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 const SHADOW_DARK: Pixel = Pixel { r: 6, g: 8, b: 12 };
+
+struct PerfTracker {
+    enabled: bool,
+    t0: Instant,
+    startup_reported: bool,
+    first_shell_frame_ms: Option<u128>,
+    first_loading_surface_ms: Option<u128>,
+    first_webkit_frame_ms: Option<u128>,
+    pending_scroll_at: Option<Instant>,
+    pending_tab_switch_at: Option<Instant>,
+    last_active_tab: Option<u64>,
+    last_stats_dump: Instant,
+    last_frame_start: Instant,
+    render_into_total_us: u128,
+    draw_ui_total_us: u128,
+    present_total_us: u128,
+    frame_total_us: u128,
+    timed_frames: u64,
+}
+
+impl PerfTracker {
+    fn new() -> Self {
+        let now = Instant::now();
+        let perf_arg = std::env::args().skip(1).any(|arg| arg == "--perf");
+        Self {
+            enabled: std::env::var_os("RASHAMON_PERF").is_some() || perf_arg,
+            t0: now,
+            startup_reported: false,
+            first_shell_frame_ms: None,
+            first_loading_surface_ms: None,
+            first_webkit_frame_ms: None,
+            pending_scroll_at: None,
+            pending_tab_switch_at: None,
+            last_active_tab: None,
+            last_stats_dump: now,
+            last_frame_start: now,
+            render_into_total_us: 0,
+            draw_ui_total_us: 0,
+            present_total_us: 0,
+            frame_total_us: 0,
+            timed_frames: 0,
+        }
+    }
+
+    fn ms_since_start(&self) -> u128 {
+        self.t0.elapsed().as_millis()
+    }
+
+    fn on_initial_frame(&mut self) {
+        if !self.enabled {
+            return;
+        }
+        if self.first_shell_frame_ms.is_none() {
+            self.first_shell_frame_ms = Some(self.ms_since_start());
+            eprintln!("[perf] first-shell-frame-ms={}", self.first_shell_frame_ms.unwrap_or(0));
+        }
+    }
+
+    fn on_loading_surface_frame(&mut self) {
+        if !self.enabled {
+            return;
+        }
+        if self.first_loading_surface_ms.is_none() {
+            self.first_loading_surface_ms = Some(self.ms_since_start());
+            eprintln!(
+                "[perf] first-loading-surface-ms={}",
+                self.first_loading_surface_ms.unwrap_or(0)
+            );
+        }
+    }
+
+    fn note_input(&mut self, ev: &input::PlatformEvent) {
+        if !self.enabled {
+            return;
+        }
+        if matches!(ev, input::PlatformEvent::Scroll { .. }) {
+            self.pending_scroll_at = Some(Instant::now());
+        }
+    }
+
+    fn note_active_tab(&mut self, active_tab_id: u64) {
+        if !self.enabled {
+            return;
+        }
+        if let Some(prev) = self.last_active_tab {
+            if prev != active_tab_id {
+                self.pending_tab_switch_at = Some(Instant::now());
+            }
+        }
+        self.last_active_tab = Some(active_tab_id);
+    }
+
+    fn on_engine_event(&mut self, ev: &EngineEvent) {
+        if !self.enabled {
+            return;
+        }
+        if let EngineEvent::FrameReady { reason } = ev {
+            if self.first_webkit_frame_ms.is_none() {
+                self.first_webkit_frame_ms = Some(self.ms_since_start());
+                eprintln!(
+                    "[perf] first-webkit-frame-ms={} reason={}",
+                    self.first_webkit_frame_ms.unwrap_or(0),
+                    reason
+                );
+            }
+            if reason.contains("scroll") {
+                if let Some(t0) = self.pending_scroll_at.take() {
+                    eprintln!("[perf] scroll-snapshot-latency-ms={}", t0.elapsed().as_millis());
+                }
+            }
+            if reason.contains("switch") {
+                if let Some(t0) = self.pending_tab_switch_at.take() {
+                    eprintln!("[perf] tab-switch-latency-ms={}", t0.elapsed().as_millis());
+                }
+            }
+        }
+    }
+
+    fn maybe_dump_runtime_stats(&mut self, driver: &BrowserCoreDriver) {
+        if !self.enabled || self.last_stats_dump.elapsed() < Duration::from_secs(1) {
+            return;
+        }
+        self.last_stats_dump = Instant::now();
+        let stats = driver.engine.perf_stats();
+        let timed = self.timed_frames.max(1) as u128;
+        eprintln!(
+            "[perf] t={}ms tabs={} live_webviews={} suspended={} rss_kb={} engine_render_into_ms={:.3} draw_ui_ms={:.3} present_frame_ms={:.3} frame_total_ms={:.3}",
+            self.ms_since_start(),
+            driver.state.tabs.len(),
+            stats.live_webviews,
+            stats.suspended_tabs,
+            read_process_rss_kb().unwrap_or(0),
+            self.render_into_total_us as f64 / timed as f64 / 1000.0,
+            self.draw_ui_total_us as f64 / timed as f64 / 1000.0,
+            self.present_total_us as f64 / timed as f64 / 1000.0,
+            self.frame_total_us as f64 / timed as f64 / 1000.0,
+        );
+        self.render_into_total_us = 0;
+        self.draw_ui_total_us = 0;
+        self.present_total_us = 0;
+        self.frame_total_us = 0;
+        self.timed_frames = 0;
+    }
+
+    fn maybe_report_startup(&mut self) {
+        if !self.enabled || self.startup_reported {
+            return;
+        }
+        if let (Some(shell), Some(webkit)) = (self.first_shell_frame_ms, self.first_webkit_frame_ms) {
+            eprintln!(
+                "[perf] startup-ms={} first-frame-ms={} first-webkit-frame-ms={}",
+                self.ms_since_start(),
+                shell,
+                webkit
+            );
+            self.startup_reported = true;
+        }
+    }
+
+    fn mark_frame_start(&mut self) {
+        if self.enabled {
+            self.last_frame_start = Instant::now();
+        }
+    }
+
+    fn add_render_into(&mut self, elapsed: Duration) {
+        if self.enabled {
+            self.render_into_total_us += elapsed.as_micros();
+        }
+    }
+
+    fn add_draw_ui(&mut self, elapsed: Duration) {
+        if self.enabled {
+            self.draw_ui_total_us += elapsed.as_micros();
+        }
+    }
+
+    fn add_present(&mut self, elapsed: Duration) {
+        if self.enabled {
+            self.present_total_us += elapsed.as_micros();
+        }
+    }
+
+    fn mark_frame_end(&mut self) {
+        if self.enabled {
+            self.frame_total_us += self.last_frame_start.elapsed().as_micros();
+            self.timed_frames = self.timed_frames.saturating_add(1);
+        }
+    }
+}
+
+fn read_process_rss_kb() -> Option<u64> {
+    let status = std::fs::read_to_string("/proc/self/status").ok()?;
+    let line = status.lines().find(|line| line.starts_with("VmRSS:"))?;
+    let mut parts = line.split_whitespace();
+    let _ = parts.next()?;
+    parts.next()?.parse::<u64>().ok()
+}
+
+#[derive(Debug, Default, Clone)]
+struct RuntimePerfSample {
+    first_shell_frame_ms: Option<f64>,
+    first_loading_surface_ms: Option<f64>,
+    engine_render_into_ms: Option<f64>,
+    draw_ui_ms: Option<f64>,
+    present_frame_ms: Option<f64>,
+    frame_total_ms: Option<f64>,
+    rss_kb: Option<u64>,
+}
+
+#[derive(Debug, Default, Clone)]
+struct BenchRunSample {
+    first_shell_frame_ms: Option<f64>,
+    first_loading_surface_ms: Option<f64>,
+    cold_start_ms: Option<f64>,
+    first_webkit_frame_ms: Option<f64>,
+    tab_switch_latency_ms: Option<f64>,
+    scroll_snapshot_latency_ms: Option<f64>,
+    engine_render_into_ms: Option<f64>,
+    draw_ui_ms: Option<f64>,
+    present_frame_ms: Option<f64>,
+    frame_total_ms: Option<f64>,
+    rss_kb: Option<f64>,
+    load_start_ms: Option<f64>,
+    load_finished_ms: Option<f64>,
+    snapshot_completed_ms: Option<f64>,
+    libsoup_warning_count: Option<f64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BenchTempMode {
+    Warm,
+    Cold,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct BenchConfig {
+    mode: BenchTempMode,
+    isolate_profile: bool,
+}
+
+fn parse_perf_number(line: &str, key: &str) -> Option<f64> {
+    for token in line.split_whitespace() {
+        if let Some(rest) = token.strip_prefix(key) {
+            return rest.parse::<f64>().ok();
+        }
+    }
+    None
+}
+
+fn parse_perf_u64(line: &str, key: &str) -> Option<u64> {
+    for token in line.split_whitespace() {
+        if let Some(rest) = token.strip_prefix(key) {
+            return rest.parse::<u64>().ok();
+        }
+    }
+    None
+}
+
+fn run_perf_smoke_once(
+    run_id: usize,
+    cfg: BenchConfig,
+) -> Result<SmokePerfMetrics, Box<dyn std::error::Error>> {
+    let exe = std::env::current_exe()?;
+    let mut cmd = Command::new(exe);
+    if cfg.isolate_profile {
+        let profile_suffix = match cfg.mode {
+            BenchTempMode::Cold => format!("bench-cold-smoke-{}-{}", std::process::id(), run_id),
+            BenchTempMode::Warm => format!("bench-warm-smoke-{}", std::process::id()),
+        };
+        cmd.env("RASHAMON_PROFILE_SUFFIX", profile_suffix);
+    }
+    let out = cmd
+        .arg("--smoke-test-webkit")
+        .arg("--perf")
+        .arg("--smoke-quiet")
+        .output()?;
+    let combined = format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    if !out.status.success() {
+        return Err(format!("bench smoke run failed:\n{combined}").into());
+    }
+    let mut metrics = SmokePerfMetrics::default();
+    for line in combined.lines() {
+        if line.contains("libsoup-WARNING") {
+            metrics.libsoup_warning_count = metrics.libsoup_warning_count.saturating_add(1);
+        }
+        if !line.contains("[perf]") {
+            continue;
+        }
+        if let Some(v) = parse_perf_number(line, "cold-start-ms=") {
+            metrics.cold_start_ms = Some(v as u128);
+        }
+        if let Some(v) = parse_perf_number(line, "first-webkit-frame-ms=") {
+            metrics.first_webkit_frame_ms = Some(v as u128);
+        }
+        if let Some(v) = parse_perf_number(line, "tab-switch-latency-ms=") {
+            metrics.tab_switch_latency_ms = Some(v as u128);
+        }
+        if let Some(v) = parse_perf_number(line, "scroll-snapshot-latency-ms=") {
+            metrics.scroll_snapshot_latency_ms = Some(v as u128);
+        }
+        if line.contains("webkit_stage=load-start") {
+            if let Some(v) = parse_perf_number(line, "t_ms=") {
+                metrics.load_start_ms = Some(v as u128);
+            }
+        }
+        if line.contains("webkit_stage=load-finished") {
+            if let Some(v) = parse_perf_number(line, "t_ms=") {
+                metrics.load_finished_ms = Some(v as u128);
+            }
+        }
+        if line.contains("webkit_stage=snapshot-completed") {
+            if let Some(v) = parse_perf_number(line, "t_ms=") {
+                metrics.snapshot_completed_ms = Some(v as u128);
+            }
+        }
+    }
+    Ok(metrics)
+}
+
+fn run_perf_runtime_once(
+    run_id: usize,
+    cfg: BenchConfig,
+) -> Result<RuntimePerfSample, Box<dyn std::error::Error>> {
+    let exe = std::env::current_exe()?;
+    let mut cmd = Command::new(exe);
+    if cfg.isolate_profile {
+        let profile_suffix = match cfg.mode {
+            BenchTempMode::Cold => format!("bench-cold-runtime-{}-{}", std::process::id(), run_id),
+            BenchTempMode::Warm => format!("bench-warm-runtime-{}", std::process::id()),
+        };
+        cmd.env("RASHAMON_PROFILE_SUFFIX", profile_suffix);
+    }
+    let out = cmd
+        .arg("--perf-sample")
+        .arg("--perf")
+        .arg("--smoke-quiet")
+        .output()?;
+    let combined = format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    if !out.status.success() {
+        return Err(format!("bench runtime sample failed:\n{combined}").into());
+    }
+    let mut sample = RuntimePerfSample::default();
+    for line in combined.lines() {
+        if !(line.contains("[perf]") && line.contains("engine_render_into_ms=")) {
+            if line.contains("[perf] first-shell-frame-ms=") {
+                sample.first_shell_frame_ms = parse_perf_number(line, "first-shell-frame-ms=");
+            }
+            if line.contains("[perf] first-loading-surface-ms=") {
+                sample.first_loading_surface_ms =
+                    parse_perf_number(line, "first-loading-surface-ms=");
+            }
+            continue;
+        }
+        sample.engine_render_into_ms = parse_perf_number(line, "engine_render_into_ms=");
+        sample.draw_ui_ms = parse_perf_number(line, "draw_ui_ms=");
+        sample.present_frame_ms = parse_perf_number(line, "present_frame_ms=");
+        sample.frame_total_ms = parse_perf_number(line, "frame_total_ms=");
+        sample.rss_kb = parse_perf_u64(line, "rss_kb=");
+    }
+    Ok(sample)
+}
+
+fn stat_line(name: &str, values: &[f64]) -> String {
+    if values.is_empty() {
+        return format!("{name} median=NA p95=NA min=NA max=NA");
+    }
+    let mut v = values.to_vec();
+    v.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let n = v.len();
+    let median = if n % 2 == 1 {
+        v[n / 2]
+    } else {
+        (v[n / 2 - 1] + v[n / 2]) / 2.0
+    };
+    let p95_idx = ((n as f64) * 0.95).ceil().max(1.0) as usize - 1;
+    let p95 = v[p95_idx.min(n - 1)];
+    format!(
+        "{name} median={:.3} p95={:.3} min={:.3} max={:.3}",
+        median,
+        p95,
+        v[0],
+        v[n - 1]
+    )
+}
+
+fn run_bench_perf(runs: usize, cfg: BenchConfig) -> Result<(), Box<dyn std::error::Error>> {
+    let mut samples = Vec::with_capacity(runs);
+    for i in 0..runs {
+        let smoke = run_perf_smoke_once(i + 1, cfg)?;
+        let runtime = run_perf_runtime_once(i + 1, cfg)?;
+        samples.push(BenchRunSample {
+            first_shell_frame_ms: runtime.first_shell_frame_ms,
+            first_loading_surface_ms: runtime.first_loading_surface_ms,
+            cold_start_ms: smoke.cold_start_ms.map(|v| v as f64),
+            first_webkit_frame_ms: smoke.first_webkit_frame_ms.map(|v| v as f64),
+            tab_switch_latency_ms: smoke.tab_switch_latency_ms.map(|v| v as f64),
+            scroll_snapshot_latency_ms: smoke.scroll_snapshot_latency_ms.map(|v| v as f64),
+            engine_render_into_ms: runtime.engine_render_into_ms,
+            draw_ui_ms: runtime.draw_ui_ms,
+            present_frame_ms: runtime.present_frame_ms,
+            frame_total_ms: runtime.frame_total_ms,
+            rss_kb: runtime.rss_kb.map(|v| v as f64),
+            load_start_ms: smoke.load_start_ms.map(|v| v as f64),
+            load_finished_ms: smoke.load_finished_ms.map(|v| v as f64),
+            snapshot_completed_ms: smoke.snapshot_completed_ms.map(|v| v as f64),
+            libsoup_warning_count: Some(smoke.libsoup_warning_count as f64),
+        });
+        eprintln!("[bench] run {}/{} done", i + 1, runs);
+    }
+
+    let collect = |f: fn(&BenchRunSample) -> Option<f64>| -> Vec<f64> {
+        samples.iter().filter_map(f).collect()
+    };
+
+    let mode = match cfg.mode {
+        BenchTempMode::Cold => "cold",
+        BenchTempMode::Warm => "warm",
+    };
+    println!(
+        "perf-summary runs={} mode={} isolate_profile={}",
+        runs, mode, cfg.isolate_profile
+    );
+    println!(
+        "{}",
+        stat_line("first-shell-frame-ms", &collect(|s| s.first_shell_frame_ms))
+    );
+    println!(
+        "{}",
+        stat_line(
+            "first-loading-surface-ms",
+            &collect(|s| s.first_loading_surface_ms)
+        )
+    );
+    println!("{}", stat_line("cold-start-ms", &collect(|s| s.cold_start_ms)));
+    println!("{}", stat_line("load-start-ms", &collect(|s| s.load_start_ms)));
+    println!("{}", stat_line("load-finished-ms", &collect(|s| s.load_finished_ms)));
+    println!(
+        "{}",
+        stat_line("snapshot-completed-ms", &collect(|s| s.snapshot_completed_ms))
+    );
+    println!(
+        "{}",
+        stat_line(
+            "first-webkit-frame-ms",
+            &collect(|s| s.first_webkit_frame_ms)
+        )
+    );
+    println!(
+        "{}",
+        stat_line(
+            "tab-switch-latency-ms",
+            &collect(|s| s.tab_switch_latency_ms)
+        )
+    );
+    println!(
+        "{}",
+        stat_line(
+            "scroll-snapshot-latency-ms",
+            &collect(|s| s.scroll_snapshot_latency_ms)
+        )
+    );
+    println!(
+        "{}",
+        stat_line("engine_render_into_ms", &collect(|s| s.engine_render_into_ms))
+    );
+    println!("{}", stat_line("draw_ui_ms", &collect(|s| s.draw_ui_ms)));
+    println!(
+        "{}",
+        stat_line("present_frame_ms", &collect(|s| s.present_frame_ms))
+    );
+    println!("{}", stat_line("frame_total_ms", &collect(|s| s.frame_total_ms)));
+    println!("{}", stat_line("rss_kb", &collect(|s| s.rss_kb)));
+    println!(
+        "{}",
+        stat_line("libsoup-warning-count", &collect(|s| s.libsoup_warning_count))
+    );
+    Ok(())
+}
 
 fn load_ui_font_data() -> &'static [u8] {
     const FALLBACK: &[u8] = include_bytes!("../assets/DejaVuSansMono.ttf");
@@ -218,6 +706,7 @@ fn smoke_apply_engine_events(
                 );
             }
             EngineEvent::CursorChanged(_) => {}
+            EngineEvent::FrameReady { .. } => {}
             EngineEvent::LoadStarted => {
                 let frame = state.frame_count;
                 if let Some(tab) = state.tabs.iter_mut().find(|t2| t2.id.raw() == target_raw) {
@@ -247,7 +736,7 @@ where
         engine.pump_gtk();
         let events = smoke_apply_engine_events(state, engine);
         if pred(state, &events) {
-            eprintln!("[smoke] PASS {label}");
+            smoke_log(format!("[smoke] PASS {label}"));
             return Ok(());
         }
         std::thread::sleep(Duration::from_millis(16));
@@ -319,7 +808,7 @@ fn smoke_adblock_model() -> Result<(), Box<dyn std::error::Error>> {
         return Err(smoke_fail("malformed adblock allowlist disabled blocking"));
     }
 
-    eprintln!("[smoke] PASS adblock model");
+    smoke_log("[smoke] PASS adblock model");
     Ok(())
 }
 
@@ -332,13 +821,26 @@ fn smoke_download_destination_model() -> Result<(), Box<dyn std::error::Error>> 
     if let Some(parent) = first.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    std::fs::write(&first, b"rashamon smoke")?;
+    if let Err(err) = std::fs::write(&first, b"rashamon smoke") {
+        if matches!(
+            err.kind(),
+            std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::ReadOnlyFilesystem
+        ) {
+            smoke_log(format!(
+                "[smoke] SKIP download destination duplicate check (non-writable path: {})",
+                first.display()
+            ));
+            smoke_log("[smoke] PASS download destination model");
+            return Ok(());
+        }
+        return Err(err.into());
+    }
     let second = download_destination_for_test(&name);
     let _ = std::fs::remove_file(&first);
     if second == first {
         return Err(smoke_fail("download destination did not avoid duplicate filename"));
     }
-    eprintln!("[smoke] PASS download destination model");
+    smoke_log("[smoke] PASS download destination model");
     Ok(())
 }
 
@@ -432,18 +934,58 @@ fn smoke_permissions_model() -> Result<(), Box<dyn std::error::Error>> {
         return Err(smoke_fail("malformed permissions file was not ignored"));
     }
 
-    eprintln!("[smoke] PASS permissions model");
+    smoke_log("[smoke] PASS permissions model");
     Ok(())
 }
 
-fn run_webkit_smoke_test() -> Result<(), Box<dyn std::error::Error>> {
-    eprintln!("[smoke] starting WebKit smoke test");
-    smoke_adblock_model()?;
-    smoke_download_destination_model()?;
-    smoke_permissions_model()?;
+fn perf_mode_enabled() -> bool {
+    std::env::var_os("RASHAMON_PERF").is_some()
+        || std::env::args().skip(1).any(|arg| arg == "--perf")
+}
+
+fn smoke_quiet_enabled() -> bool {
+    std::env::var_os("RASHAMON_SMOKE_QUIET").is_some()
+        || std::env::args().skip(1).any(|arg| arg == "--smoke-quiet")
+}
+
+fn smoke_log(msg: impl AsRef<str>) {
+    if !smoke_quiet_enabled() {
+        eprintln!("{}", msg.as_ref());
+    }
+}
+
+#[derive(Debug, Default, Clone)]
+struct SmokePerfMetrics {
+    cold_start_ms: Option<u128>,
+    first_webkit_frame_ms: Option<u128>,
+    tab_switch_latency_ms: Option<u128>,
+    scroll_snapshot_latency_ms: Option<u128>,
+    load_start_ms: Option<u128>,
+    load_finished_ms: Option<u128>,
+    snapshot_completed_ms: Option<u128>,
+    libsoup_warning_count: u64,
+}
+
+fn run_webkit_smoke_test() -> Result<SmokePerfMetrics, Box<dyn std::error::Error>> {
+    let smoke_t0 = Instant::now();
+    let perf = perf_mode_enabled();
+    let mut perf_metrics = SmokePerfMetrics::default();
+    smoke_log("[smoke] starting WebKit smoke test");
+    if std::env::var_os("RASHAMON_PERF").is_none() {
+        smoke_adblock_model()?;
+        smoke_download_destination_model()?;
+        smoke_permissions_model()?;
+    } else {
+        smoke_log("[smoke] PERF mode: skipping file-writing model preflight checks");
+    }
     let mut engine = RenderEngine::new(FB_WIDTH, FB_HEIGHT.saturating_sub(TOP_BAR_HEIGHT))?;
     if !engine.is_real_engine() {
         return Err(smoke_fail("WebKit smoke test requires a real engine, got fallback"));
+    }
+    if perf {
+        let value = smoke_t0.elapsed().as_millis();
+        perf_metrics.cold_start_ms = Some(value);
+        eprintln!("[perf] cold-start-ms={value}");
     }
 
     let mut state = BrowserState::new();
@@ -461,10 +1003,16 @@ fn run_webkit_smoke_test() -> Result<(), Box<dyn std::error::Error>> {
     })?;
 
     smoke_navigate(&mut state, &mut engine, "https://example.com")?;
+    let first_webkit_t0 = Instant::now();
     smoke_wait_for(&mut state, &mut engine, "startup/direct URL renders", Duration::from_secs(12), |s, events| {
         events.iter().any(|e| matches!(e, EngineEvent::LoadComplete))
             && s.active_tab().map_or(false, |t| matches!(t.page_state, PageState::Loaded))
     })?;
+    if perf {
+        let value = first_webkit_t0.elapsed().as_millis();
+        perf_metrics.first_webkit_frame_ms = Some(value);
+        eprintln!("[perf] first-webkit-frame-ms={value}");
+    }
     state.find_open = true;
     state.find_input = "Example".to_string();
     engine.find_text(&state.find_input);
@@ -500,11 +1048,18 @@ fn run_webkit_smoke_test() -> Result<(), Box<dyn std::error::Error>> {
     let search_tab_id = state.active_tab_id;
 
     state.activate_tab(first_loaded_id);
+    let tab_switch_t0 = Instant::now();
     engine.set_active_tab(first_loaded_id.raw());
-    smoke_wait_for(&mut state, &mut engine, "tab switch without reload", Duration::from_secs(3), |s, _| {
+    smoke_wait_for(&mut state, &mut engine, "tab switch without reload", Duration::from_secs(3), |s, events| {
         s.active_tab_id == first_loaded_id
             && s.active_tab().map_or(false, |t| matches!(t.page_state, PageState::Loaded))
+            && events.iter().any(|e| matches!(e, EngineEvent::FrameReady { reason } if reason.contains("switch")))
     })?;
+    if perf {
+        let value = tab_switch_t0.elapsed().as_millis();
+        perf_metrics.tab_switch_latency_ms = Some(value);
+        eprintln!("[perf] tab-switch-latency-ms={value}");
+    }
     engine.force_suspend_inactive_tabs();
     smoke_wait_for(&mut state, &mut engine, "inactive tab suspension stable", Duration::from_secs(2), |_s, _| true)?;
     state.activate_tab(search_tab_id);
@@ -560,9 +1115,17 @@ fn run_webkit_smoke_test() -> Result<(), Box<dyn std::error::Error>> {
         events.iter().any(|e| matches!(e, EngineEvent::LoadComplete))
     })?;
 
+    let scroll_t0 = Instant::now();
     state.scroll_by(SCROLL_WHEEL * 4);
     engine.scroll(SCROLL_WHEEL * 4);
-    smoke_wait_for(&mut state, &mut engine, "scroll command stable", Duration::from_secs(2), |_s, _| true)?;
+    smoke_wait_for(&mut state, &mut engine, "scroll command stable", Duration::from_secs(2), |_s, events| {
+        events.iter().any(|e| matches!(e, EngineEvent::FrameReady { reason } if reason.contains("scroll")))
+    })?;
+    if perf {
+        let value = scroll_t0.elapsed().as_millis();
+        perf_metrics.scroll_snapshot_latency_ms = Some(value);
+        eprintln!("[perf] scroll-snapshot-latency-ms={value}");
+    }
     for _ in 0..8 {
         state.scroll_by(SCROLL_WHEEL);
         engine.scroll(SCROLL_WHEEL);
@@ -640,7 +1203,7 @@ fn run_webkit_smoke_test() -> Result<(), Box<dyn std::error::Error>> {
     if state.tabs.iter().any(|t| t.id == closing_id) {
         return Err(smoke_fail("close tab failed"));
     }
-    eprintln!("[smoke] PASS close tab");
+    smoke_log("[smoke] PASS close tab");
 
     while state.tabs.len() > 1 {
         let id = state.active_tab_id;
@@ -656,9 +1219,9 @@ fn run_webkit_smoke_test() -> Result<(), Box<dyn std::error::Error>> {
     if state.tabs.len() != 1 || !state.active_tab().map_or(false, |t| matches!(t.page_state, PageState::NewTab)) {
         return Err(smoke_fail("close last tab did not restore a new tab"));
     }
-    eprintln!("[smoke] PASS close last tab");
-    eprintln!("[smoke] PASS WebKit smoke test complete");
-    Ok(())
+    smoke_log("[smoke] PASS close last tab");
+    smoke_log("[smoke] PASS WebKit smoke test complete");
+    Ok(perf_metrics)
 }
 
 // ── Content height measurement ────────────────────────────────────────────────
@@ -693,12 +1256,45 @@ fn measure_content_height(nodes: &[PageNode], font: &FontManager) -> u32 {
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     eprintln!("Rashamon Arc {APP_VERSION}");
 
+    if std::env::args().skip(1).any(|arg| arg == "--bench-perf") {
+        let mut runs = 10usize;
+        let mut mode = BenchTempMode::Warm;
+        let mut isolate_profile = std::env::var_os("RASHAMON_BENCH_ISOLATE_PROFILE").is_some();
+        let args: Vec<String> = std::env::args().collect();
+        for i in 0..args.len() {
+            if args[i] == "--runs" {
+                if let Some(next) = args.get(i + 1) {
+                    if let Ok(parsed) = next.parse::<usize>() {
+                        runs = parsed.max(1);
+                    }
+                }
+            }
+            if args[i] == "--cold" {
+                mode = BenchTempMode::Cold;
+            }
+            if args[i] == "--warm" {
+                mode = BenchTempMode::Warm;
+            }
+            if args[i] == "--bench-isolate-profile" {
+                isolate_profile = true;
+            }
+        }
+        return run_bench_perf(
+            runs,
+            BenchConfig {
+                mode,
+                isolate_profile,
+            },
+        );
+    }
+
     if std::env::args().skip(1).any(|arg| arg == "--smoke-test-permissions") {
         return smoke_permissions_model();
     }
 
     if std::env::args().skip(1).any(|arg| arg == "--smoke-test-webkit" || arg == "--smoke-test-adblock" || arg == "--smoke-test-find") {
-        return run_webkit_smoke_test();
+        run_webkit_smoke_test()?;
+        return Ok(());
     }
 
     #[cfg(feature = "linux-desktop")]
@@ -721,6 +1317,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 fn run_browser_runtime<R: PlatformRuntime>(
     mut runtime: R,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    let mut perf = PerfTracker::new();
+    draw_bootstrap_shell(runtime.framebuffer_mut());
+    runtime.present_frame()?;
+    perf.on_initial_frame();
+
+    let perf_sample_deadline = if std::env::args().skip(1).any(|arg| arg == "--perf-sample") {
+        Some(Instant::now() + Duration::from_secs(4))
+    } else {
+        None
+    };
     let content_h  = FB_HEIGHT.saturating_sub(TOP_BAR_HEIGHT);
     let mut driver = BrowserCoreDriver::new(FB_WIDTH, content_h)?;
     let _http       = HttpClient::new();
@@ -748,11 +1354,22 @@ fn run_browser_runtime<R: PlatformRuntime>(
         ContentRenderMode::Text,
     );
     runtime.present_frame()?;
+    if driver
+        .state
+        .active_tab()
+        .map_or(false, |t| t.page_state.is_loading())
+    {
+        perf.on_loading_surface_frame();
+    }
 
     let mut running          = true;
     let mut last_blink_phase = 0u64;
 
     while running && !runtime.should_exit() {
+        if perf_sample_deadline.map_or(false, |deadline| Instant::now() >= deadline) {
+            break;
+        }
+        perf.mark_frame_start();
         driver.state.frame_count += 1;
         driver.state.tick_nav_btn();
 
@@ -762,11 +1379,13 @@ fn run_browser_runtime<R: PlatformRuntime>(
 
         // ── Events ────────────────────────────────────────────────────────────
         for ev in runtime.poll_events()? {
+            perf.note_input(&ev);
             if driver.handle_platform_event(ev, (FB_HEIGHT - TOP_BAR_HEIGHT) as i32) {
                 running = false;
                 break;
             }
         }
+        perf.note_active_tab(driver.state.active_tab_id.raw());
         let effective_cursor = if driver.state.active_tab().map_or(false, |t| t.page_state.is_loading()) {
             CursorKind::Wait
         } else {
@@ -775,6 +1394,7 @@ fn run_browser_runtime<R: PlatformRuntime>(
         runtime.set_cursor(effective_cursor);
 
         // ── Spawn fetch (text renderer fallback — skipped when real engine active) ──
+        #[cfg(not(all(feature = "kamelot", not(feature = "linux-desktop"))))]
         if !driver.engine.is_real_engine() {
             if let Some(tab) = driver.state.active_tab() {
                 if tab.page_state.is_loading() {
@@ -786,6 +1406,19 @@ fn run_browser_runtime<R: PlatformRuntime>(
                         pending_fetch = Some(spawn_fetch(tab_id, url));
                     }
                 }
+            }
+        }
+
+        #[cfg(all(feature = "kamelot", not(feature = "linux-desktop")))]
+        if !driver.engine.is_real_engine() {
+            if driver
+                .state
+                .active_tab()
+                .map_or(false, |t| t.page_state.is_loading())
+            {
+                driver
+                    .state
+                    .fail_loading("Web content renderer/network unavailable on Kamelot yet.");
             }
         }
 
@@ -861,7 +1494,10 @@ fn run_browser_runtime<R: PlatformRuntime>(
         }
 
         // ── Engine events — routed by BrowserCoreDriver ──────────────────────
-        driver.poll_engine_events();
+        let engine_events = driver.poll_engine_events();
+        for (_, ev) in &engine_events {
+            perf.on_engine_event(ev);
+        }
 
         // ── Render ────────────────────────────────────────────────────────────
         if driver.state.dirty.any() {
@@ -875,7 +1511,16 @@ fn run_browser_runtime<R: PlatformRuntime>(
                 && driver.state.overlay == OverlayKind::None
                 && driver.state.active_tab().map_or(false, |t| matches!(t.page_state, PageState::Loaded))
             {
-                match driver.engine.render_into(runtime.framebuffer_mut(), 0, TOP_BAR_HEIGHT, FB_WIDTH, FB_HEIGHT - TOP_BAR_HEIGHT) {
+                let render_t0 = Instant::now();
+                let render_result = driver.engine.render_into(
+                    runtime.framebuffer_mut(),
+                    0,
+                    TOP_BAR_HEIGHT,
+                    FB_WIDTH,
+                    FB_HEIGHT - TOP_BAR_HEIGHT,
+                );
+                perf.add_render_into(render_t0.elapsed());
+                match render_result {
                     Ok(EngineFrame::Ready) => ContentRenderMode::Engine,
                     Ok(_) if driver.engine.is_real_engine() => ContentRenderMode::EnginePending,
                     Ok(_) => ContentRenderMode::Text,
@@ -890,9 +1535,24 @@ fn run_browser_runtime<R: PlatformRuntime>(
                 ContentRenderMode::Text
             };
 
+            let draw_t0 = Instant::now();
             render_ui(runtime.framebuffer_mut(), &driver.state, &font, dirty, content_mode);
+            perf.add_draw_ui(draw_t0.elapsed());
+            let present_t0 = Instant::now();
             runtime.present_frame()?;
+            perf.add_present(present_t0.elapsed());
+            if driver
+                .state
+                .active_tab()
+                .map_or(false, |t| t.page_state.is_loading())
+            {
+                perf.on_loading_surface_frame();
+            }
         }
+
+        perf.maybe_dump_runtime_stats(&driver);
+        perf.maybe_report_startup();
+        perf.mark_frame_end();
 
         // ── Persist (fire-and-forget after render) ────────────────────────────
         if driver.save_dirty.any() {
@@ -905,6 +1565,21 @@ fn run_browser_runtime<R: PlatformRuntime>(
 }
 
 // ── Top-level render ──────────────────────────────────────────────────────────
+
+fn draw_bootstrap_shell(fb: &mut Framebuffer) {
+    use theme::KAMELOT_DARK;
+    fb.clear(KAMELOT_DARK.bg);
+    fb.fill_rect(0, 0, fb.width, TAB_BAR_HEIGHT, KAMELOT_DARK.tab_bar_bg);
+    fb.fill_rect(
+        0,
+        TAB_BAR_HEIGHT,
+        fb.width,
+        CHROME_BAR_HEIGHT,
+        KAMELOT_DARK.surface,
+    );
+    fb.fill_rect(0, TOP_BAR_HEIGHT, fb.width, 1, KAMELOT_DARK.border);
+    fb.fill_rect(0, TOP_BAR_HEIGHT + 1, fb.width, 2, KAMELOT_DARK.accent);
+}
 
 /// `content_mode` tells the shell whether the engine already wrote pixels or
 /// whether it is still waiting on the next snapshot for a loaded page.

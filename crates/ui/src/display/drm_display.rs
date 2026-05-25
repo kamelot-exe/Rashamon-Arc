@@ -418,27 +418,18 @@ impl Display {
         self.frame_count += 1;
 
         // Copy the software framebuffer to the DRM dumb buffer.
-        // Convert BGR → XRGB8888 and handle pitch differences.
+        // Software FB is BGRA32 (little-endian B,G,R,A). DRM XRGB8888 expects
+        // little-endian B,G,R,X, so bytes can be copied directly row-by-row.
         unsafe {
             let dst_pitch = self.fb_pitch as usize;
             let src_pitch = fb.stride as usize;
-            let copy_width = (self.width as usize).min(fb.width as usize) * 3;
+            let copy_width = (self.width as usize).min(fb.width as usize) * 4;
             let copy_height = (self.height as usize).min(fb.height as usize);
 
             for y in 0..copy_height {
                 let src_row = fb.data.as_ptr().add(y * src_pitch);
                 let dst_row = self.fb_ptr.add(y * dst_pitch);
-
-                for x in 0..(copy_width / 3) {
-                    let src_px = src_row.add(x * 3);
-                    let dst_px = dst_row.add(x * 4);
-
-                    // BGR → XRGB8888 (little-endian: B, G, R, X)
-                    *dst_px = *src_px;         // B
-                    *dst_px.offset(1) = *src_px.offset(1); // G
-                    *dst_px.offset(2) = *src_px.offset(2); // R
-                    *dst_px.offset(3) = 0;     // X (unused)
-                }
+                std::ptr::copy_nonoverlapping(src_row, dst_row, copy_width);
             }
         }
 

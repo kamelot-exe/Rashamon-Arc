@@ -24,7 +24,7 @@
 //! a packed Vec<u8> (ARGB32 little-endian = [B,G,R,A] per pixel), and sends it
 //! as `Reply::FrameReady`.  `render_into` blits the latest cached frame.
 
-use crate::engine_trait::{ContentEngine, CursorKind, EngineEvent, EngineFrame};
+use crate::engine_trait::{ContentEngine, CursorKind, EngineEvent, EngineFrame, EnginePerfStats};
 use crate::framebuffer::{Framebuffer, Pixel};
 use crate::permissions::{
     origin_from_url, DecisionSource, PermissionDecision, PermissionKind, PermissionStore,
@@ -34,9 +34,11 @@ use glib::Cast;
 use rashamon_net::AdblockEngine;
 
 use std::cell::{Cell, RefCell};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::OnceLock;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
@@ -46,6 +48,51 @@ macro_rules! trace {
             eprintln!($($arg)*);
         }
     };
+}
+
+fn perf_enabled() -> bool {
+    std::env::var_os("RASHAMON_PERF").is_some()
+        || std::env::args().skip(1).any(|arg| arg == "--perf")
+}
+
+static PERF_T0: OnceLock<Instant> = OnceLock::new();
+static PERF_FIRST_TAB: AtomicU64 = AtomicU64::new(0);
+static PERF_FIRST_FRAME_DONE: AtomicBool = AtomicBool::new(false);
+
+fn perf_mark_global(stage: &'static str) {
+    if !perf_enabled() {
+        return;
+    }
+    let t0 = PERF_T0.get_or_init(Instant::now);
+    eprintln!("[perf] webkit_stage={} t_ms={}", stage, t0.elapsed().as_millis());
+}
+
+fn perf_mark_tab(stage: &'static str, tab_id: u64) {
+    if !perf_enabled() {
+        return;
+    }
+    let first = PERF_FIRST_TAB
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+            if v == 0 { Some(tab_id) } else { None }
+        })
+        .unwrap_or_else(|v| v);
+    let tracked = if first == 0 { tab_id } else { first };
+    if tab_id != tracked {
+        return;
+    }
+    if PERF_FIRST_FRAME_DONE.load(Ordering::Relaxed) && stage != "frame-ready-emitted" {
+        return;
+    }
+    let t0 = PERF_T0.get_or_init(Instant::now);
+    eprintln!(
+        "[perf] webkit_stage={} t_ms={} tab={}",
+        stage,
+        t0.elapsed().as_millis(),
+        tab_id
+    );
+    if stage == "frame-ready-emitted" {
+        PERF_FIRST_FRAME_DONE.store(true, Ordering::Relaxed);
+    }
 }
 
 // ── IPC ───────────────────────────────────────────────────────────────────────
@@ -146,6 +193,7 @@ pub struct WebKitEngine {
     active_tab_id:  u64,
     tab_states:     HashMap<u64, PerTabState>,
     pending_events: Vec<(u64, EngineEvent)>,
+    suspended_tab_ids: HashSet<u64>,
 }
 
 // ── WebKitDriver (!Send — main thread only) ───────────────────────────────────
@@ -206,6 +254,7 @@ impl WebKitEngine {
     pub fn create(content_w: u32, content_h: u32)
         -> Result<(Self, WebKitDriver), Box<dyn std::error::Error>>
     {
+        perf_mark_global("gtk-init-start");
         if std::env::var_os("GDK_BACKEND").is_none() {
             std::env::set_var("GDK_BACKEND", "x11,wayland");
         }
@@ -213,6 +262,7 @@ impl WebKitEngine {
             std::env::set_var("WEBKIT_DISABLE_COMPOSITING_MODE", "1");
         }
         gtk::init().map_err(|e| format!("GTK init failed: {e}"))?;
+        perf_mark_global("gtk-init-done");
 
         let (cmd_tx, cmd_rx)     = mpsc::sync_channel::<Cmd>(32);
         let (reply_tx, reply_rx) = mpsc::sync_channel::<Reply>(32);
@@ -229,8 +279,9 @@ impl WebKitEngine {
             .map(Duration::from_millis)
             .unwrap_or_else(|| Duration::from_secs(120));
         let suspend_disabled = std::env::var_os("RASHAMON_DISABLE_TAB_SUSPEND").is_some();
-        let normal_context = webkit2gtk::WebContext::default()
-            .unwrap_or_else(webkit2gtk::WebContext::new);
+        perf_mark_global("webcontext-create-start");
+        let normal_context = create_normal_web_context();
+        perf_mark_global("webcontext-create-done");
         connect_downloads_for_context(
             &normal_context,
             reply_tx.clone(),
@@ -246,6 +297,7 @@ impl WebKitEngine {
             active_tab_id:  0,
             tab_states:     HashMap::new(),
             pending_events: Vec::new(),
+            suspended_tab_ids: HashSet::new(),
         };
 
         let driver = WebKitDriver {
@@ -288,6 +340,7 @@ impl ContentEngine for WebKitEngine {
     fn close_tab(&mut self, tab_id: u64) {
         trace!("[webkit] close_tab {tab_id}");
         self.tab_states.remove(&tab_id);
+        self.suspended_tab_ids.remove(&tab_id);
         let _ = self.cmd_tx.try_send(Cmd::CloseTab { tab_id });
     }
 
@@ -544,6 +597,7 @@ impl ContentEngine for WebKitEngine {
                     self.pending_events.push((tab_id, EngineEvent::TitleChanged(title)));
                     self.pending_events.push((tab_id, EngineEvent::UrlChanged(url)));
                     self.pending_events.push((tab_id, EngineEvent::LoadComplete));
+                    self.pending_events.push((tab_id, EngineEvent::FrameReady { reason }));
                 }
                 Ok(Reply::TitleChanged { tab_id, nav_id, title }) => {
                     let state = self.tab_states.entry(tab_id).or_insert_with(PerTabState::default);
@@ -631,9 +685,11 @@ impl ContentEngine for WebKitEngine {
                     self.pending_events.push((tab_id, EngineEvent::CursorChanged(cursor)));
                 }
                 Ok(Reply::TabSuspended { tab_id }) => {
+                    self.suspended_tab_ids.insert(tab_id);
                     trace!("[webkit] tab suspended event tab={tab_id}");
                 }
                 Ok(Reply::TabWaking { tab_id }) => {
+                    self.suspended_tab_ids.remove(&tab_id);
                     trace!("[webkit] tab waking event tab={tab_id}");
                     self.pending_events.push((tab_id, EngineEvent::LoadStarted));
                 }
@@ -648,6 +704,15 @@ impl ContentEngine for WebKitEngine {
     }
     fn current_url(&self) -> Option<String> {
         self.tab_states.get(&self.active_tab_id)?.url.clone()
+    }
+
+    fn perf_stats(&self) -> EnginePerfStats {
+        let suspended_tabs = self.suspended_tab_ids.len();
+        let live_webviews = self.tab_states.len().saturating_sub(suspended_tabs);
+        EnginePerfStats {
+            live_webviews,
+            suspended_tabs,
+        }
     }
 }
 
@@ -709,6 +774,10 @@ impl WebKitDriver {
                         let nav_id = entry.nav_id_cell.get();
                         trace!("[webkit-driver] SwitchTab {tab_id} -> snapshot nav={nav_id}");
                         send_view_state(&entry.webview, tab_id, 0, &self.reply_tx);
+                        if entry.last_url.is_empty() {
+                            trace!("[webkit-driver] SwitchTab {tab_id} skip snapshot reason=no-url");
+                            continue;
+                        }
                         let token = next_cell_generation(&entry.schedule_gen);
                         request_snapshot_now(
                             &entry.webview, self.w, self.h, tab_id,
@@ -733,6 +802,7 @@ impl WebKitDriver {
                     if let Some(entry) = self.tabs.get_mut(&tab_id) {
                         use webkit2gtk::WebViewExt;
                         trace!("[webkit-driver] Navigate tab={tab_id} nav={nav_id}: {url}");
+                        perf_mark_tab("first-navigate-call", tab_id);
                         deny_pending_permission_for_tab(
                             &self.pending_permission,
                             tab_id,
@@ -1360,6 +1430,7 @@ fn make_tab_entry(
     settings.set_javascript_can_access_clipboard(false);
     settings.set_hardware_acceleration_policy(HardwareAccelerationPolicy::Never);
 
+    perf_mark_tab("webview-create-start", tab_id);
     let webview = if is_private {
         use webkit2gtk::WebContext;
         let ctx = WebContext::new_ephemeral();
@@ -1377,6 +1448,7 @@ fn make_tab_entry(
         wv.set_settings(&settings);
         wv
     };
+    perf_mark_tab("webview-create-done", tab_id);
     webview.set_size_request(w as i32, h as i32);
 
     let window = gtk::OffscreenWindow::new();
@@ -1477,13 +1549,18 @@ fn make_tab_entry(
         let sg  = Rc::clone(&schedule_gen);
         let alive = Rc::clone(&alive);
         webview.connect_load_changed(move |wv, event| {
+            if event == LoadEvent::Started {
+                perf_mark_tab("load-start", tab_id);
+            }
             if event == LoadEvent::Committed {
+                perf_mark_tab("load-committed", tab_id);
                 let nav_id = nc.get();
                 let _ = tx.try_send(Reply::UrlChanged {
                     tab_id, nav_id, url: wv_url(wv),
                 });
             }
             if event == LoadEvent::Finished {
+                perf_mark_tab("load-finished", tab_id);
                 use webkit2gtk::WebViewExt as _;
                 let nav_id    = nc.get();
                 let can_back  = wv.can_go_back();
@@ -1863,6 +1940,32 @@ fn rashamon_data_dir() -> PathBuf {
     platform::default_data_dir()
 }
 
+fn create_normal_web_context() -> webkit2gtk::WebContext {
+    use webkit2gtk::{WebContext, WebsiteDataManager};
+
+    let profile_name = std::env::var("RASHAMON_PROFILE_SUFFIX")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| "normal".to_string());
+    let profile_root = rashamon_data_dir().join("webkit-profile").join(profile_name);
+    let data_dir = profile_root.join("data");
+    let cache_dir = profile_root.join("cache");
+    let _ = std::fs::create_dir_all(&data_dir);
+    let _ = std::fs::create_dir_all(&cache_dir);
+
+    let manager = WebsiteDataManager::builder()
+        .base_data_directory(data_dir.to_string_lossy().as_ref())
+        .base_cache_directory(cache_dir.to_string_lossy().as_ref())
+        .build();
+    let context = WebContext::with_website_data_manager(&manager);
+    trace!(
+        "[webkit] profile normal data_dir={} cache_dir={}",
+        data_dir.display(),
+        cache_dir.display()
+    );
+    context
+}
+
 // ── Snapshot helper ───────────────────────────────────────────────────────────
 
 fn next_cell_generation(cell: &Rc<Cell<u64>>) -> u64 {
@@ -1932,6 +2035,7 @@ fn request_snapshot_now(
         trace!("[webkit] skip snapshot closed tab={tab_id} reason={reason}");
         return;
     }
+    perf_mark_tab("snapshot-requested", tab_id);
     let gen = next_cell_generation(&frame_gen);
     let nav_id_value = nav_id.get();
     trace!("[webkit] snapshot request tab={tab_id} nav={nav_id_value} gen={gen} reason={reason}");
@@ -1955,10 +2059,19 @@ fn schedule_snapshot(
     reason:       &'static str,
     delay:        Duration,
 ) {
+    let base_frame_gen = frame_gen.get();
     let wv = wv.clone();
     glib::timeout_add_local(delay, move || {
         if !alive.get() {
             trace!("[webkit] skip scheduled snapshot closed tab={tab_id} token={token} reason={reason}");
+        } else if (reason.contains("settle") || reason == "spa-late")
+            && frame_gen.get() != base_frame_gen
+        {
+            trace!(
+                "[webkit] skip scheduled snapshot tab={tab_id} token={token} reason={reason} base_gen={} latest_gen={}",
+                base_frame_gen,
+                frame_gen.get()
+            );
         } else if schedule_gen.get() == token {
             request_snapshot_now(
                 &wv, w, h, tab_id, tx.clone(), Rc::clone(&nav_id),
@@ -2064,6 +2177,16 @@ fn take_snapshot(
 
                 trace!("[webkit] FrameReady tab={tab_id} nav={nav_id} gen={gen} reason={reason} in {}ms: {} bytes",
                     started.elapsed().as_millis(), pixels.len());
+                perf_mark_tab("snapshot-completed", tab_id);
+                if std::env::var_os("RASHAMON_PERF").is_some() {
+                    eprintln!(
+                        "[perf] snapshot_capture_ms={} reason={} bytes={}",
+                        started.elapsed().as_millis(),
+                        reason,
+                        pixels.len()
+                    );
+                }
+                perf_mark_tab("frame-ready-emitted", tab_id);
                 let _ = tx.try_send(Reply::FrameReady {
                     tab_id, nav_id, gen, reason, pixels,
                     width: sw, height: sh, title, url,

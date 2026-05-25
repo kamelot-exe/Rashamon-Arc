@@ -1,6 +1,6 @@
 //! Framebuffer abstraction for direct display output.
 
-/// RGB888 pixel — stored internally as BGR (blue at lowest byte address).
+/// RGB pixel — stored internally as BGRA32 (blue at lowest byte address).
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Pixel {
@@ -17,13 +17,13 @@ impl Pixel {
 pub struct Framebuffer {
     pub width: u32,
     pub height: u32,
-    pub stride: u32,   // bytes per row (width * 3, aligned to 4 bytes)
+    pub stride: u32,   // bytes per row (width * 4)
     pub data: Vec<u8>,
 }
 
 impl Framebuffer {
     pub fn new(width: u32, height: u32) -> Self {
-        let stride = (width * 3 + 3) & !3;
+        let stride = width * 4;
         let size   = (stride * height) as usize;
         Self { width, height, stride, data: vec![0u8; size] }
     }
@@ -31,16 +31,17 @@ impl Framebuffer {
     #[inline]
     pub fn set_pixel(&mut self, x: u32, y: u32, pixel: Pixel) {
         if x >= self.width || y >= self.height { return; }
-        let off = (y * self.stride + x * 3) as usize;
+        let off = (y * self.stride + x * 4) as usize;
         self.data[off]     = pixel.b;
         self.data[off + 1] = pixel.g;
         self.data[off + 2] = pixel.r;
+        self.data[off + 3] = 0;
     }
 
     #[inline]
     pub fn get_pixel(&self, x: u32, y: u32) -> Pixel {
         if x >= self.width || y >= self.height { return Pixel::BLACK; }
-        let off = (y * self.stride + x * 3) as usize;
+        let off = (y * self.stride + x * 4) as usize;
         Pixel { b: self.data[off], g: self.data[off + 1], r: self.data[off + 2] }
     }
 
@@ -54,21 +55,22 @@ impl Framebuffer {
         if x0 >= x1 || y0 >= y1 { return; }
 
         let cols      = (x1 - x0) as usize;
-        let row_bytes = cols * 3;
+        let row_bytes = cols * 4;
         let stride    = self.stride as usize;
 
         // Write first row pixel by pixel.
-        let row0 = (y0 * self.stride + x0 * 3) as usize;
+        let row0 = (y0 * self.stride + x0 * 4) as usize;
         for c in 0..cols {
-            let off = row0 + c * 3;
+            let off = row0 + c * 4;
             self.data[off]     = color.b;
             self.data[off + 1] = color.g;
             self.data[off + 2] = color.r;
+            self.data[off + 3] = 0;
         }
 
         // Clone first row into every subsequent row with a single memcpy.
         for row in (y0 + 1)..y1 {
-            let dst = (row as usize) * stride + x0 as usize * 3;
+            let dst = (row as usize) * stride + x0 as usize * 4;
             self.data.copy_within(row0..row0 + row_bytes, dst);
         }
     }
@@ -80,12 +82,13 @@ impl Framebuffer {
 
         // Fill row 0.
         for x in 0..width {
-            let off = x * 3;
+            let off = x * 4;
             self.data[off]     = color.b;
             self.data[off + 1] = color.g;
             self.data[off + 2] = color.r;
+            self.data[off + 3] = 0;
         }
-        let row_bytes = width * 3;
+        let row_bytes = width * 4;
 
         // Broadcast row 0 to all remaining rows.
         for row in 1..self.height as usize {
@@ -101,9 +104,9 @@ impl Framebuffer {
         let w = w.min(src.width.saturating_sub(sx)).min(self.width.saturating_sub(dx));
         let h = h.min(src.height.saturating_sub(sy)).min(self.height.saturating_sub(dy));
         for row in 0..h {
-            let s = ((sy + row) * src.stride  + sx * 3) as usize;
-            let d = ((dy + row) * self.stride + dx * 3) as usize;
-            let n = (w * 3) as usize;
+            let s = ((sy + row) * src.stride  + sx * 4) as usize;
+            let d = ((dy + row) * self.stride + dx * 4) as usize;
+            let n = (w * 4) as usize;
             self.data[d..d + n].copy_from_slice(&src.data[s..s + n]);
         }
     }

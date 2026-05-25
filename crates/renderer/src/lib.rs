@@ -17,7 +17,7 @@ mod servo_host;
 mod webkit_engine;
 
 pub use engine::RenderEngine;
-pub use engine_trait::{ContentEngine, CursorKind, EngineEvent, EngineFrame};
+pub use engine_trait::{ContentEngine, CursorKind, EngineEvent, EngineFrame, EnginePerfStats};
 pub use framebuffer::Framebuffer;
 pub use permissions::{
     origin_from_url, DecisionSource, PermissionDecision, PermissionKind, PermissionStore,

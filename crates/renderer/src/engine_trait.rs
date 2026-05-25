@@ -3,6 +3,12 @@
 use crate::framebuffer::Framebuffer;
 use crate::permissions::{PermissionDecision, PermissionKind};
 
+#[derive(Debug, Clone, Copy, Default)]
+pub struct EnginePerfStats {
+    pub live_webviews: usize,
+    pub suspended_tabs: usize,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CursorKind {
     Default,
@@ -48,6 +54,7 @@ pub enum EngineEvent {
         blocked_count: u64,
     },
     CursorChanged(CursorKind),
+    FrameReady { reason: &'static str },
 }
 
 /// Whether the engine wrote real pixels into the framebuffer.
@@ -135,6 +142,9 @@ pub trait ContentEngine: Send {
     /// Drain queued `(tab_id, event)` pairs produced since the last call.
     /// `tab_id == 0` means "the active tab" — stubs always emit 0.
     fn poll_events(&mut self) -> Vec<(u64, EngineEvent)>;
+    fn perf_stats(&self) -> EnginePerfStats {
+        EnginePerfStats::default()
+    }
 
     fn title(&self)       -> Option<String>;
     fn current_url(&self) -> Option<String>;

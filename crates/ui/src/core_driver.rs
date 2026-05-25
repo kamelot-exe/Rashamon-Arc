@@ -670,10 +670,12 @@ impl BrowserCoreDriver {
         }
     }
 
-    pub(crate) fn poll_engine_events(&mut self) {
-        for (tab_id, ev) in self.engine.poll_events() {
+    pub(crate) fn poll_engine_events(&mut self) -> Vec<(u64, EngineEvent)> {
+        let events = self.engine.poll_events();
+        for (tab_id, ev) in events.iter().cloned() {
             self.apply_engine_event(tab_id, ev);
         }
+        events
     }
 
     fn apply_engine_event(&mut self, tab_id: u64, ev: EngineEvent) {
@@ -803,6 +805,7 @@ impl BrowserCoreDriver {
                     self.cursor = cursor;
                 }
             }
+            EngineEvent::FrameReady { .. } => {}
             EngineEvent::LoadStarted => {
                 let frame = self.state.frame_count;
                 if let Some(tab) = self

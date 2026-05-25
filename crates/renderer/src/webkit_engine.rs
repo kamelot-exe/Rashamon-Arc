@@ -240,6 +240,7 @@ pub struct WebKitDriver {
     normal_context: webkit2gtk::WebContext,
     download_seq: Rc<Cell<u64>>,
     active_downloads: Rc<Cell<u32>>,
+    blocked_by_origin: Rc<RefCell<HashMap<String, u64>>>,
     w:        u32,
     h:        u32,
     suspend_after: Duration,
@@ -270,6 +271,7 @@ impl WebKitEngine {
         let active_downloads = Rc::new(Cell::new(0));
         let pending_permission = Rc::new(RefCell::new(None));
         let permission_seq = Rc::new(Cell::new(0));
+        let blocked_by_origin = Rc::new(RefCell::new(HashMap::new()));
         let adblock_allowlist_path = rashamon_data_dir().join("adblock_allowlist.json");
         let mut adblock = AdblockEngine::new();
         adblock.load_allowlist_from_path(&adblock_allowlist_path);
@@ -314,6 +316,7 @@ impl WebKitEngine {
             normal_context,
             download_seq,
             active_downloads,
+            blocked_by_origin,
             w:    content_w,
             h:    content_h,
             suspend_after,
@@ -735,6 +738,7 @@ impl WebKitDriver {
                     let entry = make_tab_entry(
                         tab_id, is_private, self.w, self.h, self.reply_tx.clone(),
                         Rc::clone(&self.adblock),
+                        Rc::clone(&self.blocked_by_origin),
                         Rc::clone(&self.permissions),
                         Rc::clone(&self.pending_permission),
                         Rc::clone(&self.permission_seq),
@@ -819,7 +823,8 @@ impl WebKitDriver {
                         if let Some(reason) = adblock_block_reason(
                             &self.adblock, &url, &wv_url(&entry.webview), entry.is_private,
                         ) {
-                            log_adblock_block(&url, &reason);
+                            log_adblock_block_with_kind(&url, &reason, "navigation-preload");
+                            increment_origin_block_count(&self.blocked_by_origin, &wv_url(&entry.webview));
                             let _ = self.reply_tx.try_send(Reply::LoadFailed {
                                 tab_id,
                                 nav_id,
@@ -1226,6 +1231,7 @@ impl WebKitDriver {
                         &self.reply_tx,
                         &self.permissions,
                         &self.adblock,
+                        &self.blocked_by_origin,
                         &origin,
                         private,
                     );
@@ -1244,6 +1250,7 @@ impl WebKitDriver {
                         &self.reply_tx,
                         &self.permissions,
                         &self.adblock,
+                        &self.blocked_by_origin,
                         &origin,
                         private,
                     );
@@ -1273,6 +1280,7 @@ impl WebKitDriver {
                         &self.reply_tx,
                         &self.permissions,
                         &self.adblock,
+                        &self.blocked_by_origin,
                         &origin,
                         private,
                     );
@@ -1378,6 +1386,7 @@ impl WebKitDriver {
             self.h,
             self.reply_tx.clone(),
             Rc::clone(&self.adblock),
+            Rc::clone(&self.blocked_by_origin),
             Rc::clone(&self.permissions),
             Rc::clone(&self.pending_permission),
             Rc::clone(&self.permission_seq),
@@ -1410,6 +1419,7 @@ fn make_tab_entry(
     h:         u32,
     reply_tx:  mpsc::SyncSender<Reply>,
     adblock:   Rc<RefCell<AdblockEngine>>,
+    blocked_by_origin: Rc<RefCell<HashMap<String, u64>>>,
     permissions: Rc<RefCell<PermissionStore>>,
     pending_permission: Rc<RefCell<Option<PendingPermission>>>,
     permission_seq: Rc<Cell<u64>>,
@@ -1507,6 +1517,7 @@ fn make_tab_entry(
         let tx = reply_tx.clone();
         let nc = Rc::clone(&nav_id_cell);
         let ab = Rc::clone(&adblock);
+        let blocked_by_origin = Rc::clone(&blocked_by_origin);
         webview.connect_decide_policy(move |wv, decision, decision_type| {
             let uri = match decision_type {
                 PolicyDecisionType::NavigationAction | PolicyDecisionType::NewWindowAction => {
@@ -1516,28 +1527,55 @@ fn make_tab_entry(
                         .and_then(|a| a.request())
                         .and_then(|r| r.uri())
                         .map(|s| s.to_string())
+                        .map(|u| (u, "policy-navigation", true))
                 }
                 PolicyDecisionType::Response => decision
                     .downcast_ref::<ResponsePolicyDecision>()
                     .and_then(|d| d.request())
                     .and_then(|r| r.uri())
-                    .map(|s| s.to_string()),
+                    .map(|s| s.to_string())
+                    .map(|u| (u, "policy-response", false)),
                 _ => None,
             };
-            let Some(uri) = uri else {
+            let Some((uri, kind, emit_load_failed)) = uri else {
                 return false;
             };
             if let Some(reason) = adblock_block_reason(&ab, &uri, &wv_url(wv), is_private) {
-                log_adblock_block(&uri, &reason);
+                log_adblock_block_with_kind(&uri, &reason, kind);
+                increment_origin_block_count(&blocked_by_origin, &wv_url(wv));
                 decision.ignore();
-                let _ = tx.try_send(Reply::LoadFailed {
-                    tab_id,
-                    nav_id: nc.get(),
-                    reason: format!("Blocked by adblock ({reason})"),
-                });
+                if emit_load_failed {
+                    let _ = tx.try_send(Reply::LoadFailed {
+                        tab_id,
+                        nav_id: nc.get(),
+                        reason: format!("Blocked by adblock ({reason})"),
+                    });
+                }
                 return true;
             }
             false
+        });
+    }
+
+    // resource-load-started is the best in-process hook for subresource request
+    // interception in this WebKitGTK path. We cannot cancel directly here, so we
+    // rewrite blocked requests to a local data URI as a safe no-network fallback.
+    {
+        let ab = Rc::clone(&adblock);
+        let blocked_by_origin = Rc::clone(&blocked_by_origin);
+        webview.connect_resource_load_started(move |wv, _resource, request| {
+            let Some(uri) = request.uri().map(|u| u.to_string()) else {
+                return;
+            };
+            let page_url = wv_url(wv);
+            if uri == page_url {
+                return;
+            }
+            if let Some(reason) = adblock_block_reason(&ab, &uri, &page_url, is_private) {
+                log_adblock_block_with_kind(&uri, &reason, "subresource");
+                request.set_uri("data:text/plain;charset=utf-8,blocked%20by%20Rashamon%20Arc%20adblock");
+                increment_origin_block_count(&blocked_by_origin, &page_url);
+            }
         });
     }
 
@@ -1913,6 +1951,7 @@ fn send_site_info(
     tx: &mpsc::SyncSender<Reply>,
     permissions: &Rc<RefCell<PermissionStore>>,
     adblock: &Rc<RefCell<AdblockEngine>>,
+    blocked_by_origin: &Rc<RefCell<HashMap<String, u64>>>,
     origin: &str,
     private: bool,
 ) {
@@ -1926,7 +1965,11 @@ fn send_site_info(
     let adblock_ref = adblock.borrow();
     let adblock_enabled = adblock_ref.is_enabled();
     let adblock_allowlisted = adblock_ref.is_allowlisted_domain(origin, private);
-    let blocked_count = adblock_ref.blocked_count();
+    let blocked_count = blocked_by_origin
+        .borrow()
+        .get(&origin_key(origin))
+        .copied()
+        .unwrap_or(0);
     let _ = tx.try_send(Reply::SitePermissions {
         origin: origin.to_string(),
         decisions,
@@ -2210,8 +2253,28 @@ fn adblock_block_reason(
     blocked.then(|| reason.unwrap_or_else(|| "matched rule".to_string()))
 }
 
-fn log_adblock_block(url: &str, reason: &str) {
-    trace!("[adblock] blocked {url} reason={reason}");
+fn log_adblock_block_with_kind(url: &str, reason: &str, kind: &str) {
+    trace!("[adblock] blocked {url} reason={reason} kind={kind}");
+    if std::env::var_os("RASHAMON_PERF").is_some() {
+        eprintln!("[perf] adblock_blocked kind={kind}");
+    }
+}
+
+fn origin_key(origin_or_url: &str) -> String {
+    origin_from_url(origin_or_url).unwrap_or_else(|| origin_or_url.to_string())
+}
+
+fn increment_origin_block_count(
+    blocked_by_origin: &Rc<RefCell<HashMap<String, u64>>>,
+    origin_or_url: &str,
+) {
+    if origin_or_url.is_empty() {
+        return;
+    }
+    let key = origin_key(origin_or_url);
+    let mut counts = blocked_by_origin.borrow_mut();
+    let next = counts.get(&key).copied().unwrap_or(0).saturating_add(1);
+    counts.insert(key, next);
 }
 
 fn connect_downloads_for_context(

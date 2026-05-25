@@ -751,6 +751,15 @@ fn smoke_adblock_model() -> Result<(), Box<dyn std::error::Error>> {
     if !blocked || reason.as_deref() != Some("doubleclick.net") {
         return Err(smoke_fail("adblock did not block default domain"));
     }
+    let (blocked_subresource, _) = engine.should_block(
+        "https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js",
+        "https://example.com",
+    );
+    if !blocked_subresource {
+        return Err(smoke_fail(
+            "adblock did not block subresource-like tracker URL",
+        ));
+    }
 
     engine.allowlist_domain("doubleclick.net");
     let (blocked, _) =

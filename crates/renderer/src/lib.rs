@@ -27,19 +27,38 @@ pub use webkit_engine::download_destination_for_test;
 #[cfg(feature = "webkit")]
 pub use webkit_engine::{
     webext_blocked_events_for_test, webext_is_available_for_test, webext_is_configured_for_test,
-    webext_is_disabled_for_test, webext_ready_for_test,
+    webext_is_disabled_for_test, webext_ready_for_test, webext_rules_error_for_test,
+    webext_rules_ok_for_test,
 };
 #[cfg(not(feature = "webkit"))]
 pub fn download_destination_for_test(filename: &str) -> std::path::PathBuf {
     std::path::PathBuf::from(filename)
 }
 #[cfg(not(feature = "webkit"))]
-pub fn webext_is_configured_for_test() -> bool { false }
+pub fn webext_is_configured_for_test() -> bool {
+    false
+}
 #[cfg(not(feature = "webkit"))]
-pub fn webext_is_available_for_test() -> bool { false }
+pub fn webext_is_available_for_test() -> bool {
+    false
+}
 #[cfg(not(feature = "webkit"))]
-pub fn webext_is_disabled_for_test() -> bool { false }
+pub fn webext_is_disabled_for_test() -> bool {
+    false
+}
 #[cfg(not(feature = "webkit"))]
-pub fn webext_ready_for_test() -> bool { false }
+pub fn webext_ready_for_test() -> bool {
+    false
+}
 #[cfg(not(feature = "webkit"))]
-pub fn webext_blocked_events_for_test() -> u64 { 0 }
+pub fn webext_blocked_events_for_test() -> u64 {
+    0
+}
+#[cfg(not(feature = "webkit"))]
+pub fn webext_rules_ok_for_test() -> u64 {
+    0
+}
+#[cfg(not(feature = "webkit"))]
+pub fn webext_rules_error_for_test() -> u64 {
+    0
+}

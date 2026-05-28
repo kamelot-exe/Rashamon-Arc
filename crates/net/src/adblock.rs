@@ -8,6 +8,8 @@ use std::collections::HashSet;
 use std::fs;
 use std::path::Path;
 
+pub const ADBLOCK_RULE_PAYLOAD_VERSION: u32 = 1;
+
 /// A single adblock rule.
 #[derive(Debug, Clone)]
 pub struct Rule {
@@ -26,6 +28,35 @@ pub enum RuleKind {
     Domain(String),
     /// URL substring match, used for path-sensitive starter rules.
     Substring(String),
+}
+
+/// Compact export model used to sync the current effective rules to the
+/// WebExtension path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AdblockRulePayload {
+    pub version: u32,
+    pub enabled: bool,
+    pub blocked_domains: Vec<String>,
+    pub blocked_substrings: Vec<String>,
+    pub allowlist_domains: Vec<String>,
+}
+
+impl AdblockRulePayload {
+    pub fn to_sync_text(&self) -> String {
+        let mut out = String::new();
+        out.push_str(&format!("version={}\n", self.version));
+        out.push_str(if self.enabled { "enabled=1\n" } else { "enabled=0\n" });
+        for domain in &self.blocked_domains {
+            push_payload_line(&mut out, "block-domain", domain);
+        }
+        for pattern in &self.blocked_substrings {
+            push_payload_line(&mut out, "block-substring", pattern);
+        }
+        for domain in &self.allowlist_domains {
+            push_payload_line(&mut out, "allow-domain", domain);
+        }
+        out
+    }
 }
 
 /// The adblock engine — holds all rules and evaluates requests.
@@ -198,6 +229,36 @@ impl AdblockEngine {
         entries
     }
 
+    pub fn export_rule_payload_for_context(&self, private: bool) -> AdblockRulePayload {
+        let mut blocked_domains = Vec::new();
+        let mut blocked_substrings = Vec::new();
+        for rule in &self.rules {
+            match &rule.kind {
+                RuleKind::Domain(domain) => blocked_domains.push(domain.clone()),
+                RuleKind::Substring(pattern) => blocked_substrings.push(pattern.clone()),
+            }
+        }
+
+        let mut allowlist_domains = self.allowlist_entries();
+        if private {
+            allowlist_domains.extend(self.session_allowlist.iter().cloned());
+            allowlist_domains.sort();
+            allowlist_domains.dedup();
+        }
+
+        AdblockRulePayload {
+            version: ADBLOCK_RULE_PAYLOAD_VERSION,
+            enabled: self.enabled,
+            blocked_domains,
+            blocked_substrings,
+            allowlist_domains,
+        }
+    }
+
+    pub fn export_rule_sync_text_for_context(&self, private: bool) -> String {
+        self.export_rule_payload_for_context(private).to_sync_text()
+    }
+
     pub fn load_allowlist_from_path(&mut self, path: &Path) {
         let Ok(text) = fs::read_to_string(path) else { return };
         self.allowlist.clear();
@@ -344,6 +405,17 @@ fn json_str(s: &str) -> String {
     out
 }
 
+fn push_payload_line(out: &mut String, key: &str, value: &str) {
+    let value = value.trim();
+    if value.is_empty() || value.contains('\n') || value.contains('\r') {
+        return;
+    }
+    out.push_str(key);
+    out.push('=');
+    out.push_str(value);
+    out.push('\n');
+}
+
 #[cfg(test)]
 mod tests {
     use super::AdblockEngine;
@@ -406,5 +478,32 @@ mod tests {
             engine.should_block_for_context("https://ad.doubleclick.net/page", "", false);
         assert!(!private_blocked);
         assert!(normal_blocked);
+    }
+
+    #[test]
+    fn exports_structured_effective_rules() {
+        let mut engine = AdblockEngine::new();
+        engine.allowlist_domain("https://example.com:443/path");
+        engine.allowlist_domain_for_context("session.example", true);
+        engine.set_enabled(false);
+
+        let normal = engine.export_rule_payload_for_context(false);
+        assert_eq!(normal.version, 1);
+        assert!(!normal.enabled);
+        assert!(normal.blocked_domains.iter().any(|d| d == "doubleclick.net"));
+        assert!(normal.blocked_substrings.iter().any(|p| p == "facebook.com/tr"));
+        assert_eq!(normal.allowlist_domains, vec!["example.com".to_string()]);
+
+        let private = engine.export_rule_payload_for_context(true);
+        assert_eq!(
+            private.allowlist_domains,
+            vec!["example.com".to_string(), "session.example".to_string()]
+        );
+
+        let text = private.to_sync_text();
+        assert!(text.starts_with("version=1\nenabled=0\n"));
+        assert!(text.contains("block-domain=doubleclick.net\n"));
+        assert!(text.contains("block-substring=facebook.com/tr\n"));
+        assert!(text.contains("allow-domain=session.example\n"));
     }
 }

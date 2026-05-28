@@ -63,6 +63,8 @@ static WEBEXT_CONFIGURED: AtomicBool = AtomicBool::new(false);
 static WEBEXT_DISABLED: AtomicBool = AtomicBool::new(false);
 static WEBEXT_READY: AtomicBool = AtomicBool::new(false);
 static WEBEXT_BLOCKED_EVENTS: AtomicU64 = AtomicU64::new(0);
+static WEBEXT_RULES_OK: AtomicU64 = AtomicU64::new(0);
+static WEBEXT_RULES_ERROR: AtomicU64 = AtomicU64::new(0);
 
 fn perf_mark_global(stage: &'static str) {
     if !perf_enabled() {
@@ -118,6 +120,14 @@ pub fn webext_ready_for_test() -> bool {
 
 pub fn webext_blocked_events_for_test() -> u64 {
     WEBEXT_BLOCKED_EVENTS.load(Ordering::Relaxed)
+}
+
+pub fn webext_rules_ok_for_test() -> u64 {
+    WEBEXT_RULES_OK.load(Ordering::Relaxed)
+}
+
+pub fn webext_rules_error_for_test() -> u64 {
+    WEBEXT_RULES_ERROR.load(Ordering::Relaxed)
 }
 
 // ── IPC ───────────────────────────────────────────────────────────────────────
@@ -285,6 +295,8 @@ impl WebKitEngine {
         WEBEXT_DISABLED.store(false, Ordering::Relaxed);
         WEBEXT_READY.store(false, Ordering::Relaxed);
         WEBEXT_BLOCKED_EVENTS.store(0, Ordering::Relaxed);
+        WEBEXT_RULES_OK.store(0, Ordering::Relaxed);
+        WEBEXT_RULES_ERROR.store(0, Ordering::Relaxed);
         perf_mark_global("gtk-init-start");
         if std::env::var_os("GDK_BACKEND").is_none() {
             std::env::set_var("GDK_BACKEND", "x11,wayland");
@@ -1198,12 +1210,14 @@ impl WebKitDriver {
                 Ok(Cmd::AdblockAllowDomain { domain }) => {
                     self.adblock.borrow_mut().allowlist_domain(&domain);
                     self.adblock.borrow().save_allowlist_to_path(&self.adblock_allowlist_path);
+                    self.sync_webext_rules_to_live_tabs();
                     trace!("[adblock] allowlisted {domain}");
                 }
 
                 Ok(Cmd::AdblockRemoveAllowDomain { domain }) => {
                     self.adblock.borrow_mut().remove_allowlist_domain(&domain);
                     self.adblock.borrow().save_allowlist_to_path(&self.adblock_allowlist_path);
+                    self.sync_webext_rules_to_live_tabs();
                     trace!("[adblock] removed allowlist {domain}");
                 }
 
@@ -1306,6 +1320,7 @@ impl WebKitDriver {
                         allowlisted,
                         private,
                     );
+                    self.sync_webext_rules_to_live_tabs();
                     send_site_info(
                         &self.reply_tx,
                         &self.permissions,
@@ -1326,6 +1341,12 @@ impl WebKitDriver {
         }
 
         self.suspend_inactive_tabs(false);
+    }
+
+    fn sync_webext_rules_to_live_tabs(&self) {
+        for (tab_id, entry) in &self.tabs {
+            send_webext_rules(*tab_id, &entry.webview, &self.adblock, entry.is_private);
+        }
     }
 
     fn suspend_inactive_tabs(&mut self, force: bool) {
@@ -2078,9 +2099,7 @@ fn configure_web_extension(context: &webkit2gtk::WebContext) {
     WEBEXT_AVAILABLE.store(true, Ordering::Relaxed);
 
     context.set_web_extensions_directory(&ext_dir);
-    context.set_web_extensions_initialization_user_data(&glib::Variant::from(
-        "doubleclick.net,googlesyndication.com",
-    ));
+    context.set_web_extensions_initialization_user_data(&glib::Variant::from(""));
     context.connect_initialize_web_extensions(|_| {
         trace!("[adblock-webext] initialize_web_extensions signal");
     });
@@ -2139,23 +2158,7 @@ fn send_webext_ping_and_rules(
         return;
     }
 
-    let block_csv = "doubleclick.net,googlesyndication.com,google-analytics.com,googletagmanager.com,facebook.net,facebook.com/tr,adsystem.com,adservice.google.com,scorecardresearch.com".to_string();
-    let allow_csv = if private {
-        String::new()
-    } else {
-        adblock.borrow().allowlist_entries().join(",")
-    };
-    let rules = UserMessage::new(
-        "rashamon-webext-set-rules",
-        Some(&glib::Variant::from((block_csv, allow_csv))),
-    );
-    webview.send_message_to_page(&rules, None::<&gio::Cancellable>, move |result| {
-        if let Err(err) = result {
-            trace!("[adblock-webext] rules sync failed tab={tab_id}: {err}");
-        } else {
-            trace!("[adblock-webext] rules sync ok tab={tab_id}");
-        }
-    });
+    send_webext_rules(tab_id, webview, adblock, private);
 
     let ping = UserMessage::new(
         "rashamon-webext-ping",
@@ -2189,6 +2192,68 @@ fn send_webext_ping_and_rules(
             match result {
                 Ok(reply) => trace!("[webext] probe reply tab={tab_id}: {:?}", reply.name()),
                 Err(err) => trace!("[webext] probe failed tab={tab_id}: {err}"),
+            }
+        });
+    }
+}
+
+fn send_webext_rules(
+    tab_id: u64,
+    webview: &webkit2gtk::WebView,
+    adblock: &Rc<RefCell<AdblockEngine>>,
+    private: bool,
+) {
+    use webkit2gtk::{UserMessage, UserMessageExt, WebViewExt};
+
+    if !WEBEXT_CONFIGURED.load(Ordering::Relaxed) {
+        return;
+    }
+
+    let payload = adblock.borrow().export_rule_sync_text_for_context(private);
+    let rules = UserMessage::new(
+        "rashamon-webext-set-rules",
+        Some(&glib::Variant::from((payload,))),
+    );
+    webview.send_message_to_page(&rules, None::<&gio::Cancellable>, move |result| {
+        match result {
+            Ok(reply) => {
+                let name = reply.name().map(|n| n.to_string()).unwrap_or_default();
+                if name == "rashamon-webext-rules-ok" {
+                    WEBEXT_RULES_OK.fetch_add(1, Ordering::Relaxed);
+                    trace!("[adblock-webext] rules sync ok tab={tab_id}");
+                } else {
+                    WEBEXT_RULES_ERROR.fetch_add(1, Ordering::Relaxed);
+                    trace!("[adblock-webext] rules sync unexpected tab={tab_id}: {name}");
+                }
+            }
+            Err(err) => {
+                WEBEXT_RULES_ERROR.fetch_add(1, Ordering::Relaxed);
+                trace!("[adblock-webext] rules sync failed tab={tab_id}: {err}");
+            }
+        }
+    });
+
+    if std::env::var_os("RASHAMON_WEBEXT_SMOKE_INVALID_RULES").is_some() {
+        let invalid = UserMessage::new(
+            "rashamon-webext-set-rules",
+            Some(&glib::Variant::from(("version=999\nenabled=1\n",))),
+        );
+        webview.send_message_to_page(&invalid, None::<&gio::Cancellable>, move |result| {
+            match result {
+                Ok(reply) => {
+                    let name = reply.name().map(|n| n.to_string()).unwrap_or_default();
+                    if name == "rashamon-webext-rules-error" {
+                        WEBEXT_RULES_ERROR.fetch_add(1, Ordering::Relaxed);
+                        trace!("[adblock-webext] invalid rules rejected tab={tab_id}");
+                    } else {
+                        trace!(
+                            "[adblock-webext] invalid rules reply unexpected tab={tab_id}: {name}"
+                        );
+                    }
+                }
+                Err(err) => {
+                    trace!("[adblock-webext] invalid rules probe failed tab={tab_id}: {err}")
+                }
             }
         });
     }

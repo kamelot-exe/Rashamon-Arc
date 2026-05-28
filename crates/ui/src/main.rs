@@ -34,7 +34,8 @@ use rashamon_renderer::{
     download_destination_for_test, origin_from_url, CursorKind, DecisionSource, EngineEvent, EngineFrame,
     Framebuffer, PermissionDecision, PermissionKind, PermissionStore, RenderEngine,
     webext_blocked_events_for_test, webext_is_available_for_test, webext_is_configured_for_test,
-    webext_is_disabled_for_test, webext_ready_for_test,
+    webext_is_disabled_for_test, webext_ready_for_test, webext_rules_error_for_test,
+    webext_rules_ok_for_test,
 };
 use rashamon_renderer::framebuffer::Pixel;
 use ui_state::{BrowserState, DirtyFlags, DownloadStatus, OverlayKind, PageState, TabId, derive_title};
@@ -769,6 +770,23 @@ fn smoke_adblock_model() -> Result<(), Box<dyn std::error::Error>> {
     if blocked {
         return Err(smoke_fail("adblock allowlist did not override block rule"));
     }
+    let payload = engine.export_rule_payload_for_context(false);
+    if payload.version != 1
+        || !payload.enabled
+        || !payload.blocked_domains.iter().any(|domain| domain == "doubleclick.net")
+        || !payload.blocked_substrings.iter().any(|pattern| pattern == "facebook.com/tr")
+        || !payload.allowlist_domains.iter().any(|domain| domain == "doubleclick.net")
+    {
+        return Err(smoke_fail("adblock structured rule export is incomplete"));
+    }
+    let sync_text = engine.export_rule_sync_text_for_context(false);
+    if !sync_text.contains("version=1\n")
+        || !sync_text.contains("block-domain=doubleclick.net\n")
+        || !sync_text.contains("block-substring=facebook.com/tr\n")
+        || !sync_text.contains("allow-domain=doubleclick.net\n")
+    {
+        return Err(smoke_fail("adblock rule sync payload is incomplete"));
+    }
 
     let mut private_engine = AdblockEngine::new();
     let (blocked, _) =
@@ -807,6 +825,13 @@ fn smoke_adblock_model() -> Result<(), Box<dyn std::error::Error>> {
     );
     if blocked_private || !blocked_normal {
         return Err(smoke_fail("private adblock allowlist leaked into normal context"));
+    }
+    let normal_payload = private_session.export_rule_payload_for_context(false);
+    let private_payload = private_session.export_rule_payload_for_context(true);
+    if normal_payload.allowlist_domains.iter().any(|domain| domain == "doubleclick.net")
+        || !private_payload.allowlist_domains.iter().any(|domain| domain == "doubleclick.net")
+    {
+        return Err(smoke_fail("private adblock allowlist export did not preserve context"));
     }
 
     std::fs::write(&path, "{not-json")?;
@@ -1022,6 +1047,8 @@ fn run_webkit_smoke_test() -> Result<SmokePerfMetrics, Box<dyn std::error::Error
 
     if webext_is_configured_for_test() && std::env::var_os("RASHAMON_DISABLE_WEBEXT").is_none() {
         let blocked_probe_before = webext_blocked_events_for_test();
+        let rules_ok_before = webext_rules_ok_for_test();
+        let rules_error_before = webext_rules_error_for_test();
         match smoke_wait_for(
             &mut state,
             &mut engine,
@@ -1032,6 +1059,34 @@ fn run_webkit_smoke_test() -> Result<SmokePerfMetrics, Box<dyn std::error::Error
             Ok(()) => {
                 perf_metrics.webext_handshake_ok = true;
                 smoke_log("[smoke] PASS webext runtime handshake");
+                if smoke_wait_for(
+                    &mut state,
+                    &mut engine,
+                    "webext valid rules sync",
+                    Duration::from_secs(3),
+                    |_s, _| webext_rules_ok_for_test() > rules_ok_before,
+                )
+                .is_ok()
+                {
+                    smoke_log("[smoke] PASS webext valid rules sync");
+                } else {
+                    smoke_log("[smoke] SKIP webext valid rules sync (not observed)");
+                }
+                if std::env::var_os("RASHAMON_WEBEXT_SMOKE_INVALID_RULES").is_some() {
+                    if smoke_wait_for(
+                        &mut state,
+                        &mut engine,
+                        "webext invalid rules rejected",
+                        Duration::from_secs(3),
+                        |_s, _| webext_rules_error_for_test() > rules_error_before,
+                    )
+                    .is_ok()
+                    {
+                        smoke_log("[smoke] PASS webext invalid rules rejected");
+                    } else {
+                        smoke_log("[smoke] SKIP webext invalid rules rejection (not observed)");
+                    }
+                }
                 if smoke_wait_for(
                     &mut state,
                     &mut engine,

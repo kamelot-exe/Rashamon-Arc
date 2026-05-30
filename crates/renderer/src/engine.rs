@@ -114,6 +114,10 @@ impl RenderEngine {
         self.inner.set_active_tab(tab_id);
     }
 
+    pub fn set_tab_viewport(&mut self, tab_id: u64, width: u32, height: u32) {
+        self.inner.set_tab_viewport(tab_id, width, height);
+    }
+
     // ── Navigation ────────────────────────────────────────────────────────────
 
     pub fn navigate(&mut self, url: &str, nav_id: u64) -> Result<(), Box<dyn std::error::Error>> {
@@ -183,6 +187,15 @@ impl RenderEngine {
         x: u32, y: u32, w: u32, h: u32,
     ) -> Result<EngineFrame, Box<dyn std::error::Error>> {
         self.inner.render_into(fb, x, y, w, h)
+    }
+
+    pub fn render_tab_into(
+        &mut self,
+        tab_id: u64,
+        fb: &mut Framebuffer,
+        x: u32, y: u32, w: u32, h: u32,
+    ) -> Result<EngineFrame, Box<dyn std::error::Error>> {
+        self.inner.render_tab_into(tab_id, fb, x, y, w, h)
     }
 
     /// Drain `(tab_id, event)` pairs produced since the last call.

@@ -171,6 +171,9 @@ fn hit_chrome_bar(state: &BrowserState, x: u32, y: u32) -> UiHitTarget {
 }
 
 fn hit_content(state: &BrowserState, x: u32, y: u32) -> UiHitTarget {
+    if state.split_view.is_some() {
+        return UiHitTarget::Content;
+    }
     match state.active_tab().map(|tab| &tab.page_state) {
         Some(PageState::Error(_)) => {
             let (bx, by) = retry_btn_pos();

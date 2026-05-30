@@ -7,11 +7,13 @@
 
 use crate::input::{BrowserKey, MouseButton, PlatformEvent};
 use crate::hit_test::UiHitTarget;
-use crate::layout::{OVERLAY_VISIBLE, TOP_BAR_HEIGHT};
+use crate::layout::{FB_HEIGHT, FB_WIDTH, OVERLAY_VISIBLE, TOP_BAR_HEIGHT};
 use crate::omnibox::{self, InternalRoute, MatchEntry, OmniboxResult};
 use crate::persist;
 use crate::theme::ColorPalette;
-use crate::ui_state::{self, BrowserState, HoveredRegion, OverlayKind, PageState, TabId};
+use crate::ui_state::{
+    self, BrowserState, HoveredRegion, OverlayKind, PageState, SplitPane, TabId,
+};
 use rashamon_renderer::{
     origin_from_url, CursorKind, EngineEvent, PermissionDecision, PermissionKind, RenderEngine,
 };
@@ -44,6 +46,7 @@ pub(crate) enum BrowserAction {
     CloseActiveTab,
     CloseTab(TabId),
     SwitchTab(TabId),
+    ToggleSplitView,
     Scroll(i32),
     FocusAddressBar,
     AddressBarChar(char),
@@ -115,6 +118,7 @@ impl BrowserCoreDriver {
             BrowserAction::CloseActiveTab => self.close_active_tab(),
             BrowserAction::CloseTab(tab_id) => self.close_tab(tab_id),
             BrowserAction::SwitchTab(tab_id) => self.switch_tab(tab_id),
+            BrowserAction::ToggleSplitView => self.toggle_split_view(),
             BrowserAction::Scroll(delta) => {
                 self.state.scroll_by(delta);
                 self.engine.scroll(delta);
@@ -213,8 +217,29 @@ impl BrowserCoreDriver {
     }
 
     fn click_content(&mut self, x: u32, y: u32) {
+        let (content_x, content_y) = self.route_content_point(x, y, true);
         self.state.cancel_address_bar_edit();
-        self.engine.click(x, y.saturating_sub(TOP_BAR_HEIGHT));
+        self.engine.click(content_x, content_y);
+    }
+
+    fn route_content_point(&mut self, x: u32, y: u32, activate: bool) -> (u32, u32) {
+        let content_y = y.saturating_sub(TOP_BAR_HEIGHT);
+        if self.state.split_view.is_none() {
+            return (x, content_y);
+        }
+        let pane = self.state.split_pane_for_x(x);
+        let pane_x = match pane {
+            SplitPane::Left => 0,
+            SplitPane::Right => FB_WIDTH / 2,
+        };
+        if activate {
+            if self.state.split_active_pane() != Some(pane) {
+                if let Some(tab_id) = self.state.activate_split_pane(pane) {
+                    self.engine.set_active_tab(tab_id.raw());
+                }
+            }
+        }
+        (x.saturating_sub(pane_x), content_y)
     }
 
     fn content_key_name(key: BrowserKey) -> Option<&'static str> {
@@ -269,7 +294,11 @@ impl BrowserCoreDriver {
     ) -> bool {
         match event {
             PlatformEvent::Quit => self.dispatch(BrowserAction::Quit),
-            PlatformEvent::Tick | PlatformEvent::MouseUp { .. } | PlatformEvent::WindowResized { .. } => false,
+            PlatformEvent::Tick | PlatformEvent::MouseUp { .. } => false,
+            PlatformEvent::WindowResized { .. } => {
+                self.sync_split_viewports();
+                false
+            }
             PlatformEvent::KeyDown { key, modifiers } => {
                 let should_send_to_content = !modifiers.ctrl
                     && !self.state.address_bar_focused
@@ -307,7 +336,8 @@ impl BrowserCoreDriver {
                 let target = crate::hit_test::hit_test_ui(&self.state, x, y);
                 self.update_shell_cursor(&target);
                 if matches!(target, UiHitTarget::Content) {
-                    self.engine.mouse_move(x, y.saturating_sub(TOP_BAR_HEIGHT));
+                    let (content_x, content_y) = self.route_content_point(x, y, false);
+                    self.engine.mouse_move(content_x, content_y);
                 }
                 false
             }
@@ -325,7 +355,8 @@ impl BrowserCoreDriver {
                         }
                     }
                     MouseButton::Right if matches!(target, UiHitTarget::Content) => {
-                        self.engine.right_click(x, y.saturating_sub(TOP_BAR_HEIGHT));
+                        let (content_x, content_y) = self.route_content_point(x, y, true);
+                        self.engine.right_click(content_x, content_y);
                         false
                     }
                     _ => false,
@@ -403,6 +434,7 @@ impl BrowserCoreDriver {
             BrowserKey::Char('i') if ctrl => self.dispatch(BrowserAction::NewTab { private: true }),
             BrowserKey::Char('w') if ctrl => self.dispatch(BrowserAction::CloseActiveTab),
             BrowserKey::Char('r') if ctrl => self.dispatch(BrowserAction::Reload),
+            BrowserKey::Char('s') if ctrl && shift => self.dispatch(BrowserAction::ToggleSplitView),
             BrowserKey::Char('h') if ctrl => self.dispatch(BrowserAction::OpenOverlay(OverlayKind::History)),
             BrowserKey::Char('b') if ctrl => self.dispatch(BrowserAction::OpenOverlay(OverlayKind::Bookmarks)),
             BrowserKey::Char('f') if ctrl => self.dispatch(BrowserAction::FindOpen),
@@ -466,6 +498,7 @@ impl BrowserCoreDriver {
     }
 
     pub(crate) fn open_tab(&mut self, private: bool) {
+        let old_split = self.state.split_view;
         if private {
             self.state.open_private_tab();
         } else {
@@ -474,6 +507,8 @@ impl BrowserCoreDriver {
         let id = self.state.active_tab_id;
         self.engine.create_tab(id.raw(), private);
         self.engine.set_active_tab(id.raw());
+        self.restore_displaced_split_tabs(old_split);
+        self.sync_split_viewports();
     }
 
     fn close_active_tab(&mut self) {
@@ -489,6 +524,7 @@ impl BrowserCoreDriver {
             let new_id = self.state.active_tab_id;
             self.engine.create_tab(new_id.raw(), false);
         }
+        self.sync_split_viewports();
         self.sync_active_engine_tab();
     }
 
@@ -496,7 +532,10 @@ impl BrowserCoreDriver {
         if tab_id == self.state.active_tab_id {
             return;
         }
+        let old_split = self.state.split_view;
         self.state.activate_tab(tab_id);
+        self.restore_displaced_split_tabs(old_split);
+        self.sync_split_viewports();
         self.sync_active_engine_tab();
     }
 
@@ -510,6 +549,78 @@ impl BrowserCoreDriver {
             .filter(|url| !url.is_empty())
         {
             self.engine.navigate(&url, 0).ok();
+        }
+    }
+
+    fn toggle_split_view(&mut self) {
+        if self.state.split_view.is_some() {
+            let old_split = self.state.split_view;
+            self.state.exit_split_view();
+            if let Some(split) = old_split {
+                self.set_full_tab_viewport(split.left);
+                self.set_full_tab_viewport(split.right);
+            }
+            self.sync_active_engine_tab();
+            return;
+        }
+
+        let left = self.state.active_tab_id;
+        let right = if self.state.tabs.len() == 1 {
+            let private = self.state.active_tab().map_or(false, |tab| tab.is_private);
+            if private {
+                self.state.open_private_tab();
+            } else {
+                self.state.open_new_tab();
+            }
+            let id = self.state.active_tab_id;
+            self.engine.create_tab(id.raw(), private);
+            id
+        } else {
+            let pos = self
+                .state
+                .tabs
+                .iter()
+                .position(|tab| tab.id == left)
+                .unwrap_or(0);
+            let next = (pos + 1) % self.state.tabs.len();
+            self.state.tabs[next].id
+        };
+
+        self.state.enter_split_view(left, right, SplitPane::Left);
+        self.sync_split_viewports();
+        self.sync_active_engine_tab();
+    }
+
+    fn sync_split_viewports(&mut self) {
+        let Some(split) = self.state.split_view else {
+            self.set_full_tab_viewport(self.state.active_tab_id);
+            return;
+        };
+        let content_h = FB_HEIGHT.saturating_sub(TOP_BAR_HEIGHT);
+        let left_w = FB_WIDTH / 2;
+        let right_w = FB_WIDTH.saturating_sub(left_w);
+        self.engine.set_tab_viewport(split.left.raw(), left_w, content_h);
+        self.engine.set_tab_viewport(split.right.raw(), right_w, content_h);
+    }
+
+    fn set_full_tab_viewport(&mut self, tab_id: TabId) {
+        self.engine.set_tab_viewport(
+            tab_id.raw(),
+            FB_WIDTH,
+            FB_HEIGHT.saturating_sub(TOP_BAR_HEIGHT),
+        );
+    }
+
+    fn restore_displaced_split_tabs(&mut self, old_split: Option<ui_state::SplitViewState>) {
+        let Some(old_split) = old_split else { return };
+        let new_split = self.state.split_view;
+        for old_id in [old_split.left, old_split.right] {
+            let still_split = new_split.map_or(false, |split| {
+                split.left == old_id || split.right == old_id
+            });
+            if !still_split && self.state.tabs.iter().any(|tab| tab.id == old_id) {
+                self.set_full_tab_viewport(old_id);
+            }
         }
     }
 

@@ -80,6 +80,10 @@ pub trait ContentEngine: Send {
     /// For per-tab engines this does NOT trigger a page reload.
     fn set_active_tab(&mut self, _tab_id: u64) {}
 
+    /// Resize one tab's content viewport. Per-tab engines should use this to
+    /// make split panes lay out at pane size instead of full window size.
+    fn set_tab_viewport(&mut self, _tab_id: u64, _width: u32, _height: u32) {}
+
     // ── Navigation (operate on the currently active tab) ──────────────────────
 
     /// Navigate the active tab's WebView to `url`.
@@ -138,6 +142,19 @@ pub trait ContentEngine: Send {
         w:   u32,
         h:   u32,
     ) -> Result<EngineFrame, Box<dyn std::error::Error>>;
+
+    /// Composite a specific tab without changing the engine's input target.
+    fn render_tab_into(
+        &mut self,
+        _tab_id: u64,
+        fb:      &mut Framebuffer,
+        x:       u32,
+        y:       u32,
+        w:       u32,
+        h:       u32,
+    ) -> Result<EngineFrame, Box<dyn std::error::Error>> {
+        self.render_into(fb, x, y, w, h)
+    }
 
     /// Drain queued `(tab_id, event)` pairs produced since the last call.
     /// `tab_id == 0` means "the active tab" — stubs always emit 0.

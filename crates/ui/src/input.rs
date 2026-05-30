@@ -138,6 +138,7 @@ impl InputHandler {
                         Scancode::T if self.modifiers.ctrl => Some(BrowserKey::Char('t')),
                         Scancode::W if self.modifiers.ctrl => Some(BrowserKey::Char('w')),
                         Scancode::R if self.modifiers.ctrl => Some(BrowserKey::Char('r')),
+                        Scancode::S if self.modifiers.ctrl && self.modifiers.shift => Some(BrowserKey::Char('s')),
                         Scancode::P if self.modifiers.ctrl => Some(BrowserKey::Char('p')),
                         Scancode::H if self.modifiers.ctrl => Some(BrowserKey::Char('h')),
                         Scancode::B if self.modifiers.ctrl => Some(BrowserKey::Char('b')),

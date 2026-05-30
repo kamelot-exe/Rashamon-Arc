@@ -159,6 +159,8 @@ enum Cmd {
     CloseTab   { tab_id: u64 },
     /// Activate tab and request a fresh snapshot (no reload).
     SwitchTab  { tab_id: u64 },
+    /// Resize a tab WebView and request a fresh snapshot.
+    SetTabViewport { tab_id: u64, width: u32, height: u32 },
     /// Load a URL in the specified tab's WebView.
     Navigate   { tab_id: u64, url: String, nav_id: u64 },
     /// Scroll by delta pixels and re-snapshot the specified tab.
@@ -255,7 +257,7 @@ pub struct WebKitEngine {
 
 struct TabEntry {
     webview:     webkit2gtk::WebView,
-    _window:     gtk::OffscreenWindow,
+    window:      gtk::OffscreenWindow,
     is_private:  bool,
     nav_id_cell: Rc<Cell<u64>>,
     frame_gen:   Rc<Cell<u64>>,
@@ -263,12 +265,18 @@ struct TabEntry {
     alive:       Rc<Cell<bool>>,
     last_active: Instant,
     last_url:    String,
+    viewport_w:  u32,
+    viewport_h:  u32,
+    viewport_w_cell: Rc<Cell<u32>>,
+    viewport_h_cell: Rc<Cell<u32>>,
 }
 
 struct SuspendedTab {
     is_private: bool,
     url:        String,
     nav_id:     u64,
+    viewport_w: u32,
+    viewport_h: u32,
 }
 
 struct PendingPermission {
@@ -440,6 +448,18 @@ impl ContentEngine for WebKitEngine {
         self.active_tab_id = tab_id;
         // Request a fresh snapshot — the WebView already has its page loaded.
         let _ = self.cmd_tx.try_send(Cmd::SwitchTab { tab_id });
+    }
+
+    fn set_tab_viewport(&mut self, tab_id: u64, width: u32, height: u32) {
+        trace!("[webkit] set_tab_viewport {tab_id} {width}x{height}");
+        if let Some(state) = self.tab_states.get_mut(&tab_id) {
+            state.cache = None;
+        }
+        let _ = self.cmd_tx.try_send(Cmd::SetTabViewport {
+            tab_id,
+            width,
+            height,
+        });
     }
 
     fn navigate(&mut self, url: &str, nav_id: u64) -> Result<(), Box<dyn std::error::Error>> {
@@ -632,11 +652,25 @@ impl ContentEngine for WebKitEngine {
         fb:  &mut Framebuffer,
         x:   u32, y: u32, w: u32, h: u32,
     ) -> Result<EngineFrame, Box<dyn std::error::Error>> {
-        let tab_id = self.active_tab_id;
+        self.render_tab_into(self.active_tab_id, fb, x, y, w, h)
+    }
+
+    fn render_tab_into(
+        &mut self,
+        tab_id: u64,
+        fb:     &mut Framebuffer,
+        x:      u32,
+        y:      u32,
+        w:      u32,
+        h:      u32,
+    ) -> Result<EngineFrame, Box<dyn std::error::Error>> {
         let Some(state) = self.tab_states.get(&tab_id) else {
             return Ok(EngineFrame::NotReady);
         };
         let Some(cache) = &state.cache else { return Ok(EngineFrame::NotReady); };
+        if cache.width != w || cache.height != h {
+            return Ok(EngineFrame::NotReady);
+        }
 
         let src_w = cache.width;
         let src_h = cache.height;
@@ -856,6 +890,38 @@ impl WebKitDriver {
                     trace!("[webkit-driver] dropped WebView for tab {tab_id}");
                 }
 
+                Ok(Cmd::SetTabViewport { tab_id, width, height }) => {
+                    if !self.tabs.contains_key(&tab_id) {
+                        if let Some(suspended) = self.suspended_tabs.get_mut(&tab_id) {
+                            suspended.viewport_w = width;
+                            suspended.viewport_h = height;
+                        }
+                        self.resume_tab(tab_id);
+                    }
+                    if let Some(entry) = self.tabs.get_mut(&tab_id) {
+                        resize_tab_entry(entry, width, height);
+                        if entry.last_url.is_empty() {
+                            trace!("[webkit-driver] SetTabViewport {tab_id} skip snapshot reason=no-url");
+                            continue;
+                        }
+                        let token = next_cell_generation(&entry.schedule_gen);
+                        schedule_snapshot(
+                            &entry.webview, entry.viewport_w, entry.viewport_h, tab_id,
+                            self.reply_tx.clone(), Rc::clone(&entry.nav_id_cell),
+                            Rc::clone(&entry.frame_gen), Rc::clone(&entry.schedule_gen),
+                            Rc::clone(&entry.alive), token, "viewport-resize",
+                            Duration::from_millis(80),
+                        );
+                        schedule_snapshot(
+                            &entry.webview, entry.viewport_w, entry.viewport_h, tab_id,
+                            self.reply_tx.clone(), Rc::clone(&entry.nav_id_cell),
+                            Rc::clone(&entry.frame_gen), Rc::clone(&entry.schedule_gen),
+                            Rc::clone(&entry.alive), token, "viewport-resize-settle",
+                            Duration::from_millis(180),
+                        );
+                    }
+                }
+
                 Ok(Cmd::SwitchTab { tab_id }) => {
                     self.active_tab_id = tab_id;
                     if !self.tabs.contains_key(&tab_id) {
@@ -872,13 +938,13 @@ impl WebKitDriver {
                         }
                         let token = next_cell_generation(&entry.schedule_gen);
                         request_snapshot_now(
-                            &entry.webview, self.w, self.h, tab_id,
+                            &entry.webview, entry.viewport_w, entry.viewport_h, tab_id,
                             self.reply_tx.clone(), Rc::clone(&entry.nav_id_cell),
                             Rc::clone(&entry.frame_gen), Rc::clone(&entry.alive),
                             "tab-switch",
                         );
                         schedule_snapshot(
-                            &entry.webview, self.w, self.h, tab_id,
+                            &entry.webview, entry.viewport_w, entry.viewport_h, tab_id,
                             self.reply_tx.clone(), Rc::clone(&entry.nav_id_cell),
                             Rc::clone(&entry.frame_gen), Rc::clone(&entry.schedule_gen),
                             Rc::clone(&entry.alive), token, "tab-switch-settle",
@@ -941,14 +1007,14 @@ impl WebKitDriver {
                         );
                         let token = next_cell_generation(&entry.schedule_gen);
                         schedule_snapshot(
-                            &entry.webview, self.w, self.h, tab_id,
+                            &entry.webview, entry.viewport_w, entry.viewport_h, tab_id,
                             self.reply_tx.clone(), Rc::clone(&entry.nav_id_cell),
                             Rc::clone(&entry.frame_gen), Rc::clone(&entry.schedule_gen),
                             Rc::clone(&entry.alive), token, "scroll-fast",
                             Duration::from_millis(16),
                         );
                         schedule_snapshot(
-                            &entry.webview, self.w, self.h, tab_id,
+                            &entry.webview, entry.viewport_w, entry.viewport_h, tab_id,
                             self.reply_tx.clone(), Rc::clone(&entry.nav_id_cell),
                             Rc::clone(&entry.frame_gen), Rc::clone(&entry.schedule_gen),
                             Rc::clone(&entry.alive), token, "scroll-settle",
@@ -992,14 +1058,14 @@ impl WebKitDriver {
                             "click-state", Duration::from_millis(80),
                         );
                         schedule_snapshot(
-                            &entry.webview, self.w, self.h, tab_id,
+                            &entry.webview, entry.viewport_w, entry.viewport_h, tab_id,
                             self.reply_tx.clone(), Rc::clone(&entry.nav_id_cell),
                             Rc::clone(&entry.frame_gen), Rc::clone(&entry.schedule_gen),
                             Rc::clone(&entry.alive), token, "click-fast",
                             Duration::from_millis(80),
                         );
                         schedule_snapshot(
-                            &entry.webview, self.w, self.h, tab_id,
+                            &entry.webview, entry.viewport_w, entry.viewport_h, tab_id,
                             self.reply_tx.clone(), Rc::clone(&entry.nav_id_cell),
                             Rc::clone(&entry.frame_gen), Rc::clone(&entry.schedule_gen),
                             Rc::clone(&entry.alive), token, "click-settle",
@@ -1108,7 +1174,7 @@ impl WebKitDriver {
                         );
                         let token = next_cell_generation(&entry.schedule_gen);
                         schedule_snapshot(
-                            &entry.webview, self.w, self.h, tab_id,
+                            &entry.webview, entry.viewport_w, entry.viewport_h, tab_id,
                             self.reply_tx.clone(), Rc::clone(&entry.nav_id_cell),
                             Rc::clone(&entry.frame_gen), Rc::clone(&entry.schedule_gen),
                             Rc::clone(&entry.alive), token, "text-input",
@@ -1158,7 +1224,7 @@ impl WebKitDriver {
                         );
                         let token = next_cell_generation(&entry.schedule_gen);
                         schedule_snapshot(
-                            &entry.webview, self.w, self.h, tab_id,
+                            &entry.webview, entry.viewport_w, entry.viewport_h, tab_id,
                             self.reply_tx.clone(), Rc::clone(&entry.nav_id_cell),
                             Rc::clone(&entry.frame_gen), Rc::clone(&entry.schedule_gen),
                             Rc::clone(&entry.alive), token, "key-input",
@@ -1190,7 +1256,7 @@ impl WebKitDriver {
                             // a same-page (fragment) navigation.
                             let token = next_cell_generation(&entry.schedule_gen);
                             schedule_snapshot(
-                                &entry.webview, self.w, self.h, tab_id,
+                                &entry.webview, entry.viewport_w, entry.viewport_h, tab_id,
                                 self.reply_tx.clone(), Rc::clone(&entry.nav_id_cell),
                                 Rc::clone(&entry.frame_gen), Rc::clone(&entry.schedule_gen),
                                 Rc::clone(&entry.alive), token, "back-forward-settle",
@@ -1219,7 +1285,7 @@ impl WebKitDriver {
                             );
                             let token = next_cell_generation(&entry.schedule_gen);
                             schedule_snapshot(
-                                &entry.webview, self.w, self.h, tab_id,
+                                &entry.webview, entry.viewport_w, entry.viewport_h, tab_id,
                                 self.reply_tx.clone(), Rc::clone(&entry.nav_id_cell),
                                 Rc::clone(&entry.frame_gen), Rc::clone(&entry.schedule_gen),
                                 Rc::clone(&entry.alive), token, "back-forward-settle",
@@ -1241,14 +1307,14 @@ impl WebKitDriver {
                         entry.webview.set_zoom_level(next);
                         let token = next_cell_generation(&entry.schedule_gen);
                         schedule_snapshot(
-                            &entry.webview, self.w, self.h, tab_id,
+                            &entry.webview, entry.viewport_w, entry.viewport_h, tab_id,
                             self.reply_tx.clone(), Rc::clone(&entry.nav_id_cell),
                             Rc::clone(&entry.frame_gen), Rc::clone(&entry.schedule_gen),
                             Rc::clone(&entry.alive), token, "zoom-fast",
                             Duration::from_millis(24),
                         );
                         schedule_snapshot(
-                            &entry.webview, self.w, self.h, tab_id,
+                            &entry.webview, entry.viewport_w, entry.viewport_h, tab_id,
                             self.reply_tx.clone(), Rc::clone(&entry.nav_id_cell),
                             Rc::clone(&entry.frame_gen), Rc::clone(&entry.schedule_gen),
                             Rc::clone(&entry.alive), token, "zoom-settle",
@@ -1473,6 +1539,8 @@ impl WebKitDriver {
                 is_private: entry.is_private,
                 url: url.clone(),
                 nav_id: entry.nav_id_cell.get(),
+                viewport_w: entry.viewport_w,
+                viewport_h: entry.viewport_h,
             });
             trace!(
                 "[webkit-driver] suspended tab={} url={} live={} suspended={}",
@@ -1490,8 +1558,8 @@ impl WebKitDriver {
         let mut entry = make_tab_entry(
             tab_id,
             suspended.is_private,
-            self.w,
-            self.h,
+            suspended.viewport_w,
+            suspended.viewport_h,
             self.reply_tx.clone(),
             Rc::clone(&self.adblock),
             Rc::clone(&self.blocked_by_origin),
@@ -1581,6 +1649,8 @@ fn make_tab_entry(
     let frame_gen: Rc<Cell<u64>> = Rc::new(Cell::new(0));
     let schedule_gen: Rc<Cell<u64>> = Rc::new(Cell::new(0));
     let alive: Rc<Cell<bool>> = Rc::new(Cell::new(true));
+    let viewport_w_cell: Rc<Cell<u32>> = Rc::new(Cell::new(w));
+    let viewport_h_cell: Rc<Cell<u32>> = Rc::new(Cell::new(h));
 
     {
         let permissions = Rc::clone(&permissions);
@@ -1705,6 +1775,8 @@ fn make_tab_entry(
         let fg  = Rc::clone(&frame_gen);
         let sg  = Rc::clone(&schedule_gen);
         let alive = Rc::clone(&alive);
+        let vw = Rc::clone(&viewport_w_cell);
+        let vh = Rc::clone(&viewport_h_cell);
         webview.connect_load_changed(move |wv, event| {
             if event == LoadEvent::Started {
                 perf_mark_tab("load-start", tab_id);
@@ -1728,16 +1800,16 @@ fn make_tab_entry(
                     tab_id, can_back, can_forward: can_fwd,
                 });
                 request_snapshot_now(
-                    wv, w, h, tab_id, tx.clone(), Rc::clone(&nc),
+                    wv, vw.get(), vh.get(), tab_id, tx.clone(), Rc::clone(&nc),
                     Rc::clone(&fg), Rc::clone(&alive), "load-finished",
                 );
                 schedule_snapshot(
-                    wv, w, h, tab_id, tx.clone(), Rc::clone(&nc),
+                    wv, vw.get(), vh.get(), tab_id, tx.clone(), Rc::clone(&nc),
                     Rc::clone(&fg), Rc::clone(&sg), Rc::clone(&alive),
                     token, "spa-settle", Duration::from_millis(180),
                 );
                 schedule_snapshot(
-                    wv, w, h, tab_id, tx.clone(), Rc::clone(&nc),
+                    wv, vw.get(), vh.get(), tab_id, tx.clone(), Rc::clone(&nc),
                     Rc::clone(&fg), Rc::clone(&sg), Rc::clone(&alive),
                     token, "spa-late", Duration::from_millis(650),
                 );
@@ -1780,7 +1852,7 @@ fn make_tab_entry(
 
     TabEntry {
         webview,
-        _window: window,
+        window,
         is_private,
         nav_id_cell,
         frame_gen,
@@ -1788,7 +1860,30 @@ fn make_tab_entry(
         alive,
         last_active: Instant::now(),
         last_url: String::new(),
+        viewport_w: w,
+        viewport_h: h,
+        viewport_w_cell,
+        viewport_h_cell,
     }
+}
+
+fn resize_tab_entry(entry: &mut TabEntry, width: u32, height: u32) {
+    let width = width.max(1);
+    let height = height.max(1);
+    if entry.viewport_w == width && entry.viewport_h == height {
+        return;
+    }
+    use gtk::prelude::{GtkWindowExt, WidgetExt};
+    entry.viewport_w = width;
+    entry.viewport_h = height;
+    entry.viewport_w_cell.set(width);
+    entry.viewport_h_cell.set(height);
+    next_cell_generation(&entry.schedule_gen);
+    next_cell_generation(&entry.frame_gen);
+    entry.webview.set_size_request(width as i32, height as i32);
+    entry.window.set_default_size(width as i32, height as i32);
+    entry.window.resize(width as i32, height as i32);
+    trace!("[webkit-driver] resized tab viewport {}x{}", width, height);
 }
 
 // ── Permission handling ──────────────────────────────────────────────────────

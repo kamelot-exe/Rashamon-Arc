@@ -93,6 +93,37 @@ pub enum OverlayKind {
     Bookmarks,
 }
 
+// ── Split View ───────────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SplitPane {
+    Left,
+    Right,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SplitViewState {
+    pub left:   TabId,
+    pub right:  TabId,
+    pub active: SplitPane,
+}
+
+impl SplitViewState {
+    pub fn active_tab_id(self) -> TabId {
+        match self.active {
+            SplitPane::Left => self.left,
+            SplitPane::Right => self.right,
+        }
+    }
+
+    pub fn tab_for_pane(self, pane: SplitPane) -> TabId {
+        match pane {
+            SplitPane::Left => self.left,
+            SplitPane::Right => self.right,
+        }
+    }
+}
+
 // ── HoveredRegion ─────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -337,6 +368,7 @@ impl QuickLink {
 pub struct BrowserState {
     pub tabs:          Vec<TabState>,
     pub active_tab_id: TabId,
+    pub split_view:    Option<SplitViewState>,
 
     pub mouse_x:     u32,
     pub mouse_y:     u32,
@@ -385,6 +417,7 @@ impl BrowserState {
         let mut s = Self {
             tabs:          vec![first_tab],
             active_tab_id: first_id,
+            split_view:    None,
             mouse_x:       0,
             mouse_y:       0,
             frame_count:   0,
@@ -676,6 +709,97 @@ impl BrowserState {
         self.active_tab().map_or(false, |t| t.page_state.is_new_tab())
     }
 
+    pub fn tab_by_id(&self, id: TabId) -> Option<&TabState> {
+        self.tabs.iter().find(|t| t.id == id)
+    }
+
+    pub fn split_active_pane(&self) -> Option<SplitPane> {
+        self.split_view.map(|split| split.active)
+    }
+
+    pub fn split_pane_for_x(&self, x: u32) -> SplitPane {
+        if x < FB_WIDTH / 2 { SplitPane::Left } else { SplitPane::Right }
+    }
+
+    pub fn activate_split_pane(&mut self, pane: SplitPane) -> Option<TabId> {
+        let id = self.split_view?.tab_for_pane(pane);
+        if self.tabs.iter().any(|tab| tab.id == id) {
+            if let Some(split) = self.split_view.as_mut() {
+                split.active = pane;
+            }
+            self.activate_tab(id);
+            Some(id)
+        } else {
+            self.recover_split_view();
+            None
+        }
+    }
+
+    pub fn enter_split_view(&mut self, left: TabId, right: TabId, active: SplitPane) -> bool {
+        if left == right {
+            return false;
+        }
+        if !self.tabs.iter().any(|tab| tab.id == left) || !self.tabs.iter().any(|tab| tab.id == right) {
+            return false;
+        }
+        self.split_view = Some(SplitViewState { left, right, active });
+        let active_id = self.split_view.unwrap().active_tab_id();
+        self.activate_tab(active_id);
+        self.dirty.all();
+        true
+    }
+
+    pub fn exit_split_view(&mut self) -> Option<TabId> {
+        let active = self.split_view.map(|split| split.active_tab_id());
+        self.split_view = None;
+        if let Some(id) = active {
+            self.activate_tab(id);
+        } else {
+            self.dirty.all();
+        }
+        active
+    }
+
+    pub fn recover_split_view(&mut self) {
+        let Some(mut split) = self.split_view else { return };
+        let left_alive = self.tabs.iter().any(|tab| tab.id == split.left);
+        let right_alive = self.tabs.iter().any(|tab| tab.id == split.right);
+
+        match (left_alive, right_alive) {
+            (true, true) => {}
+            (true, false) => {
+                if let Some(replacement) = self.tabs.iter().find(|tab| tab.id != split.left).map(|tab| tab.id) {
+                    split.right = replacement;
+                    if split.active == SplitPane::Right {
+                        split.active = SplitPane::Left;
+                    }
+                    self.split_view = Some(split);
+                } else {
+                    self.split_view = None;
+                }
+            }
+            (false, true) => {
+                if let Some(replacement) = self.tabs.iter().find(|tab| tab.id != split.right).map(|tab| tab.id) {
+                    split.left = replacement;
+                    if split.active == SplitPane::Left {
+                        split.active = SplitPane::Right;
+                    }
+                    self.split_view = Some(split);
+                } else {
+                    self.split_view = None;
+                }
+            }
+            (false, false) => self.split_view = None,
+        }
+        if let Some(split) = self.split_view {
+            self.active_tab_id = split.active_tab_id();
+        }
+        self.sync_address_bar();
+        self.update_layout();
+        self.update_bookmark_flag();
+        self.dirty.all();
+    }
+
     // ── Mouse / hover ─────────────────────────────────────────────────────────
 
     pub fn set_mouse_pos(&mut self, x: u32, y: u32) {
@@ -751,6 +875,7 @@ impl BrowserState {
             let fresh_id = fresh.id;
             self.tabs[0]       = fresh;
             self.active_tab_id = fresh_id;
+            self.split_view    = None;
             self.close_site_info();
             self.sync_address_bar();
             self.update_layout();
@@ -765,6 +890,7 @@ impl BrowserState {
             let new_id  = self.tabs[new_idx].id;
             self.activate_tab(new_id);
         }
+        self.recover_split_view();
         self.update_layout();
         self.dirty.all();
     }
@@ -772,6 +898,18 @@ impl BrowserState {
     pub fn activate_tab(&mut self, id: TabId) {
         if self.tabs.iter().any(|t| t.id == id) {
             self.active_tab_id       = id;
+            if let Some(split) = self.split_view.as_mut() {
+                if split.left == id {
+                    split.active = SplitPane::Left;
+                } else if split.right == id {
+                    split.active = SplitPane::Right;
+                } else {
+                    match split.active {
+                        SplitPane::Left => split.left = id,
+                        SplitPane::Right => split.right = id,
+                    }
+                }
+            }
             self.address_bar_focused = false;
             self.close_overlay();
             self.close_site_info();

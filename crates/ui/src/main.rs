@@ -39,7 +39,10 @@ use rashamon_renderer::{
     webext_ready_for_test, webext_rules_error_for_test, webext_rules_ok_for_test,
 };
 use rashamon_renderer::framebuffer::Pixel;
-use ui_state::{BrowserState, DirtyFlags, DownloadStatus, OverlayKind, PageState, TabId, derive_title};
+use ui_state::{
+    BrowserState, DirtyFlags, DownloadStatus, OverlayKind, PageState, SplitPane, TabId,
+    derive_title,
+};
 
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
@@ -572,6 +575,7 @@ enum ContentRenderMode {
     Text,
     Engine,
     EnginePending,
+    SplitEngine,
 }
 
 // ── Persistence helpers ───────────────────────────────────────────────────────
@@ -740,6 +744,29 @@ where
         engine.pump_gtk();
         let events = smoke_apply_engine_events(state, engine);
         if pred(state, &events) {
+            smoke_log(format!("[smoke] PASS {label}"));
+            return Ok(());
+        }
+        std::thread::sleep(Duration::from_millis(16));
+    }
+    Err(smoke_fail(format!("smoke timeout: {label}")))
+}
+
+fn smoke_wait_for_tab_snapshot(
+    state:  &mut BrowserState,
+    engine: &mut RenderEngine,
+    label:  &str,
+    tab_id: TabId,
+    rect:   Rect,
+    timeout: Duration,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        state.frame_count += 1;
+        engine.pump_gtk();
+        smoke_apply_engine_events(state, engine);
+        let mut fb = Framebuffer::new(FB_WIDTH, FB_HEIGHT);
+        if engine.render_tab_into(tab_id.raw(), &mut fb, rect.0, rect.1, rect.2, rect.3)? == EngineFrame::Ready {
             smoke_log(format!("[smoke] PASS {label}"));
             return Ok(());
         }
@@ -1254,6 +1281,90 @@ fn run_webkit_smoke_test() -> Result<SmokePerfMetrics, Box<dyn std::error::Error
     })?;
     let search_tab_id = state.active_tab_id;
 
+    smoke_create_tab(&mut state, &mut engine, false);
+    let split_nav_tab = state.active_tab_id;
+    if !state.enter_split_view(first_loaded_id, split_nav_tab, SplitPane::Left) {
+        return Err(smoke_fail("split view did not enter with two tabs"));
+    }
+    engine.set_active_tab(first_loaded_id.raw());
+    if state.split_view.as_ref().map_or(true, |split| {
+        split.left != first_loaded_id || split.right != split_nav_tab || split.active != SplitPane::Left
+    }) {
+        return Err(smoke_fail("split panes were not assigned"));
+    }
+    let split_content_h = FB_HEIGHT.saturating_sub(TOP_BAR_HEIGHT);
+    let split_left_w = FB_WIDTH / 2;
+    let split_right_w = FB_WIDTH.saturating_sub(split_left_w);
+    engine.set_tab_viewport(first_loaded_id.raw(), split_left_w, split_content_h);
+    engine.set_tab_viewport(split_nav_tab.raw(), split_right_w, split_content_h);
+    smoke_wait_for(&mut state, &mut engine, "split left viewport resizes", Duration::from_secs(4), |_s, events| {
+        events.iter().any(|e| matches!(e, EngineEvent::FrameReady { reason } if reason.contains("viewport-resize")))
+    })?;
+    smoke_wait_for_tab_snapshot(
+        &mut state,
+        &mut engine,
+        "split left snapshot matches pane viewport",
+        first_loaded_id,
+        (0, TOP_BAR_HEIGHT, split_left_w, split_content_h),
+        Duration::from_secs(4),
+    )?;
+    smoke_log("[smoke] PASS split view enter");
+
+    state.activate_split_pane(SplitPane::Right)
+        .ok_or_else(|| smoke_fail("split right pane did not activate"))?;
+    engine.set_active_tab(split_nav_tab.raw());
+    if state.active_tab_id != split_nav_tab || state.split_active_pane() != Some(SplitPane::Right) {
+        return Err(smoke_fail("split active pane did not switch"));
+    }
+    smoke_log("[smoke] PASS split active pane switch");
+
+    smoke_navigate(&mut state, &mut engine, "https://example.net")?;
+    smoke_wait_for(&mut state, &mut engine, "split active pane navigates", Duration::from_secs(12), |s, events| {
+        events.iter().any(|e| matches!(e, EngineEvent::LoadComplete))
+            && s.active_tab_id == split_nav_tab
+            && s.active_tab().map_or(false, |t| t.url.contains("example.net"))
+    })?;
+    smoke_wait_for_tab_snapshot(
+        &mut state,
+        &mut engine,
+        "split right snapshot matches pane viewport",
+        split_nav_tab,
+        (split_left_w, TOP_BAR_HEIGHT, split_right_w, split_content_h),
+        Duration::from_secs(4),
+    )?;
+    smoke_log("[smoke] PASS split active pane navigation");
+
+    state.exit_split_view();
+    engine.set_tab_viewport(first_loaded_id.raw(), FB_WIDTH, split_content_h);
+    engine.set_tab_viewport(split_nav_tab.raw(), FB_WIDTH, split_content_h);
+    engine.set_active_tab(state.active_tab_id.raw());
+    smoke_wait_for(&mut state, &mut engine, "split exit restores full viewport", Duration::from_secs(4), |_s, events| {
+        events.iter().any(|e| matches!(e, EngineEvent::FrameReady { reason } if reason.contains("viewport-resize")))
+    })?;
+    if state.split_view.is_some() {
+        return Err(smoke_fail("split view did not exit"));
+    }
+    smoke_log("[smoke] PASS split view exit");
+
+    if !state.enter_split_view(first_loaded_id, split_nav_tab, SplitPane::Right) {
+        return Err(smoke_fail("split close setup failed"));
+    }
+    engine.set_active_tab(split_nav_tab.raw());
+    engine.close_tab(split_nav_tab.raw());
+    state.close_tab(split_nav_tab);
+    engine.set_active_tab(state.active_tab_id.raw());
+    if state.tabs.iter().any(|tab| tab.id == split_nav_tab) {
+        return Err(smoke_fail("split referenced tab close failed"));
+    }
+    if state.split_view.as_ref().map_or(false, |split| {
+        split.left == split_nav_tab || split.right == split_nav_tab
+    }) {
+        return Err(smoke_fail("split retained closed tab"));
+    }
+    state.exit_split_view();
+    engine.set_active_tab(state.active_tab_id.raw());
+    smoke_log("[smoke] PASS split close referenced tab");
+
     state.activate_tab(first_loaded_id);
     let tab_switch_t0 = Instant::now();
     engine.set_active_tab(first_loaded_id.raw());
@@ -1716,6 +1827,19 @@ fn run_browser_runtime<R: PlatformRuntime>(
             // intentional pending state instead of showing text fallback.
             let content_mode = if dirty.content
                 && driver.state.overlay == OverlayKind::None
+                && driver.state.split_view.is_some()
+            {
+                let render_t0 = Instant::now();
+                let mode = render_split_content(
+                    runtime.framebuffer_mut(),
+                    &driver.state,
+                    &mut driver.engine,
+                    &font,
+                );
+                perf.add_render_into(render_t0.elapsed());
+                mode
+            } else if dirty.content
+                && driver.state.overlay == OverlayKind::None
                 && driver.state.active_tab().map_or(false, |t| matches!(t.page_state, PageState::Loaded))
             {
                 let render_t0 = Instant::now();
@@ -1804,6 +1928,11 @@ fn render_ui(
     if dirty.content {
         if state.overlay != OverlayKind::None {
             draw_overlay(fb, state, font);
+        } else if content_mode == ContentRenderMode::SplitEngine {
+            draw_split_view_chrome(fb, state, font);
+            draw_download_status(fb, state, font);
+            draw_permission_prompt(fb, state, font);
+            draw_site_info_panel(fb, state, font);
         } else {
             match state.active_tab().map(|t| &t.page_state) {
                 Some(PageState::NewTab)   => {
@@ -1847,7 +1976,127 @@ fn render_ui(
         fb.fill_rect(0, TAB_BAR_HEIGHT, fb.width, CHROME_BAR_HEIGHT, theme.surface);
         draw_chrome_row(fb, state, font);
         fb.fill_rect(0, TOP_BAR_HEIGHT, fb.width, 1, theme.border);
+        if state.split_view.is_some() {
+            draw_split_view_hint(fb, state, font);
+        }
     }
+}
+
+fn split_pane_rect(pane: SplitPane) -> Rect {
+    let half = FB_WIDTH / 2;
+    let h = FB_HEIGHT.saturating_sub(TOP_BAR_HEIGHT);
+    match pane {
+        SplitPane::Left => (0, TOP_BAR_HEIGHT, half, h),
+        SplitPane::Right => (half, TOP_BAR_HEIGHT, FB_WIDTH.saturating_sub(half), h),
+    }
+}
+
+fn render_split_content(
+    fb:     &mut Framebuffer,
+    state:  &BrowserState,
+    engine: &mut RenderEngine,
+    font:   &FontManager,
+) -> ContentRenderMode {
+    let Some(split) = state.split_view else { return ContentRenderMode::Text };
+    fb.fill_rect(
+        0,
+        TOP_BAR_HEIGHT,
+        FB_WIDTH,
+        FB_HEIGHT.saturating_sub(TOP_BAR_HEIGHT),
+        state.theme.bg,
+    );
+
+    for pane in [SplitPane::Left, SplitPane::Right] {
+        let tab_id = split.tab_for_pane(pane);
+        let (x, y, w, h) = split_pane_rect(pane);
+        match state.tab_by_id(tab_id).map(|tab| &tab.page_state) {
+            Some(PageState::Loaded) => {
+                match engine.render_tab_into(tab_id.raw(), fb, x, y, w, h) {
+                    Ok(EngineFrame::Ready) => {}
+                    Ok(_) if engine.is_real_engine() => {
+                        draw_split_placeholder(fb, state, font, pane, "Waiting for page snapshot");
+                    }
+                    Ok(_) => {
+                        draw_split_placeholder(fb, state, font, pane, "Text fallback is shown in single view");
+                    }
+                    Err(e) => {
+                        if std::env::var_os("RASHAMON_DEBUG").is_some() {
+                            eprintln!("[render] engine.render_tab_into error: {e}");
+                        }
+                        draw_split_placeholder(fb, state, font, pane, "Page snapshot unavailable");
+                    }
+                }
+            }
+            Some(PageState::Loading) => {
+                draw_split_placeholder(fb, state, font, pane, "Loading");
+            }
+            Some(PageState::Error(_)) => {
+                draw_split_placeholder(fb, state, font, pane, "Page unavailable");
+            }
+            Some(PageState::NewTab) => {
+                draw_split_placeholder(fb, state, font, pane, "New Tab");
+            }
+            None => {
+                draw_split_placeholder(fb, state, font, pane, "Tab unavailable");
+            }
+        }
+    }
+    draw_split_view_chrome(fb, state, font);
+    ContentRenderMode::SplitEngine
+}
+
+fn draw_split_placeholder(
+    fb:    &mut Framebuffer,
+    state: &BrowserState,
+    font:  &FontManager,
+    pane:  SplitPane,
+    label: &str,
+) {
+    let (x, y, w, h) = split_pane_rect(pane);
+    fb.fill_rect(x, y, w, h, state.theme.bg);
+    let text_w = font.text_width(label, 16.0);
+    let tx = x + w.saturating_sub(text_w) / 2;
+    let ty = y + h / 2;
+    draw::draw_text(fb, font, tx, ty, label, 16.0, state.theme.fg_secondary, w.saturating_sub(48));
+}
+
+fn draw_split_view_chrome(fb: &mut Framebuffer, state: &BrowserState, font: &FontManager) {
+    let Some(split) = state.split_view else { return };
+    let theme = state.theme;
+    let mid = FB_WIDTH / 2;
+    fb.fill_rect(mid.saturating_sub(1), TOP_BAR_HEIGHT, 2, FB_HEIGHT.saturating_sub(TOP_BAR_HEIGHT), theme.border);
+    for pane in [SplitPane::Left, SplitPane::Right] {
+        let (x, y, w, h) = split_pane_rect(pane);
+        let active = split.active == pane;
+        let color = if active { theme.accent } else { theme.border };
+        fb.fill_rect(x, y, w, 2, color);
+        if active {
+            fb.fill_rect(x, y, 2, h, color);
+            fb.fill_rect(x + w.saturating_sub(2), y, 2, h, color);
+        }
+        if let Some(tab) = state.tab_by_id(split.tab_for_pane(pane)) {
+            let label = match pane {
+                SplitPane::Left => "Left",
+                SplitPane::Right => "Right",
+            };
+            let title = tab.tab_title();
+            let chip = format!("{label}: {title}");
+            let chip_w = font.text_width(&chip, 11.5).saturating_add(20).min(w.saturating_sub(16));
+            fb.fill_rect(x + 8, y + 8, chip_w, 22, theme.surface);
+            draw::draw_text(fb, font, x + 18, y + 13, &chip, 11.5, theme.fg_secondary, chip_w.saturating_sub(20));
+        }
+    }
+}
+
+fn draw_split_view_hint(fb: &mut Framebuffer, state: &BrowserState, font: &FontManager) {
+    let Some(pane) = state.split_active_pane() else { return };
+    let label = match pane {
+        SplitPane::Left => "Split: Left",
+        SplitPane::Right => "Split: Right",
+    };
+    let x = FB_WIDTH.saturating_sub(144);
+    let y = TAB_BAR_HEIGHT + (CHROME_BAR_HEIGHT - 22) / 2;
+    draw::draw_text(fb, font, x, y + 5, label, 11.5, state.theme.fg_secondary, 120);
 }
 
 // ── Tab row ───────────────────────────────────────────────────────────────────

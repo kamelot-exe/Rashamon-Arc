@@ -65,6 +65,10 @@ static WEBEXT_READY: AtomicBool = AtomicBool::new(false);
 static WEBEXT_BLOCKED_EVENTS: AtomicU64 = AtomicU64::new(0);
 static WEBEXT_RULES_OK: AtomicU64 = AtomicU64::new(0);
 static WEBEXT_RULES_ERROR: AtomicU64 = AtomicU64::new(0);
+static WEBEXT_PROBE_BLOCKED: AtomicU64 = AtomicU64::new(0);
+static WEBEXT_PROBE_CLEAR: AtomicU64 = AtomicU64::new(0);
+static ADBLOCK_POLICY_BLOCKS: AtomicU64 = AtomicU64::new(0);
+static ADBLOCK_SUBRESOURCE_REWRITES: AtomicU64 = AtomicU64::new(0);
 
 fn perf_mark_global(stage: &'static str) {
     if !perf_enabled() {
@@ -128,6 +132,22 @@ pub fn webext_rules_ok_for_test() -> u64 {
 
 pub fn webext_rules_error_for_test() -> u64 {
     WEBEXT_RULES_ERROR.load(Ordering::Relaxed)
+}
+
+pub fn webext_probe_blocked_for_test() -> u64 {
+    WEBEXT_PROBE_BLOCKED.load(Ordering::Relaxed)
+}
+
+pub fn webext_probe_clear_for_test() -> u64 {
+    WEBEXT_PROBE_CLEAR.load(Ordering::Relaxed)
+}
+
+pub fn adblock_policy_blocks_for_test() -> u64 {
+    ADBLOCK_POLICY_BLOCKS.load(Ordering::Relaxed)
+}
+
+pub fn adblock_subresource_rewrites_for_test() -> u64 {
+    ADBLOCK_SUBRESOURCE_REWRITES.load(Ordering::Relaxed)
 }
 
 // ── IPC ───────────────────────────────────────────────────────────────────────
@@ -261,6 +281,28 @@ struct PendingPermission {
     request: webkit2gtk::PermissionRequest,
 }
 
+#[derive(Default, Clone, Copy)]
+struct OriginBlockCounts {
+    in_process_policy: u64,
+    in_process_subresource: u64,
+    webextension_hard: u64,
+}
+
+impl OriginBlockCounts {
+    fn total(self) -> u64 {
+        self.in_process_policy
+            .saturating_add(self.in_process_subresource)
+            .saturating_add(self.webextension_hard)
+    }
+}
+
+#[derive(Clone, Copy)]
+enum BlockSource {
+    InProcessPolicy,
+    InProcessSubresource,
+    WebExtensionHard,
+}
+
 pub struct WebKitDriver {
     cmd_rx:   mpsc::Receiver<Cmd>,
     reply_tx: mpsc::SyncSender<Reply>,
@@ -275,7 +317,7 @@ pub struct WebKitDriver {
     normal_context: webkit2gtk::WebContext,
     download_seq: Rc<Cell<u64>>,
     active_downloads: Rc<Cell<u32>>,
-    blocked_by_origin: Rc<RefCell<HashMap<String, u64>>>,
+    blocked_by_origin: Rc<RefCell<HashMap<String, OriginBlockCounts>>>,
     w:        u32,
     h:        u32,
     suspend_after: Duration,
@@ -297,6 +339,10 @@ impl WebKitEngine {
         WEBEXT_BLOCKED_EVENTS.store(0, Ordering::Relaxed);
         WEBEXT_RULES_OK.store(0, Ordering::Relaxed);
         WEBEXT_RULES_ERROR.store(0, Ordering::Relaxed);
+        WEBEXT_PROBE_BLOCKED.store(0, Ordering::Relaxed);
+        WEBEXT_PROBE_CLEAR.store(0, Ordering::Relaxed);
+        ADBLOCK_POLICY_BLOCKS.store(0, Ordering::Relaxed);
+        ADBLOCK_SUBRESOURCE_REWRITES.store(0, Ordering::Relaxed);
         perf_mark_global("gtk-init-start");
         if std::env::var_os("GDK_BACKEND").is_none() {
             std::env::set_var("GDK_BACKEND", "x11,wayland");
@@ -866,7 +912,11 @@ impl WebKitDriver {
                             &self.adblock, &url, &wv_url(&entry.webview), entry.is_private,
                         ) {
                             log_adblock_block_with_kind(&url, &reason, "navigation-preload");
-                            increment_origin_block_count(&self.blocked_by_origin, &wv_url(&entry.webview));
+                            increment_origin_block_count(
+                                &self.blocked_by_origin,
+                                &wv_url(&entry.webview),
+                                BlockSource::InProcessPolicy,
+                            );
                             let _ = self.reply_tx.try_send(Reply::LoadFailed {
                                 tab_id,
                                 nav_id,
@@ -1345,7 +1395,14 @@ impl WebKitDriver {
 
     fn sync_webext_rules_to_live_tabs(&self) {
         for (tab_id, entry) in &self.tabs {
-            send_webext_rules(*tab_id, &entry.webview, &self.adblock, entry.is_private);
+            send_webext_rules(
+                *tab_id,
+                &entry.webview,
+                &self.adblock,
+                entry.is_private,
+                true,
+                std::env::var_os("RASHAMON_WEBEXT_SMOKE_INVALID_RULES").is_some(),
+            );
         }
     }
 
@@ -1470,7 +1527,7 @@ fn make_tab_entry(
     h:         u32,
     reply_tx:  mpsc::SyncSender<Reply>,
     adblock:   Rc<RefCell<AdblockEngine>>,
-    blocked_by_origin: Rc<RefCell<HashMap<String, u64>>>,
+    blocked_by_origin: Rc<RefCell<HashMap<String, OriginBlockCounts>>>,
     permissions: Rc<RefCell<PermissionStore>>,
     pending_permission: Rc<RefCell<Option<PendingPermission>>>,
     permission_seq: Rc<Cell<u64>>,
@@ -1596,7 +1653,11 @@ fn make_tab_entry(
             };
             if let Some(reason) = adblock_block_reason(&ab, &uri, &wv_url(wv), is_private) {
                 log_adblock_block_with_kind(&uri, &reason, kind);
-                increment_origin_block_count(&blocked_by_origin, &wv_url(wv));
+                increment_origin_block_count(
+                    &blocked_by_origin,
+                    &wv_url(wv),
+                    BlockSource::InProcessPolicy,
+                );
                 decision.ignore();
                 if emit_load_failed {
                     let _ = tx.try_send(Reply::LoadFailed {
@@ -1628,7 +1689,11 @@ fn make_tab_entry(
             if let Some(reason) = adblock_block_reason(&ab, &uri, &page_url, is_private) {
                 log_adblock_block_with_kind(&uri, &reason, "subresource");
                 request.set_uri("data:text/plain;charset=utf-8,blocked%20by%20Rashamon%20Arc%20adblock");
-                increment_origin_block_count(&blocked_by_origin, &page_url);
+                increment_origin_block_count(
+                    &blocked_by_origin,
+                    &page_url,
+                    BlockSource::InProcessSubresource,
+                );
             }
         });
     }
@@ -2005,7 +2070,7 @@ fn send_site_info(
     tx: &mpsc::SyncSender<Reply>,
     permissions: &Rc<RefCell<PermissionStore>>,
     adblock: &Rc<RefCell<AdblockEngine>>,
-    blocked_by_origin: &Rc<RefCell<HashMap<String, u64>>>,
+    blocked_by_origin: &Rc<RefCell<HashMap<String, OriginBlockCounts>>>,
     origin: &str,
     private: bool,
 ) {
@@ -2023,6 +2088,7 @@ fn send_site_info(
         .borrow()
         .get(&origin_key(origin))
         .copied()
+        .map(OriginBlockCounts::total)
         .unwrap_or(0);
     let _ = tx.try_send(Reply::SitePermissions {
         origin: origin.to_string(),
@@ -2116,7 +2182,7 @@ fn configure_web_extension(context: &webkit2gtk::WebContext) {
 fn connect_webext_view_messages(
     tab_id: u64,
     webview: &webkit2gtk::WebView,
-    blocked_by_origin: Rc<RefCell<HashMap<String, u64>>>,
+    blocked_by_origin: Rc<RefCell<HashMap<String, OriginBlockCounts>>>,
 ) {
     use webkit2gtk::{UserMessageExt, WebViewExt};
     webview.connect_user_message_received(move |wv, message| {
@@ -2130,16 +2196,23 @@ fn connect_webext_view_messages(
             return true;
         }
         if name == "rashamon-webext-blocked" {
-            WEBEXT_BLOCKED_EVENTS.fetch_add(1, Ordering::Relaxed);
             if let Some(params) = message.parameters() {
                 if let Some((url, page_url, kind)) = params.get::<(String, String, String)>() {
-                    trace!("[adblock-webext] blocked {url} kind={kind}");
-                    increment_origin_block_count(&blocked_by_origin, &page_url);
+                    trace!("[adblock-webext] blocked {url} kind={kind} source=webextension-hard");
+                    increment_origin_block_count(
+                        &blocked_by_origin,
+                        &page_url,
+                        BlockSource::WebExtensionHard,
+                    );
                     return true;
                 }
             }
-            increment_origin_block_count(&blocked_by_origin, &wv_url(wv));
-            trace!("[adblock-webext] blocked event (no params)");
+            increment_origin_block_count(
+                &blocked_by_origin,
+                &wv_url(wv),
+                BlockSource::WebExtensionHard,
+            );
+            trace!("[adblock-webext] blocked event source=webextension-hard params=none");
             return true;
         }
         false
@@ -2155,15 +2228,18 @@ fn send_webext_ping_and_rules(
     use webkit2gtk::{UserMessage, UserMessageExt, WebViewExt};
 
     if !WEBEXT_CONFIGURED.load(Ordering::Relaxed) {
+        trace!("[adblock-webext] rules/ping skipped tab={tab_id} reason=not-configured");
         return;
     }
 
-    send_webext_rules(tab_id, webview, adblock, private);
+    send_webext_rules(tab_id, webview, adblock, private, false, false);
 
     let ping = UserMessage::new(
         "rashamon-webext-ping",
         Some(&glib::Variant::from("ping")),
     );
+    let webview_for_ready = webview.clone();
+    let adblock_for_ready = Rc::clone(adblock);
     webview.send_message_to_page(&ping, None::<&gio::Cancellable>, move |result| {
         match result {
             Ok(reply) => {
@@ -2174,27 +2250,22 @@ fn send_webext_ping_and_rules(
                     .unwrap_or(false);
                 if ready {
                     WEBEXT_READY.store(true, Ordering::Relaxed);
-                    trace!("[webext] ready tab={tab_id}");
+                    trace!("[webext] ready tab={tab_id}; syncing rules after handshake");
+                    send_webext_rules(
+                        tab_id,
+                        &webview_for_ready,
+                        &adblock_for_ready,
+                        private,
+                        true,
+                        std::env::var_os("RASHAMON_WEBEXT_SMOKE_INVALID_RULES").is_some(),
+                    );
                 } else {
                     trace!("[webext] ping reply unexpected tab={tab_id}: {:?}", reply.name());
                 }
             }
-            Err(err) => trace!("[webext] ping failed tab={tab_id}: {err}"),
+            Err(err) => trace!("[webext] ping failed tab={tab_id}: {err}; fallback=in-process"),
         }
     });
-
-    if std::env::var_os("RASHAMON_WEBEXT_SMOKE_PROBE").is_some() {
-        let probe = UserMessage::new(
-            "rashamon-webext-probe-url",
-            Some(&glib::Variant::from(("https://doubleclick.net/pagead/probe",))),
-        );
-        webview.send_message_to_page(&probe, None::<&gio::Cancellable>, move |result| {
-            match result {
-                Ok(reply) => trace!("[webext] probe reply tab={tab_id}: {:?}", reply.name()),
-                Err(err) => trace!("[webext] probe failed tab={tab_id}: {err}"),
-            }
-        });
-    }
 }
 
 fn send_webext_rules(
@@ -2202,18 +2273,26 @@ fn send_webext_rules(
     webview: &webkit2gtk::WebView,
     adblock: &Rc<RefCell<AdblockEngine>>,
     private: bool,
+    smoke_probe: bool,
+    invalid_probe: bool,
 ) {
     use webkit2gtk::{UserMessage, UserMessageExt, WebViewExt};
 
     if !WEBEXT_CONFIGURED.load(Ordering::Relaxed) {
+        trace!("[adblock-webext] rules sync skipped tab={tab_id} reason=not-configured fallback=in-process");
         return;
     }
 
     let payload = adblock.borrow().export_rule_sync_text_for_context(private);
+    trace!(
+        "[adblock-webext] rules sync start tab={tab_id} private={private} bytes={}",
+        payload.len()
+    );
     let rules = UserMessage::new(
         "rashamon-webext-set-rules",
         Some(&glib::Variant::from((payload,))),
     );
+    let webview_for_probe = webview.clone();
     webview.send_message_to_page(&rules, None::<&gio::Cancellable>, move |result| {
         match result {
             Ok(reply) => {
@@ -2221,42 +2300,75 @@ fn send_webext_rules(
                 if name == "rashamon-webext-rules-ok" {
                     WEBEXT_RULES_OK.fetch_add(1, Ordering::Relaxed);
                     trace!("[adblock-webext] rules sync ok tab={tab_id}");
+                    if invalid_probe {
+                        send_webext_invalid_rules_probe(tab_id, &webview_for_probe, smoke_probe);
+                    } else if smoke_probe {
+                        send_webext_smoke_probe(tab_id, &webview_for_probe);
+                    }
                 } else {
                     WEBEXT_RULES_ERROR.fetch_add(1, Ordering::Relaxed);
-                    trace!("[adblock-webext] rules sync unexpected tab={tab_id}: {name}");
+                    trace!("[adblock-webext] rules sync unexpected tab={tab_id}: {name}; fallback=in-process");
                 }
             }
             Err(err) => {
                 WEBEXT_RULES_ERROR.fetch_add(1, Ordering::Relaxed);
-                trace!("[adblock-webext] rules sync failed tab={tab_id}: {err}");
+                trace!("[adblock-webext] rules sync failed tab={tab_id}: {err}; fallback=in-process");
             }
         }
     });
+}
 
-    if std::env::var_os("RASHAMON_WEBEXT_SMOKE_INVALID_RULES").is_some() {
-        let invalid = UserMessage::new(
-            "rashamon-webext-set-rules",
-            Some(&glib::Variant::from(("version=999\nenabled=1\n",))),
-        );
-        webview.send_message_to_page(&invalid, None::<&gio::Cancellable>, move |result| {
-            match result {
-                Ok(reply) => {
-                    let name = reply.name().map(|n| n.to_string()).unwrap_or_default();
-                    if name == "rashamon-webext-rules-error" {
-                        WEBEXT_RULES_ERROR.fetch_add(1, Ordering::Relaxed);
-                        trace!("[adblock-webext] invalid rules rejected tab={tab_id}");
-                    } else {
-                        trace!(
-                            "[adblock-webext] invalid rules reply unexpected tab={tab_id}: {name}"
-                        );
-                    }
+fn send_webext_smoke_probe(tab_id: u64, webview: &webkit2gtk::WebView) {
+    use webkit2gtk::{UserMessage, UserMessageExt, WebViewExt};
+    if std::env::var_os("RASHAMON_WEBEXT_SMOKE_PROBE").is_none() {
+        return;
+    }
+    let probe = UserMessage::new(
+        "rashamon-webext-probe-url",
+        Some(&glib::Variant::from(("https://doubleclick.net/pagead/probe",))),
+    );
+    webview.send_message_to_page(&probe, None::<&gio::Cancellable>, move |result| {
+        match result {
+            Ok(reply) => {
+                let name = reply.name().map(|n| n.to_string()).unwrap_or_default();
+                if name == "rashamon-webext-probe-blocked" {
+                    WEBEXT_PROBE_BLOCKED.fetch_add(1, Ordering::Relaxed);
+                } else if name == "rashamon-webext-probe-clear" {
+                    WEBEXT_PROBE_CLEAR.fetch_add(1, Ordering::Relaxed);
                 }
-                Err(err) => {
-                    trace!("[adblock-webext] invalid rules probe failed tab={tab_id}: {err}")
+                trace!("[webext] probe reply tab={tab_id}: {name}");
+            }
+            Err(err) => trace!("[webext] probe failed tab={tab_id}: {err}; fallback=in-process"),
+        }
+    });
+}
+
+fn send_webext_invalid_rules_probe(tab_id: u64, webview: &webkit2gtk::WebView, probe_after_reject: bool) {
+    use webkit2gtk::{UserMessage, UserMessageExt, WebViewExt};
+    let invalid = UserMessage::new(
+        "rashamon-webext-set-rules",
+        Some(&glib::Variant::from(("version=999\nenabled=1\n",))),
+    );
+    let webview_for_probe = webview.clone();
+    webview.send_message_to_page(&invalid, None::<&gio::Cancellable>, move |result| {
+        match result {
+            Ok(reply) => {
+                let name = reply.name().map(|n| n.to_string()).unwrap_or_default();
+                if name == "rashamon-webext-rules-error" {
+                    WEBEXT_RULES_ERROR.fetch_add(1, Ordering::Relaxed);
+                    trace!("[adblock-webext] invalid rules rejected tab={tab_id}");
+                    if probe_after_reject {
+                        send_webext_smoke_probe(tab_id, &webview_for_probe);
+                    }
+                } else {
+                    trace!(
+                        "[adblock-webext] invalid rules reply unexpected tab={tab_id}: {name}"
+                    );
                 }
             }
-        });
-    }
+            Err(err) => trace!("[adblock-webext] invalid rules probe failed tab={tab_id}: {err}"),
+        }
+    });
 }
 
 // ── Snapshot helper ───────────────────────────────────────────────────────────
@@ -2504,7 +2616,7 @@ fn adblock_block_reason(
 }
 
 fn log_adblock_block_with_kind(url: &str, reason: &str, kind: &str) {
-    trace!("[adblock] blocked {url} reason={reason} kind={kind}");
+    trace!("[adblock] blocked {url} reason={reason} kind={kind} source=in-process");
     if std::env::var_os("RASHAMON_PERF").is_some() {
         eprintln!("[perf] adblock_blocked kind={kind}");
     }
@@ -2515,16 +2627,38 @@ fn origin_key(origin_or_url: &str) -> String {
 }
 
 fn increment_origin_block_count(
-    blocked_by_origin: &Rc<RefCell<HashMap<String, u64>>>,
+    blocked_by_origin: &Rc<RefCell<HashMap<String, OriginBlockCounts>>>,
     origin_or_url: &str,
+    source: BlockSource,
 ) {
+    match source {
+        BlockSource::InProcessPolicy => {
+            ADBLOCK_POLICY_BLOCKS.fetch_add(1, Ordering::Relaxed);
+        }
+        BlockSource::InProcessSubresource => {
+            ADBLOCK_SUBRESOURCE_REWRITES.fetch_add(1, Ordering::Relaxed);
+        }
+        BlockSource::WebExtensionHard => {
+            WEBEXT_BLOCKED_EVENTS.fetch_add(1, Ordering::Relaxed);
+        }
+    }
     if origin_or_url.is_empty() {
         return;
     }
     let key = origin_key(origin_or_url);
     let mut counts = blocked_by_origin.borrow_mut();
-    let next = counts.get(&key).copied().unwrap_or(0).saturating_add(1);
-    counts.insert(key, next);
+    let entry = counts.entry(key).or_default();
+    match source {
+        BlockSource::InProcessPolicy => {
+            entry.in_process_policy = entry.in_process_policy.saturating_add(1);
+        }
+        BlockSource::InProcessSubresource => {
+            entry.in_process_subresource = entry.in_process_subresource.saturating_add(1);
+        }
+        BlockSource::WebExtensionHard => {
+            entry.webextension_hard = entry.webextension_hard.saturating_add(1);
+        }
+    }
 }
 
 fn connect_downloads_for_context(

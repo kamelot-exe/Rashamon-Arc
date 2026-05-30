@@ -31,11 +31,12 @@ use runtime::LinuxDesktopRuntime;
 use runtime::PlatformRuntime;
 use rashamon_net::{AdblockEngine, HttpClient};
 use rashamon_renderer::{
+    adblock_policy_blocks_for_test,
     download_destination_for_test, origin_from_url, CursorKind, DecisionSource, EngineEvent, EngineFrame,
     Framebuffer, PermissionDecision, PermissionKind, PermissionStore, RenderEngine,
     webext_blocked_events_for_test, webext_is_available_for_test, webext_is_configured_for_test,
-    webext_is_disabled_for_test, webext_ready_for_test, webext_rules_error_for_test,
-    webext_rules_ok_for_test,
+    webext_is_disabled_for_test, webext_probe_blocked_for_test, webext_probe_clear_for_test,
+    webext_ready_for_test, webext_rules_error_for_test, webext_rules_ok_for_test,
 };
 use rashamon_renderer::framebuffer::Pixel;
 use ui_state::{BrowserState, DirtyFlags, DownloadStatus, OverlayKind, PageState, TabId, derive_title};
@@ -1047,6 +1048,7 @@ fn run_webkit_smoke_test() -> Result<SmokePerfMetrics, Box<dyn std::error::Error
 
     if webext_is_configured_for_test() && std::env::var_os("RASHAMON_DISABLE_WEBEXT").is_none() {
         let blocked_probe_before = webext_blocked_events_for_test();
+        let probe_blocked_before = webext_probe_blocked_for_test();
         let rules_ok_before = webext_rules_ok_for_test();
         let rules_error_before = webext_rules_error_for_test();
         match smoke_wait_for(
@@ -1086,13 +1088,35 @@ fn run_webkit_smoke_test() -> Result<SmokePerfMetrics, Box<dyn std::error::Error
                     } else {
                         smoke_log("[smoke] SKIP webext invalid rules rejection (not observed)");
                     }
+                    let invalid_rules_before = webext_rules_error_for_test();
+                    let invalid_retained_probe_before = webext_probe_blocked_for_test();
+                    engine.adblock_remove_allow_domain("invalid-probe.invalid");
+                    if smoke_wait_for(
+                        &mut state,
+                        &mut engine,
+                        "webext invalid rules kept previous rules",
+                        Duration::from_secs(3),
+                        |_s, _| {
+                            webext_rules_error_for_test() > invalid_rules_before
+                                && webext_probe_blocked_for_test() > invalid_retained_probe_before
+                        },
+                    )
+                    .is_ok()
+                    {
+                        smoke_log("[smoke] PASS webext invalid rules kept previous rules");
+                    } else {
+                        smoke_log("[smoke] SKIP webext invalid rules retention (not observed)");
+                    }
                 }
                 if smoke_wait_for(
                     &mut state,
                     &mut engine,
                     "webext blocked-event probe",
                     Duration::from_secs(3),
-                    |_s, _| webext_blocked_events_for_test() > blocked_probe_before,
+                    |_s, _| {
+                        webext_blocked_events_for_test() > blocked_probe_before
+                            && webext_probe_blocked_for_test() > probe_blocked_before
+                    },
                 )
                 .is_ok()
                 {
@@ -1100,6 +1124,46 @@ fn run_webkit_smoke_test() -> Result<SmokePerfMetrics, Box<dyn std::error::Error
                     smoke_log("[smoke] PASS webext blocked event path");
                 } else {
                     smoke_log("[smoke] SKIP webext blocked event path (not observed)");
+                }
+
+                let allow_rules_before = webext_rules_ok_for_test();
+                let allow_probe_clear_before = webext_probe_clear_for_test();
+                engine.adblock_allow_domain("doubleclick.net");
+                if smoke_wait_for(
+                    &mut state,
+                    &mut engine,
+                    "webext rules sync after allowlist add",
+                    Duration::from_secs(3),
+                    |_s, _| {
+                        webext_rules_ok_for_test() > allow_rules_before
+                            && webext_probe_clear_for_test() > allow_probe_clear_before
+                    },
+                )
+                .is_ok()
+                {
+                    smoke_log("[smoke] PASS webext rules sync after allowlist add");
+                } else {
+                    return Err(smoke_fail("webext rules did not resync after allowlist add"));
+                }
+
+                let block_rules_before = webext_rules_ok_for_test();
+                let block_probe_before = webext_probe_blocked_for_test();
+                engine.adblock_remove_allow_domain("doubleclick.net");
+                if smoke_wait_for(
+                    &mut state,
+                    &mut engine,
+                    "webext rules sync after allowlist remove",
+                    Duration::from_secs(3),
+                    |_s, _| {
+                        webext_rules_ok_for_test() > block_rules_before
+                            && webext_probe_blocked_for_test() > block_probe_before
+                    },
+                )
+                .is_ok()
+                {
+                    smoke_log("[smoke] PASS webext rules sync after allowlist remove");
+                } else {
+                    return Err(smoke_fail("webext rules did not resync after allowlist remove"));
                 }
             }
             Err(_) => {
@@ -1112,11 +1176,15 @@ fn run_webkit_smoke_test() -> Result<SmokePerfMetrics, Box<dyn std::error::Error
     }
 
     let blocked_before = webext_blocked_events_for_test();
+    let policy_blocks_before = adblock_policy_blocks_for_test();
     smoke_navigate(&mut state, &mut engine, "https://doubleclick.net/pagead/id")?;
     smoke_wait_for(&mut state, &mut engine, "adblock rejects blocked URL", Duration::from_secs(4), |s, events| {
         events.iter().any(|e| matches!(e, EngineEvent::LoadFailed(reason) if reason.contains("Blocked by adblock")))
             && s.active_tab().map_or(false, |t| matches!(t.page_state, PageState::Error(_)))
     })?;
+    if adblock_policy_blocks_for_test() <= policy_blocks_before {
+        return Err(smoke_fail("in-process policy block counter did not increment"));
+    }
     if perf_metrics.webext_loaded && !perf_metrics.webext_disabled && !perf_metrics.webext_blocked_event_seen {
         let blocked_seen = webext_blocked_events_for_test() > blocked_before;
         perf_metrics.webext_blocked_event_seen = blocked_seen;
@@ -1155,7 +1223,23 @@ fn run_webkit_smoke_test() -> Result<SmokePerfMetrics, Box<dyn std::error::Error
     })?;
     let first_loaded_id = state.active_tab_id;
 
+    let new_tab_rules_before = webext_rules_ok_for_test();
     smoke_create_tab(&mut state, &mut engine, false);
+    if webext_is_configured_for_test() && std::env::var_os("RASHAMON_DISABLE_WEBEXT").is_none() {
+        if smoke_wait_for(
+            &mut state,
+            &mut engine,
+            "webext rules sync after new tab",
+            Duration::from_secs(3),
+            |_s, _| webext_rules_ok_for_test() > new_tab_rules_before,
+        )
+        .is_ok()
+        {
+            smoke_log("[smoke] PASS webext rules sync after new tab");
+        } else {
+            return Err(smoke_fail("webext rules did not sync after new tab"));
+        }
+    }
     {
         use omnibox::{classify_input, InputKind, DEFAULT_PROVIDER};
         let search_url = match classify_input("rust browser engine") {

@@ -101,11 +101,12 @@ pub enum SplitPane {
     Right,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct SplitViewState {
     pub left:   TabId,
     pub right:  TabId,
     pub active: SplitPane,
+    pub ratio:  f32,
 }
 
 impl SplitViewState {
@@ -121,6 +122,10 @@ impl SplitViewState {
             SplitPane::Left => self.left,
             SplitPane::Right => self.right,
         }
+    }
+
+    pub fn clamp_ratio(ratio: f32) -> f32 {
+        ratio.clamp(layout::SPLIT_RATIO_MIN, layout::SPLIT_RATIO_MAX)
     }
 }
 
@@ -369,6 +374,7 @@ pub struct BrowserState {
     pub tabs:          Vec<TabState>,
     pub active_tab_id: TabId,
     pub split_view:    Option<SplitViewState>,
+    pub split_dragging: bool,
 
     pub mouse_x:     u32,
     pub mouse_y:     u32,
@@ -418,6 +424,7 @@ impl BrowserState {
             tabs:          vec![first_tab],
             active_tab_id: first_id,
             split_view:    None,
+            split_dragging: false,
             mouse_x:       0,
             mouse_y:       0,
             frame_count:   0,
@@ -717,8 +724,46 @@ impl BrowserState {
         self.split_view.map(|split| split.active)
     }
 
+    pub fn split_ratio(&self) -> f32 {
+        self.split_view.map_or(0.5, |split| split.ratio)
+    }
+
+    pub fn set_split_ratio(&mut self, ratio: f32) -> bool {
+        let Some(split) = self.split_view.as_mut() else { return false };
+        let next = SplitViewState::clamp_ratio(ratio);
+        if (split.ratio - next).abs() < f32::EPSILON {
+            return false;
+        }
+        split.ratio = next;
+        self.dirty.chrome = true;
+        self.dirty.content = true;
+        true
+    }
+
+    pub fn split_widths(&self) -> (u32, u32, u32) {
+        let ratio = self.split_ratio();
+        let available = FB_WIDTH.saturating_sub(layout::SPLIT_HANDLE_W);
+        let min = (available as f32 * layout::SPLIT_RATIO_MIN).round() as u32;
+        let max = available.saturating_sub(min);
+        let mut left = (available as f32 * ratio).round() as u32;
+        left = left.clamp(min, max);
+        let right = available.saturating_sub(left);
+        (left, layout::SPLIT_HANDLE_W, right)
+    }
+
+    pub fn split_divider_x(&self) -> u32 {
+        self.split_widths().0
+    }
+
     pub fn split_pane_for_x(&self, x: u32) -> SplitPane {
-        if x < FB_WIDTH / 2 { SplitPane::Left } else { SplitPane::Right }
+        let (left_w, handle_w, _) = self.split_widths();
+        if x < left_w {
+            SplitPane::Left
+        } else if x >= left_w.saturating_add(handle_w) {
+            SplitPane::Right
+        } else {
+            self.split_active_pane().unwrap_or(SplitPane::Left)
+        }
     }
 
     pub fn activate_split_pane(&mut self, pane: SplitPane) -> Option<TabId> {
@@ -742,7 +787,13 @@ impl BrowserState {
         if !self.tabs.iter().any(|tab| tab.id == left) || !self.tabs.iter().any(|tab| tab.id == right) {
             return false;
         }
-        self.split_view = Some(SplitViewState { left, right, active });
+        self.split_view = Some(SplitViewState {
+            left,
+            right,
+            active,
+            ratio: 0.5,
+        });
+        self.split_dragging = false;
         let active_id = self.split_view.unwrap().active_tab_id();
         self.activate_tab(active_id);
         self.dirty.all();
@@ -752,6 +803,7 @@ impl BrowserState {
     pub fn exit_split_view(&mut self) -> Option<TabId> {
         let active = self.split_view.map(|split| split.active_tab_id());
         self.split_view = None;
+        self.split_dragging = false;
         if let Some(id) = active {
             self.activate_tab(id);
         } else {
@@ -794,10 +846,33 @@ impl BrowserState {
         if let Some(split) = self.split_view {
             self.active_tab_id = split.active_tab_id();
         }
+        self.split_dragging = false;
         self.sync_address_bar();
         self.update_layout();
         self.update_bookmark_flag();
         self.dirty.all();
+    }
+
+    pub fn split_drag_active(&self) -> bool {
+        self.split_dragging
+    }
+
+    pub fn begin_split_drag(&mut self) {
+        if self.split_view.is_some() {
+            self.split_dragging = true;
+            self.address_bar_focused = false;
+            self.close_overlay();
+            self.close_site_info();
+            self.dirty.all();
+        }
+    }
+
+    pub fn end_split_drag(&mut self) {
+        if self.split_dragging {
+            self.split_dragging = false;
+            self.dirty.chrome = true;
+            self.dirty.content = true;
+        }
     }
 
     // ── Mouse / hover ─────────────────────────────────────────────────────────
@@ -876,6 +951,7 @@ impl BrowserState {
             self.tabs[0]       = fresh;
             self.active_tab_id = fresh_id;
             self.split_view    = None;
+            self.split_dragging = false;
             self.close_site_info();
             self.sync_address_bar();
             self.update_layout();

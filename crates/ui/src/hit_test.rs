@@ -38,6 +38,7 @@ pub(crate) enum UiHitTarget {
     SiteAdblockToggle,
     FindClose,
     ErrorRetry,
+    SplitDivider,
     Content,
 }
 
@@ -61,6 +62,9 @@ pub(crate) fn hit_test_ui(state: &BrowserState, x: u32, y: u32) -> UiHitTarget {
     }
     if state.overlay != OverlayKind::None {
         return UiHitTarget::OverlayActivate;
+    }
+    if state.split_view.is_some() && hit_split_divider(state, x, y) {
+        return UiHitTarget::SplitDivider;
     }
     hit_content(state, x, y)
 }
@@ -171,9 +175,6 @@ fn hit_chrome_bar(state: &BrowserState, x: u32, y: u32) -> UiHitTarget {
 }
 
 fn hit_content(state: &BrowserState, x: u32, y: u32) -> UiHitTarget {
-    if state.split_view.is_some() {
-        return UiHitTarget::Content;
-    }
     match state.active_tab().map(|tab| &tab.page_state) {
         Some(PageState::Error(_)) => {
             let (bx, by) = retry_btn_pos();
@@ -208,6 +209,11 @@ fn hit_content(state: &BrowserState, x: u32, y: u32) -> UiHitTarget {
         _ => {}
     }
     UiHitTarget::Content
+}
+
+fn hit_split_divider(state: &BrowserState, x: u32, y: u32) -> bool {
+    let divider_x = state.split_divider_x();
+    in_rect(x, y, (divider_x, TOP_BAR_HEIGHT, SPLIT_HANDLE_W, FB_HEIGHT.saturating_sub(TOP_BAR_HEIGHT)))
 }
 
 pub(crate) fn permission_prompt_rect() -> Rect {

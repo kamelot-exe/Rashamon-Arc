@@ -22,6 +22,9 @@ pub const RETRY_BTN_H: u32 = 38;
 pub const QUICK_LINK_W:   u32 = 120;
 pub const QUICK_LINK_H:   u32 = 100;
 pub const QUICK_LINK_GAP: u32 = 16;
+pub const SPLIT_HANDLE_W: u32 = 10;
+pub const SPLIT_RATIO_MIN: f32 = 0.25;
+pub const SPLIT_RATIO_MAX: f32 = 0.75;
 
 #[inline]
 pub fn tab_width(n: usize) -> u32 {

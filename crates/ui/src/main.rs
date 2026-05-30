@@ -1293,8 +1293,14 @@ fn run_webkit_smoke_test() -> Result<SmokePerfMetrics, Box<dyn std::error::Error
         return Err(smoke_fail("split panes were not assigned"));
     }
     let split_content_h = FB_HEIGHT.saturating_sub(TOP_BAR_HEIGHT);
-    let split_left_w = FB_WIDTH / 2;
-    let split_right_w = FB_WIDTH.saturating_sub(split_left_w);
+    let (initial_left_w, _, _) = state.split_widths();
+    if !state.set_split_ratio(0.68) {
+        return Err(smoke_fail("split ratio did not update"));
+    }
+    let (split_left_w, split_handle_w, split_right_w) = state.split_widths();
+    if split_left_w == initial_left_w {
+        return Err(smoke_fail("split ratio did not change pane width"));
+    }
     engine.set_tab_viewport(first_loaded_id.raw(), split_left_w, split_content_h);
     engine.set_tab_viewport(split_nav_tab.raw(), split_right_w, split_content_h);
     smoke_wait_for(&mut state, &mut engine, "split left viewport resizes", Duration::from_secs(4), |_s, events| {
@@ -1329,7 +1335,7 @@ fn run_webkit_smoke_test() -> Result<SmokePerfMetrics, Box<dyn std::error::Error
         &mut engine,
         "split right snapshot matches pane viewport",
         split_nav_tab,
-        (split_left_w, TOP_BAR_HEIGHT, split_right_w, split_content_h),
+        (split_left_w + split_handle_w, TOP_BAR_HEIGHT, split_right_w, split_content_h),
         Duration::from_secs(4),
     )?;
     smoke_log("[smoke] PASS split active pane navigation");
@@ -1982,13 +1988,19 @@ fn render_ui(
     }
 }
 
-fn split_pane_rect(pane: SplitPane) -> Rect {
-    let half = FB_WIDTH / 2;
+fn split_pane_rect(state: &BrowserState, pane: SplitPane) -> Rect {
+    let (left_w, handle_w, right_w) = state.split_widths();
     let h = FB_HEIGHT.saturating_sub(TOP_BAR_HEIGHT);
     match pane {
-        SplitPane::Left => (0, TOP_BAR_HEIGHT, half, h),
-        SplitPane::Right => (half, TOP_BAR_HEIGHT, FB_WIDTH.saturating_sub(half), h),
+        SplitPane::Left => (0, TOP_BAR_HEIGHT, left_w, h),
+        SplitPane::Right => (left_w + handle_w, TOP_BAR_HEIGHT, right_w, h),
     }
+}
+
+fn split_divider_rect(state: &BrowserState) -> Rect {
+    let (left_w, handle_w, _) = state.split_widths();
+    let h = FB_HEIGHT.saturating_sub(TOP_BAR_HEIGHT);
+    (left_w, TOP_BAR_HEIGHT, handle_w, h)
 }
 
 fn render_split_content(
@@ -2008,7 +2020,7 @@ fn render_split_content(
 
     for pane in [SplitPane::Left, SplitPane::Right] {
         let tab_id = split.tab_for_pane(pane);
-        let (x, y, w, h) = split_pane_rect(pane);
+        let (x, y, w, h) = split_pane_rect(state, pane);
         match state.tab_by_id(tab_id).map(|tab| &tab.page_state) {
             Some(PageState::Loaded) => {
                 match engine.render_tab_into(tab_id.raw(), fb, x, y, w, h) {
@@ -2052,7 +2064,7 @@ fn draw_split_placeholder(
     pane:  SplitPane,
     label: &str,
 ) {
-    let (x, y, w, h) = split_pane_rect(pane);
+    let (x, y, w, h) = split_pane_rect(state, pane);
     fb.fill_rect(x, y, w, h, state.theme.bg);
     let text_w = font.text_width(label, 16.0);
     let tx = x + w.saturating_sub(text_w) / 2;
@@ -2063,10 +2075,9 @@ fn draw_split_placeholder(
 fn draw_split_view_chrome(fb: &mut Framebuffer, state: &BrowserState, font: &FontManager) {
     let Some(split) = state.split_view else { return };
     let theme = state.theme;
-    let mid = FB_WIDTH / 2;
-    fb.fill_rect(mid.saturating_sub(1), TOP_BAR_HEIGHT, 2, FB_HEIGHT.saturating_sub(TOP_BAR_HEIGHT), theme.border);
+    draw_split_divider(fb, state);
     for pane in [SplitPane::Left, SplitPane::Right] {
-        let (x, y, w, h) = split_pane_rect(pane);
+        let (x, y, w, h) = split_pane_rect(state, pane);
         let active = split.active == pane;
         let color = if active { theme.accent } else { theme.border };
         fb.fill_rect(x, y, w, 2, color);
@@ -2097,6 +2108,20 @@ fn draw_split_view_hint(fb: &mut Framebuffer, state: &BrowserState, font: &FontM
     let x = FB_WIDTH.saturating_sub(144);
     let y = TAB_BAR_HEIGHT + (CHROME_BAR_HEIGHT - 22) / 2;
     draw::draw_text(fb, font, x, y + 5, label, 11.5, state.theme.fg_secondary, 120);
+}
+
+fn draw_split_divider(fb: &mut Framebuffer, state: &BrowserState) {
+    let theme = state.theme;
+    let (x, y, w, h) = split_divider_rect(state);
+    let active = state.split_drag_active();
+    let fill = if active { theme.surface } else { theme.bg };
+    let accent = if active { theme.accent } else { theme.border };
+    fb.fill_rect(x, y, w, h, fill);
+    fb.fill_rect(x + w / 2, y + 8, 1, h.saturating_sub(16), accent);
+    if active {
+        fb.fill_rect(x, y, w, 2, accent);
+        fb.fill_rect(x, y + h.saturating_sub(2), w, 2, accent);
+    }
 }
 
 // ── Tab row ───────────────────────────────────────────────────────────────────

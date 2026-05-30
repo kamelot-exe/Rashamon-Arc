@@ -212,6 +212,11 @@ impl BrowserCoreDriver {
             } => self.dispatch(BrowserAction::SitePermissionSet(permission, decision)),
             UiHitTarget::SiteAdblockToggle => self.dispatch(BrowserAction::SiteAdblockToggle),
             UiHitTarget::FindClose => self.dispatch(BrowserAction::FindClose),
+            UiHitTarget::SplitDivider => {
+                self.state.begin_split_drag();
+                self.sync_split_viewports();
+                false
+            }
             UiHitTarget::Content => self.dispatch(BrowserAction::AddressBarCancel),
         }
     }
@@ -228,9 +233,10 @@ impl BrowserCoreDriver {
             return (x, content_y);
         }
         let pane = self.state.split_pane_for_x(x);
+        let (left_w, handle_w, _) = self.state.split_widths();
         let pane_x = match pane {
             SplitPane::Left => 0,
-            SplitPane::Right => FB_WIDTH / 2,
+            SplitPane::Right => left_w.saturating_add(handle_w),
         };
         if activate {
             if self.state.split_active_pane() != Some(pane) {
@@ -278,7 +284,8 @@ impl BrowserCoreDriver {
             | UiHitTarget::SitePermission { .. }
             | UiHitTarget::SiteAdblockToggle
             | UiHitTarget::FindClose
-            | UiHitTarget::ErrorRetry => CursorKind::Pointer,
+            | UiHitTarget::ErrorRetry
+            | UiHitTarget::SplitDivider => CursorKind::Pointer,
             UiHitTarget::AddressBar | UiHitTarget::NewTabSearch => CursorKind::Text,
             UiHitTarget::Content
             | UiHitTarget::None
@@ -294,7 +301,14 @@ impl BrowserCoreDriver {
     ) -> bool {
         match event {
             PlatformEvent::Quit => self.dispatch(BrowserAction::Quit),
-            PlatformEvent::Tick | PlatformEvent::MouseUp { .. } => false,
+            PlatformEvent::Tick => false,
+            PlatformEvent::MouseUp { .. } => {
+                if self.state.split_drag_active() {
+                    self.state.end_split_drag();
+                    self.sync_split_viewports();
+                }
+                false
+            }
             PlatformEvent::WindowResized { .. } => {
                 self.sync_split_viewports();
                 false
@@ -332,6 +346,10 @@ impl BrowserCoreDriver {
             PlatformEvent::MouseMove { x, y } => {
                 let x = x.max(0) as u32;
                 let y = y.max(0) as u32;
+                if self.state.split_drag_active() {
+                    self.update_split_ratio_from_mouse(x);
+                    return false;
+                }
                 self.state.set_mouse_pos(x, y);
                 let target = crate::hit_test::hit_test_ui(&self.state, x, y);
                 self.update_shell_cursor(&target);
@@ -347,6 +365,11 @@ impl BrowserCoreDriver {
                 let target = crate::hit_test::hit_test_ui(&self.state, x, y);
                 match button {
                     MouseButton::Left => {
+                        if matches!(target, UiHitTarget::SplitDivider) {
+                            self.state.begin_split_drag();
+                            self.update_shell_cursor(&target);
+                            return false;
+                        }
                         if matches!(target, UiHitTarget::Content) {
                             self.click_content(x, y);
                             false
@@ -555,6 +578,7 @@ impl BrowserCoreDriver {
     fn toggle_split_view(&mut self) {
         if self.state.split_view.is_some() {
             let old_split = self.state.split_view;
+            self.state.end_split_drag();
             self.state.exit_split_view();
             if let Some(split) = old_split {
                 self.set_full_tab_viewport(split.left);
@@ -597,8 +621,7 @@ impl BrowserCoreDriver {
             return;
         };
         let content_h = FB_HEIGHT.saturating_sub(TOP_BAR_HEIGHT);
-        let left_w = FB_WIDTH / 2;
-        let right_w = FB_WIDTH.saturating_sub(left_w);
+        let (left_w, _, right_w) = self.state.split_widths();
         self.engine.set_tab_viewport(split.left.raw(), left_w, content_h);
         self.engine.set_tab_viewport(split.right.raw(), right_w, content_h);
     }
@@ -621,6 +644,22 @@ impl BrowserCoreDriver {
             if !still_split && self.state.tabs.iter().any(|tab| tab.id == old_id) {
                 self.set_full_tab_viewport(old_id);
             }
+        }
+    }
+
+    fn update_split_ratio_from_mouse(&mut self, x: u32) {
+        if !self.state.split_drag_active() {
+            return;
+        }
+        let available = FB_WIDTH.saturating_sub(crate::layout::SPLIT_HANDLE_W);
+        let min = (available as f32 * crate::layout::SPLIT_RATIO_MIN).round() as u32;
+        let max = available.saturating_sub(min);
+        let left = x
+            .saturating_sub(crate::layout::SPLIT_HANDLE_W / 2)
+            .clamp(min, max);
+        let ratio = left as f32 / available.max(1) as f32;
+        if self.state.set_split_ratio(ratio) {
+            self.sync_split_viewports();
         }
     }
 

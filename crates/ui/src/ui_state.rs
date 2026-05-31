@@ -2,6 +2,7 @@
 
 use crate::layout::{self, *};
 use crate::page::PageNode;
+use crate::persist;
 use crate::theme::{get_theme, ColorPalette, Theme};
 use rashamon_renderer::{PermissionDecision, PermissionKind};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -261,6 +262,23 @@ impl BrowsingProfile {
             Self::TorProxy => rashamon_renderer::EngineProfile::TorProxy,
         }
     }
+
+    pub fn as_session_str(self) -> &'static str {
+        match self {
+            Self::Normal => "Normal",
+            Self::Private => "Private",
+            Self::TorProxy => "TorProxy",
+        }
+    }
+
+    pub fn from_session_str(s: &str) -> Option<Self> {
+        match s {
+            "Normal" => Some(Self::Normal),
+            "Private" => Some(Self::Private),
+            "TorProxy" => Some(Self::TorProxy),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -295,6 +313,7 @@ impl TabState {
     pub fn new_tab() -> Self { Self::make(BrowsingProfile::Normal) }
     pub fn new_private() -> Self { Self::make(BrowsingProfile::Private) }
     pub fn new_tor_proxy() -> Self { Self::make(BrowsingProfile::TorProxy) }
+    pub fn new_profile(profile: BrowsingProfile) -> Self { Self::make(profile) }
 
     fn make(profile: BrowsingProfile) -> Self {
         Self {
@@ -374,6 +393,15 @@ impl TabState {
             PageState::Error(_) => if self.title.is_empty() { "Error" }     else { &self.title },
         }
     }
+
+    pub fn set_restored_url(&mut self, url: &str) {
+        if url.is_empty() { return; }
+        self.url = url.to_string();
+        self.display_url = url.to_string();
+        self.title = derive_title(url).to_string();
+        self.page_state = PageState::Loaded;
+        self.last_committed_url = url.to_string();
+    }
 }
 
 // ── QuickLink ─────────────────────────────────────────────────────────────────
@@ -441,6 +469,7 @@ pub struct BrowserState {
     pub dirty:          DirtyFlags,
     pub theme_version:  u64,
     pub hovered_region: HoveredRegion,
+    pub session_recovered: bool,
 }
 
 impl BrowserState {
@@ -485,6 +514,7 @@ impl BrowserState {
             dirty:          DirtyFlags { tabs: true, chrome: true, content: true },
             theme_version:  0,
             hovered_region: HoveredRegion::None,
+            session_recovered: false,
         };
         s.update_layout();
         s
@@ -901,6 +931,117 @@ impl BrowserState {
             self.dirty.chrome = true;
             self.dirty.content = true;
         }
+    }
+
+    pub fn to_stored_session(&self, clean_shutdown: bool) -> persist::StoredSession {
+        let mut tabs = Vec::new();
+        let mut id_to_index = Vec::new();
+        for tab in &self.tabs {
+            if tab.profile == BrowsingProfile::Private {
+                continue;
+            }
+            id_to_index.push((tab.id, tabs.len()));
+            tabs.push(persist::StoredSessionTab {
+                url: tab.url.clone(),
+                profile: tab.profile.as_session_str().to_string(),
+            });
+        }
+        if tabs.is_empty() {
+            tabs.push(persist::StoredSessionTab {
+                url: String::new(),
+                profile: BrowsingProfile::Normal.as_session_str().to_string(),
+            });
+        }
+        let active_index = id_to_index
+            .iter()
+            .find_map(|(id, idx)| if *id == self.active_tab_id { Some(*idx) } else { None })
+            .unwrap_or(0)
+            .min(tabs.len().saturating_sub(1));
+        let split = self.split_view.and_then(|split| {
+            let left_index = id_to_index
+                .iter()
+                .find_map(|(id, idx)| if *id == split.left { Some(*idx) } else { None })?;
+            let right_index = id_to_index
+                .iter()
+                .find_map(|(id, idx)| if *id == split.right { Some(*idx) } else { None })?;
+            if left_index == right_index {
+                return None;
+            }
+            Some(persist::StoredSessionSplit {
+                left_index,
+                right_index,
+                active_pane: match split.active {
+                    SplitPane::Left => "Left".to_string(),
+                    SplitPane::Right => "Right".to_string(),
+                },
+                ratio: split.ratio,
+            })
+        });
+        persist::StoredSession {
+            version: 1,
+            clean_shutdown,
+            active_index,
+            tabs,
+            split,
+        }
+    }
+
+    pub fn restore_stored_session(
+        &mut self,
+        session: &persist::StoredSession,
+    ) -> Vec<(TabId, String)> {
+        let mut tabs = Vec::new();
+        let mut restored_urls = Vec::new();
+        for stored in &session.tabs {
+            let Some(profile) = BrowsingProfile::from_session_str(&stored.profile) else { continue };
+            if profile == BrowsingProfile::Private {
+                continue;
+            }
+            let mut tab = TabState::new_profile(profile);
+            tab.set_restored_url(&stored.url);
+            let id = tab.id;
+            if !stored.url.is_empty() {
+                restored_urls.push((id, stored.url.clone()));
+            }
+            tabs.push(tab);
+        }
+        if tabs.is_empty() {
+            tabs.push(TabState::new_tab());
+        }
+        self.tabs = tabs;
+        let active_index = session.active_index.min(self.tabs.len().saturating_sub(1));
+        self.active_tab_id = self.tabs[active_index].id;
+        self.split_view = session.split.as_ref().and_then(|split| {
+            if split.left_index >= self.tabs.len()
+                || split.right_index >= self.tabs.len()
+                || split.left_index == split.right_index
+            {
+                return None;
+            }
+            let active = if split.active_pane == "Right" {
+                SplitPane::Right
+            } else {
+                SplitPane::Left
+            };
+            Some(SplitViewState {
+                left: self.tabs[split.left_index].id,
+                right: self.tabs[split.right_index].id,
+                active,
+                ratio: SplitViewState::clamp_ratio(split.ratio),
+            })
+        });
+        if let Some(split) = self.split_view {
+            self.active_tab_id = split.active_tab_id();
+        }
+        self.split_dragging = false;
+        self.close_site_info();
+        self.permission_prompt = None;
+        self.downloads.clear();
+        self.sync_address_bar();
+        self.update_layout();
+        self.update_bookmark_flag();
+        self.dirty.all();
+        restored_urls
     }
 
     // ── Mouse / hover ─────────────────────────────────────────────────────────

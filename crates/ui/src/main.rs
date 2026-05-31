@@ -1013,6 +1013,72 @@ fn smoke_permissions_model() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+fn smoke_session_model() -> Result<(), Box<dyn std::error::Error>> {
+    let path = std::env::temp_dir().join(format!("rashamon-session-smoke-{}.json", std::process::id()));
+    let bad_path = std::env::temp_dir().join(format!("rashamon-session-smoke-bad-{}.json", std::process::id()));
+    let mut state = BrowserState::new();
+    let normal_id = state.active_tab_id;
+    state.active_tab_mut().unwrap().set_restored_url("https://example.com");
+    state.open_private_tab();
+    state.active_tab_mut().unwrap().set_restored_url("https://private.invalid");
+    state.open_tor_proxy_tab();
+    let tor_id = state.active_tab_id;
+    state.active_tab_mut().unwrap().set_restored_url("https://check.torproject.org");
+    state.enter_split_view(normal_id, tor_id, SplitPane::Right);
+    state.set_split_ratio(0.67);
+    let session = state.to_stored_session(false);
+    if session.clean_shutdown {
+        return Err(smoke_fail("session snapshot did not record dirty shutdown state"));
+    }
+    if session.tabs.iter().any(|tab| tab.profile == "Private" || tab.url.contains("private.invalid")) {
+        return Err(smoke_fail("session snapshot persisted private tab"));
+    }
+    if !session.tabs.iter().any(|tab| tab.profile == "TorProxy") {
+        return Err(smoke_fail("session snapshot did not preserve TorProxy tab"));
+    }
+    if session.split.as_ref().map_or(true, |split| {
+        split.active_pane != "Right" || (split.ratio - 0.67).abs() > 0.01
+    }) {
+        return Err(smoke_fail("session snapshot did not preserve split state"));
+    }
+    persist::save_session_to_path(path.clone(), &session);
+    let loaded = persist::load_session_from_path(path.clone())
+        .ok_or_else(|| smoke_fail("saved session did not load"))?;
+    if loaded.clean_shutdown || loaded.tabs.len() != 2 {
+        return Err(smoke_fail("loaded session had unexpected shape"));
+    }
+    let mut restored = BrowserState::new();
+    let urls = restored.restore_stored_session(&loaded);
+    if restored.tabs.len() != 2 || urls.len() != 2 {
+        return Err(smoke_fail("session restore did not restore expected tabs"));
+    }
+    if restored.active_tab().map_or(true, |tab| tab.profile != BrowsingProfile::TorProxy) {
+        return Err(smoke_fail("session restore did not preserve active split pane"));
+    }
+    if restored.split_view.as_ref().map_or(true, |split| {
+        split.active != SplitPane::Right || (split.ratio - 0.67).abs() > 0.01
+    }) {
+        return Err(smoke_fail("session restore did not preserve split mode"));
+    }
+    std::fs::write(&bad_path, "{not-json")?;
+    if persist::load_session_from_path(bad_path.clone()).is_some() {
+        return Err(smoke_fail("corrupted session file was not ignored"));
+    }
+    std::fs::write(
+        &bad_path,
+        "{ \"version\": 1, \"clean_shutdown\": false, \"active_index\": 4, \"tabs\": [ { \"url\": \"https://partial.example\" } ], \"split\": { \"left_index\": 0, \"right_index\": 9, \"active_pane\": \"Right\", \"ratio\": 0.7 } }",
+    )?;
+    let partial = persist::load_session_from_path(bad_path.clone())
+        .ok_or_else(|| smoke_fail("partial session file did not load"))?;
+    if partial.tabs.len() != 1 || partial.tabs[0].profile != "Normal" || partial.split.is_some() {
+        return Err(smoke_fail("partial session was not safely normalized"));
+    }
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_file(&bad_path);
+    smoke_log("[smoke] PASS session model");
+    Ok(())
+}
+
 fn perf_mode_enabled() -> bool {
     std::env::var_os("RASHAMON_PERF").is_some()
         || std::env::args().skip(1).any(|arg| arg == "--perf")
@@ -1056,6 +1122,7 @@ fn run_webkit_smoke_test() -> Result<SmokePerfMetrics, Box<dyn std::error::Error
         smoke_adblock_model()?;
         smoke_download_destination_model()?;
         smoke_permissions_model()?;
+        smoke_session_model()?;
     } else {
         smoke_log("[smoke] PERF mode: skipping file-writing model preflight checks");
     }
@@ -1994,6 +2061,7 @@ fn run_browser_runtime<R: PlatformRuntime>(
 
         runtime.tick();
     }
+    driver.save_session_clean_shutdown();
     Ok(())
 }
 
@@ -2321,6 +2389,18 @@ fn draw_chrome_row(fb: &mut Framebuffer, state: &BrowserState, font: &FontManage
     draw_address_bar(fb, state, font);
     if state.find_open {
         draw_find_bar(fb, state, font);
+    }
+    if state.session_recovered && state.frame_count < 600 {
+        draw::draw_text(
+            fb,
+            font,
+            FB_WIDTH.saturating_sub(260),
+            TAB_BAR_HEIGHT + 10,
+            "Previous session restored",
+            11.5,
+            state.theme.fg_secondary,
+            210,
+        );
     }
     draw::draw_icon_menu(fb, FB_WIDTH - 28, cy, state.theme.icon_fg);
 }

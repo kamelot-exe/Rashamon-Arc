@@ -27,11 +27,12 @@ pub(crate) struct SaveDirty {
     pub bookmarks: bool,
     pub history: bool,
     pub prefs: bool,
+    pub session: bool,
 }
 
 impl SaveDirty {
     pub(crate) fn any(&self) -> bool {
-        self.bookmarks || self.history || self.prefs
+        self.bookmarks || self.history || self.prefs || self.session
     }
 }
 
@@ -84,6 +85,8 @@ pub(crate) struct BrowserCoreDriver {
     pub(crate) engine: RenderEngine,
     pub(crate) save_dirty: SaveDirty,
     pub(crate) cursor: CursorKind,
+    restored_urls: Vec<(TabId, String)>,
+    session_save_due_frame: Option<u64>,
 }
 
 impl BrowserCoreDriver {
@@ -94,17 +97,31 @@ impl BrowserCoreDriver {
             engine,
             save_dirty: SaveDirty::default(),
             cursor: CursorKind::Default,
+            restored_urls: Vec::new(),
+            session_save_due_frame: None,
         };
         driver.load_user_data();
-        driver.register_initial_tab();
+        driver.register_initial_tabs();
+        driver.save_session_running();
         Ok(driver)
     }
 
-    pub(crate) fn register_initial_tab(&mut self) {
-        let id = self.state.active_tab_id;
-        let profile = self.state.active_tab().map_or(BrowsingProfile::Normal, |tab| tab.profile);
-        self.engine.create_tab(id.raw(), profile.to_engine_profile());
-        self.engine.set_active_tab(id.raw());
+    pub(crate) fn register_initial_tabs(&mut self) {
+        let final_id = self.state.active_tab_id;
+        for tab in &self.state.tabs {
+            self.engine.create_tab(tab.id.raw(), tab.profile.to_engine_profile());
+        }
+        let restored = std::mem::take(&mut self.restored_urls);
+        for (tab_id, url) in restored {
+            self.state.activate_tab(tab_id);
+            self.engine.set_active_tab(tab_id.raw());
+            if let Some(url) = self.state.begin_navigate(&url) {
+                let nav_id = self.state.active_tab().map_or(0, |tab| tab.nav_id);
+                self.engine.navigate(&url, nav_id).ok();
+            }
+        }
+        self.state.activate_tab(final_id);
+        self.engine.set_active_tab(final_id.raw());
     }
 
     pub(crate) fn dispatch(&mut self, action: BrowserAction) -> bool {
@@ -529,6 +546,7 @@ impl BrowserCoreDriver {
         self.engine.set_active_tab(id.raw());
         self.restore_displaced_split_tabs(old_split);
         self.sync_split_viewports();
+        self.mark_session_dirty();
     }
 
     fn close_active_tab(&mut self) {
@@ -546,6 +564,7 @@ impl BrowserCoreDriver {
         }
         self.sync_split_viewports();
         self.sync_active_engine_tab();
+        self.mark_session_dirty();
     }
 
     fn switch_tab(&mut self, tab_id: TabId) {
@@ -582,6 +601,7 @@ impl BrowserCoreDriver {
                 self.set_full_tab_viewport(split.right);
             }
             self.sync_active_engine_tab();
+            self.mark_session_dirty();
             return;
         }
 
@@ -606,6 +626,7 @@ impl BrowserCoreDriver {
         self.state.enter_split_view(left, right, SplitPane::Left);
         self.sync_split_viewports();
         self.sync_active_engine_tab();
+        self.mark_session_dirty();
     }
 
     fn sync_split_viewports(&mut self) {
@@ -653,6 +674,7 @@ impl BrowserCoreDriver {
         let ratio = left as f32 / available.max(1) as f32;
         if self.state.set_split_ratio(ratio) {
             self.sync_split_viewports();
+            self.mark_session_dirty();
         }
     }
 
@@ -863,6 +885,7 @@ impl BrowserCoreDriver {
             }
             EngineEvent::LoadComplete => {
                 self.state.resolve_engine_loading_for(target_raw);
+                self.mark_session_dirty();
                 if is_active {
                     if !self.state.address_bar_focused {
                         self.state.sync_address_bar();
@@ -968,6 +991,16 @@ impl BrowserCoreDriver {
     }
 
     pub(crate) fn flush_saves(&mut self) {
+        if self.save_dirty.session {
+            let due = self.session_save_due_frame.unwrap_or(self.state.frame_count);
+            if self.state.frame_count >= due {
+                let session = self.state.to_stored_session(false);
+                std::thread::spawn(move || persist::save_session(&session));
+                self.save_dirty.session = false;
+                self.session_save_due_frame = None;
+            }
+        }
+
         if self.save_dirty.bookmarks {
             let bookmarks: Vec<persist::StoredBookmark> = self
                 .state
@@ -1003,6 +1036,26 @@ impl BrowserCoreDriver {
         }
     }
 
+    pub(crate) fn save_session_clean_shutdown(&mut self) {
+        let session = self.state.to_stored_session(true);
+        persist::save_session(&session);
+        self.save_dirty.session = false;
+        self.session_save_due_frame = None;
+    }
+
+    fn save_session_running(&mut self) {
+        let session = self.state.to_stored_session(false);
+        persist::save_session(&session);
+        self.save_dirty.session = false;
+        self.session_save_due_frame = None;
+    }
+
+    fn mark_session_dirty(&mut self) {
+        self.save_dirty.session = true;
+        let due = self.state.frame_count.saturating_add(30);
+        self.session_save_due_frame = Some(self.session_save_due_frame.map_or(due, |old| old.min(due)));
+    }
+
     fn load_user_data(&mut self) {
         if let Some(theme_str) = persist::load_theme() {
             if let Some(palette) = ColorPalette::from_str(&theme_str) {
@@ -1026,6 +1079,12 @@ impl BrowserCoreDriver {
                     title: entry.title,
                     when: 0,
                 });
+        }
+
+        if let Some(session) = persist::load_session() {
+            let recovered = !session.clean_shutdown;
+            self.restored_urls = self.state.restore_stored_session(&session);
+            self.state.session_recovered = recovered;
         }
     }
 }

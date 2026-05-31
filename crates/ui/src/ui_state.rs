@@ -242,6 +242,27 @@ pub fn derive_title(url: &str) -> &str {
 
 // ── TabState ──────────────────────────────────────────────────────────────────
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BrowsingProfile {
+    Normal,
+    Private,
+    TorProxy,
+}
+
+impl BrowsingProfile {
+    pub fn is_private_like(self) -> bool {
+        matches!(self, Self::Private | Self::TorProxy)
+    }
+
+    pub fn to_engine_profile(self) -> rashamon_renderer::EngineProfile {
+        match self {
+            Self::Normal => rashamon_renderer::EngineProfile::Normal,
+            Self::Private => rashamon_renderer::EngineProfile::Private,
+            Self::TorProxy => rashamon_renderer::EngineProfile::TorProxy,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct TabState {
     pub id:                 TabId,
@@ -252,6 +273,7 @@ pub struct TabState {
     pub is_pinned:          bool,
     pub is_bookmarked:      bool,
     pub is_private:         bool,
+    pub profile:            BrowsingProfile,
     pub history:            Vec<NavigationEntry>,
     pub history_index:      usize,
     pub last_committed_url: String,
@@ -270,10 +292,11 @@ pub struct TabState {
 }
 
 impl TabState {
-    pub fn new_tab() -> Self { Self::make(false) }
-    pub fn new_private() -> Self { Self::make(true) }
+    pub fn new_tab() -> Self { Self::make(BrowsingProfile::Normal) }
+    pub fn new_private() -> Self { Self::make(BrowsingProfile::Private) }
+    pub fn new_tor_proxy() -> Self { Self::make(BrowsingProfile::TorProxy) }
 
-    fn make(private: bool) -> Self {
+    fn make(profile: BrowsingProfile) -> Self {
         Self {
             id:                 TabId::next(),
             title:              String::new(),
@@ -282,7 +305,8 @@ impl TabState {
             page_state:         PageState::NewTab,
             is_pinned:          false,
             is_bookmarked:      false,
-            is_private:         private,
+            is_private:         profile.is_private_like(),
+            profile,
             history:            Vec::new(),
             history_index:      0,
             last_committed_url: String::new(),
@@ -340,7 +364,11 @@ impl TabState {
 
     pub fn tab_title(&self) -> &str {
         match &self.page_state {
-            PageState::NewTab   => if self.is_private { "Private" } else { "New Tab" },
+            PageState::NewTab   => match self.profile {
+                BrowsingProfile::Normal => "New Tab",
+                BrowsingProfile::Private => "Private",
+                BrowsingProfile::TorProxy => "Tor Proxy",
+            },
             PageState::Loading  => if self.title.is_empty() { "Loading…" } else { &self.title },
             PageState::Loaded   => if self.title.is_empty() { &self.url }   else { &self.title },
             PageState::Error(_) => if self.title.is_empty() { "Error" }     else { &self.title },
@@ -942,6 +970,24 @@ impl BrowserState {
         self.address_bar_focused = true;
         self.address_bar_input.clear();
         self.dirty.all();
+    }
+
+    pub fn open_tor_proxy_tab(&mut self) {
+        let tab = TabState::new_tor_proxy();
+        let id  = tab.id;
+        self.tabs.push(tab);
+        self.activate_tab(id);
+        self.address_bar_focused = true;
+        self.address_bar_input.clear();
+        self.dirty.all();
+    }
+
+    pub fn open_profile_tab(&mut self, profile: BrowsingProfile) {
+        match profile {
+            BrowsingProfile::Normal => self.open_new_tab(),
+            BrowsingProfile::Private => self.open_private_tab(),
+            BrowsingProfile::TorProxy => self.open_tor_proxy_tab(),
+        }
     }
 
     pub fn close_tab(&mut self, id: TabId) {

@@ -32,6 +32,7 @@ use runtime::PlatformRuntime;
 use rashamon_net::{AdblockEngine, HttpClient};
 use rashamon_renderer::{
     adblock_policy_blocks_for_test,
+    tor_proxy_configured_for_test, tor_proxy_tabs_for_test, tor_proxy_unavailable_for_test,
     download_destination_for_test, origin_from_url, CursorKind, DecisionSource, EngineEvent, EngineFrame,
     Framebuffer, PermissionDecision, PermissionKind, PermissionStore, RenderEngine,
     webext_blocked_events_for_test, webext_is_available_for_test, webext_is_configured_for_test,
@@ -40,7 +41,7 @@ use rashamon_renderer::{
 };
 use rashamon_renderer::framebuffer::Pixel;
 use ui_state::{
-    BrowserState, DirtyFlags, DownloadStatus, OverlayKind, PageState, SplitPane, TabId,
+    BrowsingProfile, BrowserState, DirtyFlags, DownloadStatus, OverlayKind, PageState, SplitPane, TabId,
     derive_title,
 };
 
@@ -61,6 +62,7 @@ const SCROLL_WHEEL: i32 = 80;
 
 // Private tab accent colour (purple stripe)
 const PRIVATE_ACCENT: Pixel = Pixel { r: 130, g: 70, b: 200 };
+const TOR_ACCENT: Pixel = Pixel { r: 20, g: 145, b: 110 };
 
 const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -626,13 +628,22 @@ fn smoke_fail(msg: impl Into<String>) -> Box<dyn std::error::Error> {
 }
 
 fn smoke_create_tab(state: &mut BrowserState, engine: &mut RenderEngine, private: bool) {
-    if private {
-        state.open_private_tab();
-    } else {
-        state.open_new_tab();
+    let profile = if private { BrowsingProfile::Private } else { BrowsingProfile::Normal };
+    smoke_create_profile_tab(state, engine, profile);
+}
+
+fn smoke_create_profile_tab(
+    state: &mut BrowserState,
+    engine: &mut RenderEngine,
+    profile: BrowsingProfile,
+) {
+    match profile {
+        BrowsingProfile::Normal => state.open_new_tab(),
+        BrowsingProfile::Private => state.open_private_tab(),
+        BrowsingProfile::TorProxy => state.open_tor_proxy_tab(),
     }
     let id = state.active_tab_id;
-    engine.create_tab(id.raw(), private);
+    engine.create_tab(id.raw(), profile.to_engine_profile());
     engine.set_active_tab(id.raw());
 }
 
@@ -1060,11 +1071,96 @@ fn run_webkit_smoke_test() -> Result<SmokePerfMetrics, Box<dyn std::error::Error
 
     let mut state = BrowserState::new();
     let first_id = state.active_tab_id;
-    engine.create_tab(first_id.raw(), false);
+    engine.create_tab(first_id.raw(), BrowsingProfile::Normal.to_engine_profile());
     engine.set_active_tab(first_id.raw());
     smoke_wait_for(&mut state, &mut engine, "startup no args", Duration::from_secs(2), |s, _| {
         s.tabs.len() == 1 && s.active_tab().map_or(false, |t| matches!(t.page_state, PageState::NewTab))
     })?;
+
+    std::env::set_var("RASHAMON_TOR_PROXY", "http://127.0.0.1:9050/bad");
+    let tor_invalid_tabs_before = tor_proxy_tabs_for_test();
+    let tor_invalid_configured_before = tor_proxy_configured_for_test();
+    let tor_invalid_unavailable_before = tor_proxy_unavailable_for_test();
+    smoke_create_profile_tab(&mut state, &mut engine, BrowsingProfile::TorProxy);
+    if !state.active_tab().map_or(false, |tab| {
+        tab.profile == BrowsingProfile::TorProxy && tab.is_private
+    }) {
+        return Err(smoke_fail("TorProxy tab did not use private-like profile state"));
+    }
+    smoke_wait_for(
+        &mut state,
+        &mut engine,
+        "TorProxy invalid env creates isolated context",
+        Duration::from_secs(2),
+        |_s, _| tor_proxy_tabs_for_test() > tor_invalid_tabs_before,
+    )?;
+    if tor_proxy_configured_for_test() != tor_invalid_configured_before {
+        return Err(smoke_fail("TorProxy invalid env still applied proxy settings"));
+    }
+    let history_before_invalid_tor = state.global_history.len();
+    smoke_navigate(&mut state, &mut engine, "https://example.com")?;
+    smoke_wait_for(
+        &mut state,
+        &mut engine,
+        "TorProxy invalid env fails explicitly",
+        Duration::from_secs(4),
+        |s, events| {
+            events.iter().any(|e| matches!(e, EngineEvent::LoadFailed(reason) if reason.contains("Tor proxy unavailable")))
+                && s.active_tab().map_or(false, |t| matches!(&t.page_state, PageState::Error(reason) if reason.contains("Tor proxy unavailable")))
+        },
+    )?;
+    if tor_proxy_unavailable_for_test() <= tor_invalid_unavailable_before {
+        return Err(smoke_fail("TorProxy invalid env did not prevent navigation"));
+    }
+    if state.global_history.len() != history_before_invalid_tor {
+        return Err(smoke_fail("TorProxy invalid env persisted global history"));
+    }
+    state.activate_tab(first_id);
+    engine.set_active_tab(first_id.raw());
+    smoke_log("[smoke] PASS TorProxy invalid proxy env explicit failure");
+
+    std::env::set_var("RASHAMON_TOR_PROXY", "socks5://127.0.0.1:1");
+    let tor_tabs_before = tor_proxy_tabs_for_test();
+    let tor_configured_before = tor_proxy_configured_for_test();
+    let tor_unavailable_before = tor_proxy_unavailable_for_test();
+    smoke_create_profile_tab(&mut state, &mut engine, BrowsingProfile::TorProxy);
+    if !state.active_tab().map_or(false, |tab| {
+        tab.profile == BrowsingProfile::TorProxy && tab.is_private
+    }) {
+        return Err(smoke_fail("TorProxy tab did not use private-like profile state"));
+    }
+    smoke_wait_for(
+        &mut state,
+        &mut engine,
+        "TorProxy context and proxy configured",
+        Duration::from_secs(2),
+        |_s, _| {
+            tor_proxy_tabs_for_test() > tor_tabs_before
+                && tor_proxy_configured_for_test() > tor_configured_before
+        },
+    )?;
+    let history_before_tor = state.global_history.len();
+    smoke_navigate(&mut state, &mut engine, "https://example.com")?;
+    smoke_wait_for(
+        &mut state,
+        &mut engine,
+        "TorProxy unavailable fails explicitly",
+        Duration::from_secs(4),
+        |s, events| {
+            events.iter().any(|e| matches!(e, EngineEvent::LoadFailed(reason) if reason.contains("Tor proxy unavailable")))
+                && s.active_tab().map_or(false, |t| matches!(&t.page_state, PageState::Error(reason) if reason.contains("Tor proxy unavailable")))
+        },
+    )?;
+    if tor_proxy_unavailable_for_test() <= tor_unavailable_before {
+        return Err(smoke_fail("TorProxy unavailable path was not recorded"));
+    }
+    if state.global_history.len() != history_before_tor {
+        return Err(smoke_fail("TorProxy tab persisted global history"));
+    }
+    state.activate_tab(first_id);
+    engine.set_active_tab(first_id.raw());
+    smoke_log("[smoke] PASS TorProxy profile isolation and explicit unavailable failure");
+
     perf_metrics.webext_available = webext_is_available_for_test();
     perf_metrics.webext_loaded = webext_is_configured_for_test();
     perf_metrics.webext_disabled = webext_is_disabled_for_test();
@@ -1538,7 +1634,7 @@ fn run_webkit_smoke_test() -> Result<SmokePerfMetrics, Box<dyn std::error::Error
     let last_id = state.active_tab_id;
     engine.close_tab(last_id.raw());
     state.close_tab(last_id);
-    engine.create_tab(state.active_tab_id.raw(), false);
+    engine.create_tab(state.active_tab_id.raw(), BrowsingProfile::Normal.to_engine_profile());
     engine.set_active_tab(state.active_tab_id.raw());
     if state.tabs.len() != 1 || !state.active_tab().map_or(false, |t| matches!(t.page_state, PageState::NewTab)) {
         return Err(smoke_fail("close last tab did not restore a new tab"));
@@ -2150,14 +2246,24 @@ fn draw_tab_row(fb: &mut Framebuffer, state: &BrowserState, font: &FontManager) 
 
         if is_active {
             fb.fill_rect(tx, TAB_BAR_HEIGHT - 2, tw, 3, theme.surface);
-            let stripe = if tab.is_private { PRIVATE_ACCENT } else { theme.accent };
+            let stripe = match tab.profile {
+                BrowsingProfile::TorProxy => TOR_ACCENT,
+                BrowsingProfile::Private => PRIVATE_ACCENT,
+                BrowsingProfile::Normal => theme.accent,
+            };
             fb.fill_rect(tx, TOP + 4, 2, H - 8, stripe);
         }
 
-        // Private tab: small badge dot before title
-        let title_x = if tab.is_private && (is_active || is_hovered) {
-            draw::draw_circle_filled(fb, tx + 10, TOP + H / 2, 4, PRIVATE_ACCENT);
-            tx + 18
+        // Private/proxy tabs: small badge before title
+        let title_x = if tab.profile != BrowsingProfile::Normal && (is_active || is_hovered) {
+            let badge = if tab.profile == BrowsingProfile::TorProxy { TOR_ACCENT } else { PRIVATE_ACCENT };
+            if tab.profile == BrowsingProfile::TorProxy && tw > 88 {
+                draw::draw_text(fb, font, tx + 8, TOP + H / 2 - 6, "Proxy", 9.5, badge, 36);
+                tx + 46
+            } else {
+                draw::draw_circle_filled(fb, tx + 10, TOP + H / 2, 4, badge);
+                tx + 18
+            }
         } else {
             tx + 14
         };
@@ -2252,9 +2358,11 @@ fn draw_address_bar(fb: &mut Framebuffer, state: &BrowserState, font: &FontManag
     let bar_x  = (FB_WIDTH - ADDR_BAR_W) / 2;
     let bar_y  = TAB_BAR_HEIGHT + (CHROME_BAR_HEIGHT - ADDR_BAR_H) / 2;
     let is_prv = state.active_tab().map_or(false, |t| t.is_private);
+    let is_tor = state.active_tab().map_or(false, |t| t.profile == BrowsingProfile::TorProxy);
 
     let bg     = if state.address_bar_focused { theme.address_bar_bg_focused } else { theme.address_bar_bg };
     let border = if state.address_bar_focused { theme.address_bar_border_focused }
+                 else if is_tor { TOR_ACCENT }
                  else if is_prv { PRIVATE_ACCENT }
                  else { theme.address_bar_border };
     fb.fill_rect(bar_x + 12, bar_y + ADDR_BAR_H + 1, ADDR_BAR_W.saturating_sub(24), 2, SHADOW_DARK);
@@ -2270,7 +2378,7 @@ fn draw_address_bar(fb: &mut Framebuffer, state: &BrowserState, font: &FontManag
             PageState::Loading  => draw::draw_icon_spinner(fb, icon_x, icon_y, 5, state.frame_count, theme.icon_fg),
             PageState::Error(_) => draw::draw_circle_filled(fb, icon_x, icon_y, 5, theme.security_err),
             _ if tab.url.starts_with("https://") => draw::draw_icon_lock(fb, icon_x, icon_y,
-                if is_prv { PRIVATE_ACCENT } else { theme.security_ok }),
+                if is_tor { TOR_ACCENT } else if is_prv { PRIVATE_ACCENT } else { theme.security_ok }),
             _ if !tab.url.is_empty() => draw::draw_icon_globe(fb, icon_x, icon_y, theme.icon_fg),
             _ => {}
         }
@@ -2281,7 +2389,7 @@ fn draw_address_bar(fb: &mut Framebuffer, state: &BrowserState, font: &FontManag
     let max_w = ADDR_BAR_W.saturating_sub(34 + 30);
 
     if state.address_bar_input.is_empty() && !state.address_bar_focused {
-        let placeholder = if is_prv { "Private search or URL" } else { "Search or enter URL" };
+        let placeholder = if is_tor { "Tor proxy search or URL" } else if is_prv { "Private search or URL" } else { "Search or enter URL" };
         draw::draw_text(fb, font, tx, ty, placeholder, 13.5, theme.placeholder, max_w);
     } else {
         draw::draw_text(fb, font, tx, ty, &state.address_bar_input, 13.5, theme.address_bar_fg, max_w);
@@ -2293,6 +2401,9 @@ fn draw_address_bar(fb: &mut Framebuffer, state: &BrowserState, font: &FontManag
     }
 
     if let Some(tab) = state.active_tab() {
+        if is_tor {
+            draw::draw_text(fb, font, bar_x + ADDR_BAR_W - 62, ty, "Proxy", 12.0, TOR_ACCENT, 44);
+        }
         let star_x   = bar_x + ADDR_BAR_W - 18;
         let star_col = if tab.is_bookmarked { theme.accent } else { theme.icon_fg };
         draw::draw_icon_star(fb, star_x, icon_y, 11, star_col, tab.is_bookmarked);

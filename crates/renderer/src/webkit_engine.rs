@@ -12,7 +12,7 @@
 //!
 //! ## Tab lifecycle
 //!
-//!   engine.create_tab(tab_id, is_private)   → Cmd::CreateTab → new WebView
+//!   engine.create_tab(tab_id, profile)      → Cmd::CreateTab → new WebView
 //!   engine.close_tab(tab_id)                → Cmd::CloseTab  → drop WebView
 //!   engine.set_active_tab(tab_id)           → Cmd::SwitchTab → snapshot
 //!   engine.navigate(url, nav_id)            → Cmd::Navigate  → load_uri on active tab
@@ -24,7 +24,7 @@
 //! a packed Vec<u8> (ARGB32 little-endian = [B,G,R,A] per pixel), and sends it
 //! as `Reply::FrameReady`.  `render_into` blits the latest cached frame.
 
-use crate::engine_trait::{ContentEngine, CursorKind, EngineEvent, EngineFrame, EnginePerfStats};
+use crate::engine_trait::{ContentEngine, CursorKind, EngineEvent, EngineFrame, EnginePerfStats, EngineProfile};
 use crate::framebuffer::{Framebuffer, Pixel};
 use crate::permissions::{
     origin_from_url, DecisionSource, PermissionDecision, PermissionKind, PermissionStore,
@@ -35,6 +35,7 @@ use rashamon_net::AdblockEngine;
 
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
+use std::net::{TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -69,6 +70,9 @@ static WEBEXT_PROBE_BLOCKED: AtomicU64 = AtomicU64::new(0);
 static WEBEXT_PROBE_CLEAR: AtomicU64 = AtomicU64::new(0);
 static ADBLOCK_POLICY_BLOCKS: AtomicU64 = AtomicU64::new(0);
 static ADBLOCK_SUBRESOURCE_REWRITES: AtomicU64 = AtomicU64::new(0);
+static TOR_PROXY_TABS: AtomicU64 = AtomicU64::new(0);
+static TOR_PROXY_CONFIGURED: AtomicU64 = AtomicU64::new(0);
+static TOR_PROXY_UNAVAILABLE: AtomicU64 = AtomicU64::new(0);
 
 fn perf_mark_global(stage: &'static str) {
     if !perf_enabled() {
@@ -150,11 +154,23 @@ pub fn adblock_subresource_rewrites_for_test() -> u64 {
     ADBLOCK_SUBRESOURCE_REWRITES.load(Ordering::Relaxed)
 }
 
+pub fn tor_proxy_tabs_for_test() -> u64 {
+    TOR_PROXY_TABS.load(Ordering::Relaxed)
+}
+
+pub fn tor_proxy_configured_for_test() -> u64 {
+    TOR_PROXY_CONFIGURED.load(Ordering::Relaxed)
+}
+
+pub fn tor_proxy_unavailable_for_test() -> u64 {
+    TOR_PROXY_UNAVAILABLE.load(Ordering::Relaxed)
+}
+
 // ── IPC ───────────────────────────────────────────────────────────────────────
 
 enum Cmd {
-    /// Create a new WebView for this tab.  Private tabs get an ephemeral context.
-    CreateTab  { tab_id: u64, is_private: bool },
+    /// Create a new WebView for this tab.  Private-like tabs get isolated contexts.
+    CreateTab  { tab_id: u64, profile: EngineProfile },
     /// Destroy the WebView and release GTK resources.
     CloseTab   { tab_id: u64 },
     /// Activate tab and request a fresh snapshot (no reload).
@@ -258,7 +274,8 @@ pub struct WebKitEngine {
 struct TabEntry {
     webview:     webkit2gtk::WebView,
     window:      gtk::OffscreenWindow,
-    is_private:  bool,
+    profile:     EngineProfile,
+    proxy_failure: Option<String>,
     nav_id_cell: Rc<Cell<u64>>,
     frame_gen:   Rc<Cell<u64>>,
     schedule_gen: Rc<Cell<u64>>,
@@ -272,7 +289,7 @@ struct TabEntry {
 }
 
 struct SuspendedTab {
-    is_private: bool,
+    profile:    EngineProfile,
     url:        String,
     nav_id:     u64,
     viewport_w: u32,
@@ -430,10 +447,10 @@ impl Drop for WebKitEngine {
 // ── ContentEngine impl ────────────────────────────────────────────────────────
 
 impl ContentEngine for WebKitEngine {
-    fn create_tab(&mut self, tab_id: u64, is_private: bool) {
-        trace!("[webkit] create_tab {tab_id} private={is_private}");
+    fn create_tab(&mut self, tab_id: u64, profile: EngineProfile) {
+        trace!("[webkit] create_tab {tab_id} profile={profile:?}");
         self.tab_states.entry(tab_id).or_insert_with(PerTabState::default);
-        let _ = self.cmd_tx.try_send(Cmd::CreateTab { tab_id, is_private });
+        let _ = self.cmd_tx.try_send(Cmd::CreateTab { tab_id, profile });
     }
 
     fn close_tab(&mut self, tab_id: u64) {
@@ -855,10 +872,10 @@ impl WebKitDriver {
         // Dispatch commands.
         loop {
             match self.cmd_rx.try_recv() {
-                Ok(Cmd::CreateTab { tab_id, is_private }) => {
+                Ok(Cmd::CreateTab { tab_id, profile }) => {
                     if self.tabs.contains_key(&tab_id) || self.suspended_tabs.contains_key(&tab_id) { continue; }
                     let entry = make_tab_entry(
-                        tab_id, is_private, self.w, self.h, self.reply_tx.clone(),
+                        tab_id, profile, self.w, self.h, self.reply_tx.clone(),
                         Rc::clone(&self.adblock),
                         Rc::clone(&self.blocked_by_origin),
                         Rc::clone(&self.permissions),
@@ -869,7 +886,7 @@ impl WebKitDriver {
                         Rc::clone(&self.active_downloads),
                     );
                     self.tabs.insert(tab_id, entry);
-                    trace!("[webkit-driver] created WebView for tab {tab_id}");
+                    trace!("[webkit-driver] created WebView for tab {tab_id} profile={profile:?}");
                 }
 
                 Ok(Cmd::CloseTab { tab_id }) => {
@@ -974,8 +991,18 @@ impl WebKitDriver {
                         entry.last_url = url.clone();
                         next_cell_generation(&entry.schedule_gen);
                         next_cell_generation(&entry.frame_gen);
+                        if let Some(reason) = entry.proxy_failure.clone() {
+                            trace!("[webkit-driver] TorProxy navigation blocked before load: {reason}; direct fallback prevented");
+                            TOR_PROXY_UNAVAILABLE.fetch_add(1, Ordering::Relaxed);
+                            let _ = self.reply_tx.try_send(Reply::LoadFailed {
+                                tab_id,
+                                nav_id,
+                                reason,
+                            });
+                            continue;
+                        }
                         if let Some(reason) = adblock_block_reason(
-                            &self.adblock, &url, &wv_url(&entry.webview), entry.is_private,
+                            &self.adblock, &url, &wv_url(&entry.webview), entry.profile.is_private_like(),
                         ) {
                             log_adblock_block_with_kind(&url, &reason, "navigation-preload");
                             increment_origin_block_count(
@@ -1465,7 +1492,7 @@ impl WebKitDriver {
                 *tab_id,
                 &entry.webview,
                 &self.adblock,
-                entry.is_private,
+                entry.profile.is_private_like(),
                 true,
                 std::env::var_os("RASHAMON_WEBEXT_SMOKE_INVALID_RULES").is_some(),
             );
@@ -1536,7 +1563,7 @@ impl WebKitDriver {
         entry.webview.stop_loading();
         if !url.is_empty() {
             self.suspended_tabs.insert(tab_id, SuspendedTab {
-                is_private: entry.is_private,
+                profile: entry.profile,
                 url: url.clone(),
                 nav_id: entry.nav_id_cell.get(),
                 viewport_w: entry.viewport_w,
@@ -1557,7 +1584,7 @@ impl WebKitDriver {
         let Some(suspended) = self.suspended_tabs.remove(&tab_id) else { return };
         let mut entry = make_tab_entry(
             tab_id,
-            suspended.is_private,
+            suspended.profile,
             suspended.viewport_w,
             suspended.viewport_h,
             self.reply_tx.clone(),
@@ -1588,9 +1615,63 @@ impl WebKitDriver {
 
 // ── WebView factory ───────────────────────────────────────────────────────────
 
+#[derive(Debug, Clone)]
+struct TorProxyConfig {
+    uri: String,
+    scheme: &'static str,
+    host: String,
+    port: u16,
+}
+
+fn tor_proxy_config() -> Result<TorProxyConfig, String> {
+    let uri = std::env::var("RASHAMON_TOR_PROXY")
+        .unwrap_or_else(|_| "socks5://127.0.0.1:9050".to_string());
+    let (scheme, rest) = if let Some(rest) = uri.strip_prefix("socks5h://") {
+        ("socks5h", rest)
+    } else if let Some(rest) = uri.strip_prefix("socks5://") {
+        ("socks5", rest)
+    } else {
+        return Err("Tor proxy unavailable: RASHAMON_TOR_PROXY must use socks5://host:port or socks5h://host:port".to_string());
+    };
+    if rest.contains('/') || rest.contains('?') || rest.contains('#') || rest.contains('@') {
+        return Err("Tor proxy unavailable: proxy URI must be socks5://host:port or socks5h://host:port without path, query, fragment, or credentials".to_string());
+    }
+    let (host, port_text) = rest
+        .rsplit_once(':')
+        .ok_or_else(|| "Tor proxy unavailable: proxy URI must include host and port".to_string())?;
+    if host.is_empty() {
+        return Err("Tor proxy unavailable: proxy host is empty".to_string());
+    }
+    let port = port_text
+        .parse::<u16>()
+        .map_err(|_| "Tor proxy unavailable: proxy port is invalid".to_string())?;
+    if port == 0 {
+        return Err("Tor proxy unavailable: proxy port is invalid".to_string());
+    }
+    Ok(TorProxyConfig { uri: uri.clone(), scheme, host: host.to_string(), port })
+}
+
+impl TorProxyConfig {
+    fn sanitized_uri(&self) -> String {
+        format!("{}://{}:{}", self.scheme, self.host, self.port)
+    }
+
+    fn check_available(&self) -> Result<(), String> {
+        let addrs = (self.host.as_str(), self.port)
+            .to_socket_addrs()
+            .map_err(|_| "Tor proxy unavailable".to_string())?;
+        for addr in addrs {
+            if TcpStream::connect_timeout(&addr, Duration::from_millis(250)).is_ok() {
+                return Ok(());
+            }
+        }
+        Err("Tor proxy unavailable".to_string())
+    }
+}
+
 fn make_tab_entry(
     tab_id:    u64,
-    is_private: bool,
+    profile:   EngineProfile,
     w:         u32,
     h:         u32,
     reply_tx:  mpsc::SyncSender<Reply>,
@@ -1606,9 +1687,10 @@ fn make_tab_entry(
     use gtk::prelude::{ContainerExt, GtkWindowExt, WidgetExt};
     use webkit2gtk::{
         FindControllerExt, HardwareAccelerationPolicy, LoadEvent, NavigationPolicyDecision,
-        NavigationPolicyDecisionExt, PolicyDecisionExt, PolicyDecisionType,
-        ResponsePolicyDecision, ResponsePolicyDecisionExt, Settings, SettingsExt,
-        URIRequestExt, WebView, WebViewExt,
+        NavigationPolicyDecisionExt, NetworkProxyMode, NetworkProxySettings,
+        PolicyDecisionExt, PolicyDecisionType, ResponsePolicyDecision,
+        ResponsePolicyDecisionExt, Settings, SettingsExt, URIRequestExt, WebContext,
+        WebView, WebViewExt, WebsiteDataManager, WebsiteDataManagerExt,
     };
 
     let settings = Settings::new();
@@ -1617,22 +1699,64 @@ fn make_tab_entry(
     settings.set_hardware_acceleration_policy(HardwareAccelerationPolicy::Never);
 
     perf_mark_tab("webview-create-start", tab_id);
-    let webview = if is_private {
-        use webkit2gtk::WebContext;
-        let ctx = WebContext::new_ephemeral();
-        connect_downloads_for_context(
-            &ctx,
-            reply_tx.clone(),
-            Rc::clone(&download_seq),
-            Rc::clone(&active_downloads),
-        );
-        let wv  = WebView::with_context(&ctx);
-        wv.set_settings(&settings);
-        wv
-    } else {
-        let wv = WebView::with_context(normal_context);
-        wv.set_settings(&settings);
-        wv
+    let mut proxy_failure = None;
+    let webview = match profile {
+        EngineProfile::Normal => {
+            let wv = WebView::with_context(normal_context);
+            wv.set_settings(&settings);
+            wv
+        }
+        EngineProfile::Private => {
+            let ctx = WebContext::new_ephemeral();
+            connect_downloads_for_context(
+                &ctx,
+                reply_tx.clone(),
+                Rc::clone(&download_seq),
+                Rc::clone(&active_downloads),
+            );
+            let wv  = WebView::with_context(&ctx);
+            wv.set_settings(&settings);
+            wv
+        }
+        EngineProfile::TorProxy => {
+            TOR_PROXY_TABS.fetch_add(1, Ordering::Relaxed);
+            let manager = WebsiteDataManager::new_ephemeral();
+            trace!("[webkit-driver] TorProxy creating isolated ephemeral WebContext");
+            match tor_proxy_config() {
+                Ok(config) => {
+                    trace!(
+                        "[webkit-driver] TorProxy proxy={} profile=TorProxy",
+                        config.sanitized_uri(),
+                    );
+                    if config.scheme == "socks5" {
+                        trace!(
+                            "[webkit-driver] TorProxy DNS note: socks5:// DNS behavior is delegated to WebKit/libsoup; use socks5h:// when proxy-side DNS is required and supported"
+                        );
+                    }
+                    let mut proxy_settings = NetworkProxySettings::new(Some(&config.uri), &[]);
+                    manager.set_network_proxy_settings(NetworkProxyMode::Custom, Some(&mut proxy_settings));
+                    TOR_PROXY_CONFIGURED.fetch_add(1, Ordering::Relaxed);
+                    if let Err(reason) = config.check_available() {
+                        trace!("[webkit-driver] TorProxy unavailable: {reason}; direct fallback prevented");
+                        proxy_failure = Some(reason);
+                    }
+                }
+                Err(reason) => {
+                    trace!("[webkit-driver] TorProxy config rejected: {reason}; direct fallback prevented");
+                    proxy_failure = Some(reason);
+                }
+            }
+            let ctx = WebContext::with_website_data_manager(&manager);
+            connect_downloads_for_context(
+                &ctx,
+                reply_tx.clone(),
+                Rc::clone(&download_seq),
+                Rc::clone(&active_downloads),
+            );
+            let wv  = WebView::with_context(&ctx);
+            wv.set_settings(&settings);
+            wv
+        }
     };
     perf_mark_tab("webview-create-done", tab_id);
     webview.set_size_request(w as i32, h as i32);
@@ -1643,6 +1767,7 @@ fn make_tab_entry(
     window.show_all();
 
     connect_webext_view_messages(tab_id, &webview, Rc::clone(&blocked_by_origin));
+    let is_private = profile.is_private_like();
     send_webext_ping_and_rules(tab_id, &webview, &adblock, is_private);
 
     let nav_id_cell: Rc<Cell<u64>> = Rc::new(Cell::new(0));
@@ -1853,7 +1978,8 @@ fn make_tab_entry(
     TabEntry {
         webview,
         window,
-        is_private,
+        profile,
+        proxy_failure,
         nav_id_cell,
         frame_gen,
         schedule_gen,

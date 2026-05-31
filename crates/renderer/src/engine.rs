@@ -13,6 +13,7 @@
 
 use crate::engine_trait::{ContentEngine, EngineEvent, EngineFrame, EnginePerfStats};
 use crate::framebuffer::Framebuffer;
+use crate::engine_trait::EngineProfile;
 use crate::permissions::{PermissionDecision, PermissionKind};
 
 #[cfg(not(feature = "servo"))]
@@ -99,8 +100,8 @@ impl RenderEngine {
 
     // ── Tab lifecycle ─────────────────────────────────────────────────────────
 
-    pub fn create_tab(&mut self, tab_id: u64, is_private: bool) {
-        self.inner.create_tab(tab_id, is_private);
+    pub fn create_tab(&mut self, tab_id: u64, profile: EngineProfile) {
+        self.inner.create_tab(tab_id, profile);
     }
 
     pub fn close_tab(&mut self, tab_id: u64) {

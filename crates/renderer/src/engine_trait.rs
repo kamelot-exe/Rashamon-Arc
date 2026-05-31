@@ -17,6 +17,19 @@ pub enum CursorKind {
     Wait,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EngineProfile {
+    Normal,
+    Private,
+    TorProxy,
+}
+
+impl EngineProfile {
+    pub fn is_private_like(self) -> bool {
+        matches!(self, Self::Private | Self::TorProxy)
+    }
+}
+
 /// Events the engine pushes up to the browser shell.
 /// Drained once per frame via `ContentEngine::poll_events`.
 /// Each event is tagged with the `tab_id` of the WebView that produced it.
@@ -70,8 +83,8 @@ pub enum EngineFrame {
 pub trait ContentEngine: Send {
     // ── Tab lifecycle (default no-ops for single-view stubs) ──────────────────
 
-    /// Create a new WebView for `tab_id`.  Private tabs get an ephemeral context.
-    fn create_tab(&mut self, _tab_id: u64, _is_private: bool) {}
+    /// Create a new WebView for `tab_id`.  Private-like tabs get isolated contexts.
+    fn create_tab(&mut self, _tab_id: u64, _profile: EngineProfile) {}
 
     /// Destroy the WebView for `tab_id` and release its resources.
     fn close_tab(&mut self, _tab_id: u64) {}

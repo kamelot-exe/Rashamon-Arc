@@ -17,7 +17,7 @@ mod servo_host;
 mod webkit_engine;
 
 pub use engine::RenderEngine;
-pub use engine_trait::{ContentEngine, CursorKind, EngineEvent, EngineFrame, EnginePerfStats};
+pub use engine_trait::{ContentEngine, CursorKind, EngineEvent, EngineFrame, EnginePerfStats, EngineProfile};
 pub use framebuffer::Framebuffer;
 pub use permissions::{
     origin_from_url, DecisionSource, PermissionDecision, PermissionKind, PermissionStore,
@@ -27,6 +27,7 @@ pub use webkit_engine::download_destination_for_test;
 #[cfg(feature = "webkit")]
 pub use webkit_engine::{
     adblock_policy_blocks_for_test, adblock_subresource_rewrites_for_test,
+    tor_proxy_configured_for_test, tor_proxy_tabs_for_test, tor_proxy_unavailable_for_test,
     webext_blocked_events_for_test, webext_is_available_for_test, webext_is_configured_for_test,
     webext_is_disabled_for_test, webext_probe_blocked_for_test, webext_probe_clear_for_test,
     webext_ready_for_test, webext_rules_error_for_test, webext_rules_ok_for_test,
@@ -77,5 +78,17 @@ pub fn adblock_policy_blocks_for_test() -> u64 {
 }
 #[cfg(not(feature = "webkit"))]
 pub fn adblock_subresource_rewrites_for_test() -> u64 {
+    0
+}
+#[cfg(not(feature = "webkit"))]
+pub fn tor_proxy_tabs_for_test() -> u64 {
+    0
+}
+#[cfg(not(feature = "webkit"))]
+pub fn tor_proxy_configured_for_test() -> u64 {
+    0
+}
+#[cfg(not(feature = "webkit"))]
+pub fn tor_proxy_unavailable_for_test() -> u64 {
     0
 }

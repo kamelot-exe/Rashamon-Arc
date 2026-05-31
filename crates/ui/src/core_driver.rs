@@ -12,7 +12,7 @@ use crate::omnibox::{self, InternalRoute, MatchEntry, OmniboxResult};
 use crate::persist;
 use crate::theme::ColorPalette;
 use crate::ui_state::{
-    self, BrowserState, HoveredRegion, OverlayKind, PageState, SplitPane, TabId,
+    self, BrowsingProfile, BrowserState, HoveredRegion, OverlayKind, PageState, SplitPane, TabId,
 };
 use rashamon_renderer::{
     origin_from_url, CursorKind, EngineEvent, PermissionDecision, PermissionKind, RenderEngine,
@@ -42,7 +42,7 @@ pub(crate) enum BrowserAction {
     Back,
     Forward,
     Reload,
-    NewTab { private: bool },
+    NewTab { profile: BrowsingProfile },
     CloseActiveTab,
     CloseTab(TabId),
     SwitchTab(TabId),
@@ -102,8 +102,8 @@ impl BrowserCoreDriver {
 
     pub(crate) fn register_initial_tab(&mut self) {
         let id = self.state.active_tab_id;
-        let is_private = self.state.active_tab().map_or(false, |tab| tab.is_private);
-        self.engine.create_tab(id.raw(), is_private);
+        let profile = self.state.active_tab().map_or(BrowsingProfile::Normal, |tab| tab.profile);
+        self.engine.create_tab(id.raw(), profile.to_engine_profile());
         self.engine.set_active_tab(id.raw());
     }
 
@@ -114,7 +114,7 @@ impl BrowserCoreDriver {
             BrowserAction::Back => self.go_back(),
             BrowserAction::Forward => self.go_forward(),
             BrowserAction::Reload => self.reload(),
-            BrowserAction::NewTab { private } => self.open_tab(private),
+            BrowserAction::NewTab { profile } => self.open_tab(profile),
             BrowserAction::CloseActiveTab => self.close_active_tab(),
             BrowserAction::CloseTab(tab_id) => self.close_tab(tab_id),
             BrowserAction::SwitchTab(tab_id) => self.switch_tab(tab_id),
@@ -196,7 +196,7 @@ impl BrowserCoreDriver {
             }
             UiHitTarget::BookmarkButton => self.dispatch(BrowserAction::ToggleBookmark),
             UiHitTarget::SiteInfoButton => self.dispatch(BrowserAction::OpenSiteInfo),
-            UiHitTarget::NewTabButton => self.dispatch(BrowserAction::NewTab { private: false }),
+            UiHitTarget::NewTabButton => self.dispatch(BrowserAction::NewTab { profile: BrowsingProfile::Normal }),
             UiHitTarget::Tab(tab_id) => self.dispatch(BrowserAction::SwitchTab(tab_id)),
             UiHitTarget::CloseTab(tab_id) => self.dispatch(BrowserAction::CloseTab(tab_id)),
             UiHitTarget::QuickLink(url) => self.dispatch(BrowserAction::NavigateUrl(url)),
@@ -452,9 +452,10 @@ impl BrowserCoreDriver {
                 }
             }
             BrowserKey::Char('p') if ctrl => self.dispatch(BrowserAction::CycleTheme),
-            BrowserKey::Char('t') if ctrl => self.dispatch(BrowserAction::NewTab { private: false }),
-            BrowserKey::Char('n') if ctrl && shift => self.dispatch(BrowserAction::NewTab { private: true }),
-            BrowserKey::Char('i') if ctrl => self.dispatch(BrowserAction::NewTab { private: true }),
+            BrowserKey::Char('t') if ctrl && shift => self.dispatch(BrowserAction::NewTab { profile: BrowsingProfile::TorProxy }),
+            BrowserKey::Char('t') if ctrl => self.dispatch(BrowserAction::NewTab { profile: BrowsingProfile::Normal }),
+            BrowserKey::Char('n') if ctrl && shift => self.dispatch(BrowserAction::NewTab { profile: BrowsingProfile::Private }),
+            BrowserKey::Char('i') if ctrl => self.dispatch(BrowserAction::NewTab { profile: BrowsingProfile::Private }),
             BrowserKey::Char('w') if ctrl => self.dispatch(BrowserAction::CloseActiveTab),
             BrowserKey::Char('r') if ctrl => self.dispatch(BrowserAction::Reload),
             BrowserKey::Char('s') if ctrl && shift => self.dispatch(BrowserAction::ToggleSplitView),
@@ -515,20 +516,16 @@ impl BrowserCoreDriver {
             OmniboxResult::OpenOverlay(InternalRoute::Bookmarks) => {
                 self.state.toggle_overlay(OverlayKind::Bookmarks);
             }
-            OmniboxResult::OpenOverlay(InternalRoute::Blank) => self.open_tab(false),
+            OmniboxResult::OpenOverlay(InternalRoute::Blank) => self.open_tab(BrowsingProfile::Normal),
             OmniboxResult::Nothing => self.state.cancel_address_bar_edit(),
         }
     }
 
-    pub(crate) fn open_tab(&mut self, private: bool) {
+    pub(crate) fn open_tab(&mut self, profile: BrowsingProfile) {
         let old_split = self.state.split_view;
-        if private {
-            self.state.open_private_tab();
-        } else {
-            self.state.open_new_tab();
-        }
+        self.state.open_profile_tab(profile);
         let id = self.state.active_tab_id;
-        self.engine.create_tab(id.raw(), private);
+        self.engine.create_tab(id.raw(), profile.to_engine_profile());
         self.engine.set_active_tab(id.raw());
         self.restore_displaced_split_tabs(old_split);
         self.sync_split_viewports();
@@ -545,7 +542,7 @@ impl BrowserCoreDriver {
         self.state.close_tab(tab_id);
         if was_last {
             let new_id = self.state.active_tab_id;
-            self.engine.create_tab(new_id.raw(), false);
+            self.engine.create_tab(new_id.raw(), BrowsingProfile::Normal.to_engine_profile());
         }
         self.sync_split_viewports();
         self.sync_active_engine_tab();
@@ -590,14 +587,10 @@ impl BrowserCoreDriver {
 
         let left = self.state.active_tab_id;
         let right = if self.state.tabs.len() == 1 {
-            let private = self.state.active_tab().map_or(false, |tab| tab.is_private);
-            if private {
-                self.state.open_private_tab();
-            } else {
-                self.state.open_new_tab();
-            }
+            let profile = self.state.active_tab().map_or(BrowsingProfile::Normal, |tab| tab.profile);
+            self.state.open_profile_tab(profile);
             let id = self.state.active_tab_id;
-            self.engine.create_tab(id.raw(), private);
+            self.engine.create_tab(id.raw(), profile.to_engine_profile());
             id
         } else {
             let pos = self
